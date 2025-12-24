@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8"/>
+<title>Ticket Produit</title>
+<style>
+  /* Taille 80mm, orientation verticale (writing-mode) */
+  @page { size: 80mm 200mm; margin: 0; }
+  html, body { margin:0; padding:0; width:80mm; background:#fff; color:#000; -webkit-print-color-adjust:exact; print-color-adjust:exact }
+  body { margin-left:auto; margin-right:auto; font-family:"Arial Black",Impact,system-ui,Arial,sans-serif; text-rendering:geometricPrecision }
+  .ticket{ width:80mm; height:200mm; overflow:hidden; display:flex; flex-direction:column; justify-content:space-between; align-items:stretch; border-left:1px solid #000; border-right:1px solid #000 }
+  .row{ display:grid; grid-template-columns:.34fr .66fr; align-items:stretch; justify-items:stretch; min-height:168mm; border-top:1px solid #000; border-bottom:1px dashed #000 }
+  .col{ display:flex; align-items:center; justify-content:center; height:100%; overflow:hidden }
+  .col + .col{ border-left:1px solid #000 }
+  .prix,.nom,.type{ writing-mode:vertical-rl; text-orientation:mixed; color:#000 }
+  .prix span,.nom span,.type span{ display:block; line-height:1.02; letter-spacing:.5px }
+  .prix span{ white-space:nowrap }
+  .nom span{ word-break:normal; overflow-wrap:break-word; hyphens:auto; text-wrap:balance }
+  .prix span{ font-size:96px; font-weight:900 }
+  .nom  span{ font-size:108px; font-weight:800 }
+  .type span{ font-size:42px; font-weight:900 }
+  .type{ width:100%; display:flex; align-items:flex-end; justify-content:center; height:30mm; border-top:1px solid #000 }
+</style>
+</head>
+<body>
+  <div class="ticket">
+    <div class="row">
+      <div class="col prix"><span>{{prixFc}}</span></div>
+      <div class="col nom"><span>{{nom}}</span></div>
+    </div>
+    <div class="type"><span>{{typeLabel}}</span></div>
+  </div>
+</body>
+</html>
+

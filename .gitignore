@@ -1,0 +1,51 @@
+# Dependencies
+node_modules/
+package-lock.json
+yarn.lock
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+
+# Data directory (local)
+C:\Glowflixprojet\
+Glowflixprojet/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+dist/
+build/
+*.exe
+*.dmg
+*.pkg
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Google credentials
+config/google-credentials.json
+config/secrets.json
+

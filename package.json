@@ -1,0 +1,129 @@
+{
+  "name": "glowflixprojet-app",
+  "version": "1.0.0",
+  "description": "Système de gestion de point de vente offline-first avec synchronisation Google Sheets",
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "start": "node src/api/server.js",
+    "dev": "concurrently -n \"backend,ui,electron\" -c \"cyan,magenta,green\" \"node --watch src/api/server.js\" \"vite\" \"npx wait-on http://localhost:3030/api/health http://localhost:5173 && cross-env NODE_ENV=development electron .\"",
+    "dev:ui": "vite",
+    "dev:all": "concurrently -n \"backend,frontend\" -c \"cyan,magenta\" \"npm run dev\" \"npm run dev:ui\"",
+    "electron": "electron .",
+    "electron:dev": "cross-env NODE_ENV=development electron .",
+    "dev:electron": "concurrently -n \"backend,ui,electron\" -c \"cyan,magenta,green\" \"npm run start\" \"npm run dev:ui\" \"npx wait-on http://localhost:3030/api/health http://localhost:5173 && cross-env NODE_ENV=development electron .\"",
+    "dev:app": "concurrently -n \"backend,ui,electron\" -c \"cyan,magenta,green\" \"node --watch src/api/server.js\" \"vite\" \"npx wait-on http://localhost:3030/api/health http://localhost:5173 && cross-env NODE_ENV=development electron .\"",
+    "build:ui": "vite build",
+    "build:all": "npm run build:ui",
+    "build:electron": "electron-builder",
+    "preview:ui": "vite preview",
+    "migrate": "node src/db/migrate.js",
+    "build:exe": "pkg package.json --targets node18-win-x64 --output dist/LaGrace-POS.exe",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "pos",
+    "offline-first",
+    "sqlite",
+    "google-sheets",
+    "electron",
+    "react"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.6.2",
+    "bcrypt": "^5.1.1",
+    "better-sqlite3": "^11.10.0",
+    "chokidar": "^3.5.3",
+    "cors": "^2.8.5",
+    "date-fns": "^2.30.0",
+    "dayjs": "^1.11.10",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "framer-motion": "^10.16.16",
+    "googleapis": "^126.0.1",
+    "handlebars": "^4.7.8",
+    "jsonwebtoken": "^9.0.2",
+    "lucide-react": "^0.294.0",
+    "pdf-to-printer": "^5.6.0",
+    "puppeteer": "^21.6.1",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.20.0",
+    "socket.io": "^4.6.1",
+    "socket.io-client": "^4.6.1",
+    "winston": "^3.11.0",
+    "zustand": "^4.4.7"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@vitejs/plugin-react": "^4.2.1",
+    "autoprefixer": "^10.4.16",
+    "concurrently": "^8.2.2",
+    "cross-env": "^7.0.3",
+    "electron": "^28.3.3",
+    "electron-builder": "^24.9.1",
+    "pkg": "^5.8.1",
+    "postcss": "^8.4.32",
+    "tailwindcss": "^3.3.6",
+    "vite": "^5.0.8",
+    "wait-on": "^7.2.0"
+  },
+  "pkg": {
+    "scripts": [
+      "src/api/server.js"
+    ],
+    "assets": [
+      "src/db/schema.sql",
+      "asset/**/*"
+    ],
+    "outputPath": "dist"
+  },
+  "build": {
+    "appId": "com.lagrace.pos",
+    "productName": "LA GRACE POS",
+    "directories": {
+      "output": "dist-electron"
+    },
+    "files": [
+      "electron/**/*",
+      "src/**/*",
+      "dist/**/*",
+      "asset/**/*",
+      "print/**/*",
+      "node_modules/**/*",
+      "package.json",
+      "!node_modules/**/*.{md,ts,map}",
+      "!**/test/**/*",
+      "!**/tests/**/*"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "asset/image/icon/photo.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    },
+    "mac": {
+      "target": "dmg",
+      "icon": "asset/image/icon/photo.png",
+      "category": "public.app-category.business"
+    },
+    "linux": {
+      "target": "AppImage",
+      "icon": "asset/image/icon/photo.png",
+      "category": "Office"
+    }
+  }
+}
