@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8"/>
+<title>Ticket</title>
+<style>
+  /* 80mm → page 70mm ; contenu utile 69mm (anti-coupe droite) ; zéro marge driver */
+  @page { size: 70mm auto; margin: 0; }
+  html, body { margin:0; padding:0; background:#fff; color:#000; }
+  *, *::before, *::after {
+    background:transparent !important; color:#000 !important; -webkit-text-fill-color:#000 !important;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+    text-rendering: geometricPrecision; image-rendering: crisp-edges;
+  }
+
+  :root{
+    --pageW:70mm;
+    --w:69mm;          /* largeur réelle design */
+    --padX:1mm;        /* bords plus serrés (moins d'espace à gauche) */
+    --padTop:1.6mm;    /* coussin entête (anti-coupe haut) */
+    --padBot:1.8mm;
+
+    --fs:13px;
+    --lh:1.25;
+
+    --ink:#000;
+    --ruleStrong:1.4px solid var(--ink); /* cadres épais comme sur la capture */
+    --rule:1px solid var(--ink);
+    --dot:1px dotted var(--ink);
+  }
+
+  body{
+    font-family: Arial, Helvetica, sans-serif;
+    font-size:var(--fs); line-height:var(--lh);
+    -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+  }
+
+  .ticket{
+    width:var(--w); margin:0 auto; padding:var(--padTop) var(--padX) var(--padBot);
+    break-inside: avoid; page-break-inside: avoid;
+  }
+  
+  /* ====== SHRINK-TO-FIT PRO ====== */
+  .ticket.tight{ --fs:11.5px; --padTop:1.4mm; --padBot:1.6mm; }
+  .ticket.ultra{ --fs:10px; --padTop:1.2mm; --padBot:1.4mm; }
+
+  .brand{ text-align:center; margin:0 0 2px 0; }
+  .h1{ font-weight:800; font-size:16px; margin:0; letter-spacing:.2px; }
+  .h2{ font-weight:800; font-size:13px; margin:1px 0 4px; }
+
+  .row{ margin:1px 0; word-break:break-word; overflow-wrap:anywhere; }
+  .muted{opacity:.95}
+  .sep{ border:0; border-top:var(--rule); margin:5px 0; }
+
+  /* ===== Tableau lisible, avec cadre complet et séparateurs ===== */
+  table{ width:100%; border-collapse:collapse; table-layout:fixed; border:var(--ruleStrong); }
+  thead th{
+    border-bottom:var(--ruleStrong); border-right:var(--ruleStrong);
+    padding:1.6mm 1mm; font-weight:800; text-align:center;
+  }
+  thead th:last-child{ border-right:0; }
+
+  tbody td{
+    padding:1.3mm 1mm; vertical-align:top; border-right:var(--ruleStrong);
+    border-bottom:var(--dot);
+    break-inside: avoid; page-break-inside: avoid;
+    word-break:break-word; overflow-wrap:break-word;
+  }
+  tbody tr:last-child td{ border-bottom:0; }
+  tbody td:last-child{ border-right:0; }
+  
+  /* Ajustements padding en mode compact */
+  .ticket.tight tbody td{ padding:1.1mm .9mm; }
+  .ticket.ultra tbody td{ padding:.9mm .8mm; }
+
+  /* Colonnes : pour un alignement stable comme sur l’aperçu */
+  .w-qty{ width:22%; text-align:center; white-space:normal; }
+  .w-name{ width:38%; text-align:left; }
+  .w-pu{   width:20%; text-align:right; }
+  .w-pt{   width:20%; text-align:right; }
+
+  /* Badge Qté/MARK : passe à la ligne si trop long, noir fort, net en thermique */
+  .qty-badge{
+    display:inline-flex; flex-wrap:wrap; row-gap:.5mm; column-gap:.7mm;
+    align-items:center; justify-content:center;
+    padding:.2mm .8mm; border-radius:.6mm; border:1px solid var(--ink);
+    max-width:100%;
+  }
+  .qty-badge .q{ font-weight:800; }
+  .qty-badge .mk{ display:inline-flex; align-items:center; gap:.5mm; font-weight:800; font-size:11px; letter-spacing:.2px; }
+  .qty-badge .mk-ic{ display:inline-flex; width:12px; height:12px; line-height:0; vertical-align:middle; }
+  .qty-badge .mk-ic svg{ width:12px; height:12px; }
+  
+  /* Badges compacts mode tight/ultra */
+  .ticket.tight .qty-badge{ padding:.15mm .6mm; gap:.4mm .5mm; }
+  .ticket.tight .qty-badge .mk{ font-size:10px; }
+  .ticket.ultra .qty-badge{ padding:.1mm .5mm; gap:.3mm .4mm; }
+  .ticket.ultra .qty-badge .mk{ font-size:9px; }
+
+  /* Désignation : pas de clamp → jamais coupée */
+  .name{ font-weight:600; word-break:break-word; overflow-wrap:anywhere; hyphens:auto; }
+
+  /* Montants tabulaires */
+  .money{
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1, "lnum" 1;
+  }
+
+  /* Totaux & pied */
+  .totals{ margin-top:6px; text-align:center; font-weight:800 }
+  .foot{ margin-top:7px; text-align:center; font-size:11px }
+  
+  /* Ajustements compacts totaux/footer */
+  .ticket.tight .totals{ margin-top:4px; font-size:10.5px; }
+  .ticket.tight .foot{ margin-top:5px; font-size:10px; }
+  .ticket.ultra .totals{ margin-top:3px; font-size:9.5px; }
+  .ticket.ultra .foot{ margin-top:4px; font-size:9px; }
+  
+  /* Headers compacts */
+  .ticket.tight .h1{ font-size:14.5px; margin:0 0 1px 0; }
+  .ticket.tight .h2{ font-size:12px; margin:0 0 2px 0; }
+  .ticket.ultra .h1{ font-size:13px; margin:0 0 1px 0; }
+  .ticket.ultra .h2{ font-size:11px; margin:0 0 2px 0; }
+
+  /* Sécurité anti-coupure sur toute la zone imprimée */
+  tr, td, th, hr, .brand, .totals, .foot { break-inside: avoid; page-break-inside: avoid; }
+</style>
+</head>
+<body>
+  <div class="ticket{{#if shrinkFit.class}} {{shrinkFit.class}}{{/if}}">
+
+    {{#if entreprise.logo}}
+      <div style="text-align:center;margin-bottom:4px">
+        <img src="{{asset entreprise.logo}}" alt="logo" style="max-width:60mm;max-height:18mm">
+      </div>
+    {{/if}}
+
+    <div class="brand">
+      <div class="h1">{{entreprise.nom}}</div>
+      <div class="h2">LA GRACE</div>
+    </div>
+
+    {{#if entreprise.rccm}}<div class="row"><b>. RCCM :</b> {{entreprise.rccm}}</div>{{/if}}
+    {{#if entreprise.impot}}<div class="row"><b>. N° Impôt :</b> {{entreprise.impot}}</div>{{/if}}
+    {{#if entreprise.tel}}<div class="row"><b>. Tél :</b> {{entreprise.tel}}</div>{{/if}}
+    <div class="row"><b>. DATE & HEURE :</b> {{#if dateISO}}{{date dateISO "YYYY-MM-DD HH:mm"}}{{else}}{{now "YYYY-MM-DD HH:mm"}}{{/if}}</div>
+
+    <hr class="sep"/>
+
+    {{#if (or factureNum numero)}}
+      <div class="row"><b>. FACTURE N° :</b> {{#if factureNum}}{{factureNum}}{{else}}{{numero}}{{/if}}</div>
+    {{/if}}
+    {{#if client}}<div class="row"><b>. Client :</b> {{client}}</div>{{/if}}
+
+    <hr class="sep"/>
+
+    <table>
+      <thead>
+        <tr>
+          <th class="w-qty">Qté</th>
+          <th class="w-name">Désignation</th>
+          <th class="w-pu">PU</th>
+          <th class="w-pt">PT</th>
+        </tr>
+      </thead>
+      <tbody>
+      {{#if lines.length}}
+        {{#each lines}}
+          <tr>
+            <!-- Qté : badge responsive (côte à côte, passe dessous si trop long) -->
+            <td class="w-qty">
+              {{#if displayQteHtml}}{{{displayQteHtml}}}{{else}}{{#if displayQte}}{{displayQte}}{{else}}—{{/if}}{{/if}}
+            </td>
+
+            <!-- Désignation : propre, pas de MARK ici -->
+            <td class="w-name"><span class="name">{{nom}}</span></td>
+
+            <!-- Montants : bascule devise sans changer le rendu -->
+            {{#if (eq ../printCurrency "USD")}}
+              <td class="w-pu money">{{fmtUSDnum (coalesce puUSD 0)}}</td>
+              <td class="w-pt money"><b>{{fmtUSDnum (coalesce totalUSD 0)}}</b></td>
+            {{else}}
+              <td class="w-pu money">{{fmtFC (or puFC pu)}}</td>
+              <td class="w-pt money"><b>{{fmtFC (or totalFC total)}}</b></td>
+            {{/if}}
+          </tr>
+        {{/each}}
+      {{else}}
+        <tr><td class="w-qty" colspan="4" style="text-align:center">— Aucune ligne —</td></tr>
+      {{/if}}
+      </tbody>
+    </table>
+
+    <hr class="sep"/>
+
+    <div class="totals">
+      {{#if (eq printCurrency "USD")}}
+        <div>Total USD : <b class="money">{{#if totalUSD}}{{fmtUSDnum totalUSD}}{{else}}{{fmtUSD (or totalFC total) taux}}{{/if}}</b></div>
+        <div>FC : <b class="money">{{fmtFC (or totalFC total)}}</b></div>
+      {{else}}
+        <div>Total FC : <b class="money">{{fmtFC (or totalFC total)}}</b></div>
+        <div>USD : <b class="money">{{#if totalUSD}}{{fmtUSDnum totalUSD}}{{else}}{{fmtUSD (or totalFC total) taux}}{{/if}}</b></div>
+      {{/if}}
+    </div>
+
+    <div class="foot">
+      <div class="row"><b>Les marchandises vendues ne sont ni retournées ni échangées</b></div>
+      {{#if entreprise.adresse}}<div class="row muted">{{entreprise.adresse}}</div>{{/if}}
+      <div class="row">— Merci —</div>
+      {{#if meta.vendeur}}<div class="row muted">Vendeur : {{meta.vendeur}}</div>{{/if}}
+    </div>
+
+  </div>
+</body>
+</html>

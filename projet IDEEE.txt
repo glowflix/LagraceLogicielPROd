@@ -1,0 +1,1668 @@
+Ci-dessous, je te donne une structure complète, professionnelle et directement exploitable pour ton projet Glowflixprojet (local-first, SQLite/Node, sync Google Sheets en arrière-plan, WebSocket temps réel, pages “style Sheets”, gestion MARK/unité avant impression, quantités 1.5 / 0.5 / 0.25, suppression/annulation facture, analytics, et impression par “print job queue” comme ton module).
+
+0) Racine du projet + création automatique des dossiers (obligatoire)
+Chemin standard Windows
+
+C:\Glowflixprojet\ (et non “LaGrace”)
+
+Objectif
+
+Au démarrage du serveur (PC serveur), l’app crée automatiquement toute l’arborescence (data, db, printer queue, logs…) et s’en sert comme “workspace” unique.
+
+Arborescence Glowflixprojet (pro)
+C:\Glowflixprojet\
+  db\
+    glowflixprojet.db
+    schema.sql
+    migrations\
+  data\
+    cache\
+    imports\
+    exports\
+    backups\
+    attachments\
+  printer\
+    ok\
+    err\
+    tmp\
+    assets\
+      logo.png
+    templates\
+      receipt-80.hbs
+      product-tag-vertical.hbs
+    .dedupe.json
+  logs\
+    app.log
+    sync.log
+    print.log
+  config\
+    device.json
+    secrets.json
+
+Bootstrap Node (auto-create dossier)
+// src/core/paths.js
+import fs from "fs";
+import path from "path";
+import os from "os";
+
+export function getProjectRoot() {
+  // Windows default, sinon fallback user home
+  const winDefault = "C:\\Glowflixprojet";
+  return process.env.GLOWFLIX_ROOT_DIR
+    ? path.resolve(process.env.GLOWFLIX_ROOT_DIR)
+    : (process.platform === "win32" ? winDefault : path.join(os.homedir(), "Glowflixprojet"));
+}
+
+export function ensureDirs() {
+  const root = getProjectRoot();
+  const dirs = [
+    "db", "db/migrations",
+    "data/cache", "data/imports", "data/exports", "data/backups", "data/attachments",
+    "printer/ok", "printer/err", "printer/tmp", "printer/assets", "printer/templates",
+    "logs", "config"
+  ];
+  for (const d of dirs) fs.mkdirSync(path.join(root, d), { recursive: true });
+  return root;
+}
+
+1) Structure complète “code” (Backend + Sync + WebSocket + Print + UI)
+Arborescence projet (repo)
+Glowflixprojet-app\
+  package.json
+  .env
+  src\
+    core\
+      paths.js
+      env.js
+      logger.js
+      crypto.js
+      validators.js
+    db\
+      sqlite.js
+      schema.sql
+      migrate.js
+      repositories\
+        products.repo.js
+        stock.repo.js
+        sales.repo.js
+        debts.repo.js
+        users.repo.js
+        rates.repo.js
+        sync.repo.js
+        audit.repo.js
+    services\
+      stock.service.js
+      sales.service.js
+      debts.service.js
+      rates.service.js
+      analytics.service.js
+      sync\
+        sheets.client.js
+        sync.worker.js
+        conflict.rules.js
+        mapping.sheets.js
+      print\
+        printer.module.js        // ton module adapté Glowflixprojet
+        jobs.service.js          // écrit les JSON dans printer\
+        templates\
+          receipt-80.hbs
+          product-tag-vertical.hbs
+    api\
+      middlewares\
+        auth.js
+        errors.js
+      routes\
+        auth.routes.js
+        products.routes.js
+        stock.routes.js
+        sales.routes.js
+        debts.routes.js
+        rates.routes.js
+        analytics.routes.js
+        sync.routes.js
+        print.routes.js
+      server.js
+      websocket.js              // socket.io
+    ui\
+      public\
+        login.html
+        dashboard.html
+        produits.html           // “style Sheets”
+        ventes-new.html
+        ventes-list.html
+        dettes.html
+        analytics.html
+        settings.html
+        sync.html
+        print.html
+        assets\
+          css\
+          js\
+            api.js
+            grid.js
+            produits.js
+            ventes.js
+            dettes.js
+            analytics.js
+            print.js
+  tools\
+    apps-script\
+      Code.gs
+      README.md
+
+2) Pages obligatoires (UI) – ce que tu as demandé
+Pages / menus
+
+Dashboard
+
+Total ventes du jour (FC + USD)
+
+Nombre factures du jour
+
+Total encaissé
+
+Dettes ouvertes (montant + count)
+
+Stock faible (top 10)
+
+Produits (style Sheets)
+
+Grille type tableur : ajouter une ligne vide, modifier cellule, sauvegarder
+
+Crée/modifie produit + unités (Carton/Millier/Pièce) + auto_stock_factor
+
+Push vers Google Sheets en arrière-plan
+
+Ventes (POS)
+
+Nouvelle vente (quantités 1.5 / 0.5 / 0.25)
+
+Lecture unité/mark avant impression
+
+Impression ticket 80mm + option “étiquette produit”
+
+Liste Ventes / Factures
+
+Rechercher facture
+
+Réimprimer
+
+Annuler/Supprimer facture (pro : annulation + restoration stock)
+
+Dettes
+
+Créer dette depuis facture (auto)
+
+Paiements partiels
+
+Historique paiements
+
+Analytics
+
+CA par jour/semaine/mois
+
+Top produits
+
+Ventes par vendeur
+
+Dettes (open/partial/closed)
+
+Paramètres
+
+Taux
+
+Entreprise (logo, RCCM, Impôt, tel…)
+
+Sync status
+
+Imprimantes
+
+Sync Monitor
+
+Files d’attente (outbox/inbox)
+
+Dernier push/pull
+
+Erreurs Sheets
+
+Print Monitor
+
+Queue print jobs, erreurs, retry
+
+3) Base SQLite (pro) – support unités, mark, fractions, annulation facture, sync
+
+Voici un schema.sql complet (adapté à ton modèle Sheets + local-first + sync robuste).
+
+PRAGMA foreign_keys = ON;
+
+-- =========================
+-- CORE SETTINGS
+-- =========================
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+INSERT OR IGNORE INTO settings(key,value) VALUES
+('exchange_rate_fc_per_usd','2800'),
+('company_name','ALIMENTATION'),
+('project_root','C:\\Glowflixprojet');
+
+-- =========================
+-- USERS (Compter Utilisateur)
+-- =========================
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  phone TEXT,
+  is_active INTEGER NOT NULL DEFAULT 1,
+  is_admin INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  synced_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS user_devices (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  device_brand TEXT,
+  expo_push_token TEXT,
+  profile_url TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- =========================
+-- PRODUCTS + UNITS (Carton/Milliers/Pièce)
+-- =========================
+CREATE TABLE IF NOT EXISTS products (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL UNIQUE,        -- Code produit (clé commune Sheets)
+  name TEXT NOT NULL,
+  is_active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  synced_at TEXT
+);
+
+-- unit_level: CARTON | MILLIER | PIECE
+-- unit_mark : ex CARTON, JUTE, SAC, BT, DZ, PCE...
+CREATE TABLE IF NOT EXISTS product_units (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  product_id INTEGER NOT NULL,
+  unit_level TEXT NOT NULL,
+  unit_mark TEXT NOT NULL,
+  stock_initial REAL NOT NULL DEFAULT 0,
+  stock_current REAL NOT NULL DEFAULT 0,
+  purchase_price_usd REAL NOT NULL DEFAULT 0,
+  sale_price_fc REAL NOT NULL DEFAULT 0,
+  sale_price_usd REAL NOT NULL DEFAULT 0,
+  auto_stock_factor REAL NOT NULL DEFAULT 1,  -- conversion vers base unit
+  qty_step REAL NOT NULL DEFAULT 1,           -- support 1.5 / 0.5 / 0.25 etc
+  extra1 TEXT,
+  extra2 TEXT,
+  last_update TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  synced_at TEXT,
+  UNIQUE(product_id, unit_level, unit_mark),
+  FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_units_prod ON product_units(product_id);
+
+-- =========================
+-- EXCHANGE RATES (Taux)
+-- =========================
+CREATE TABLE IF NOT EXISTS exchange_rates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  rate_fc_per_usd REAL NOT NULL,
+  effective_at TEXT NOT NULL,
+  created_by INTEGER,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  synced_at TEXT,
+  FOREIGN KEY(created_by) REFERENCES users(id)
+);
+
+-- =========================
+-- SALES (Ventes) + items
+-- =========================
+CREATE TABLE IF NOT EXISTS sales (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  invoice_number TEXT NOT NULL UNIQUE,
+  sold_at TEXT NOT NULL,
+  client_name TEXT,
+  seller_name TEXT,
+  seller_user_id INTEGER,
+  total_fc REAL NOT NULL DEFAULT 0,
+  total_usd REAL NOT NULL DEFAULT 0,
+  rate_fc_per_usd REAL NOT NULL DEFAULT 0,
+  payment_mode TEXT NOT NULL DEFAULT 'cash',     -- cash|mobile|mix|dette
+  paid_fc REAL NOT NULL DEFAULT 0,
+  paid_usd REAL NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'paid',           -- paid|partial|unpaid|void
+  origin TEXT NOT NULL DEFAULT 'LOCAL',          -- LOCAL|MOBILE|SHEETS
+  source_device TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  synced_at TEXT,
+  FOREIGN KEY(seller_user_id) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS sale_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  sale_id INTEGER NOT NULL,
+  product_id INTEGER NOT NULL,
+  product_code TEXT NOT NULL,
+  product_name TEXT NOT NULL,
+  unit_level TEXT NOT NULL,
+  unit_mark TEXT NOT NULL,
+  qty REAL NOT NULL,                 -- support fractions 0.25/0.5/1.5
+  qty_label TEXT,                    -- ex "1/2", "DEMI DZ", "1.5"
+  unit_price_fc REAL NOT NULL,
+  subtotal_fc REAL NOT NULL,
+  unit_price_usd REAL NOT NULL DEFAULT 0,
+  subtotal_usd REAL NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY(sale_id) REFERENCES sales(id) ON DELETE CASCADE,
+  FOREIGN KEY(product_id) REFERENCES products(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sales_date ON sales(sold_at);
+CREATE INDEX IF NOT EXISTS idx_sale_items_sale ON sale_items(sale_id);
+
+-- =========================
+-- SALES VOID (Annulation/Suppression facture PRO)
+-- =========================
+CREATE TABLE IF NOT EXISTS sale_voids (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  sale_id INTEGER NOT NULL UNIQUE,
+  invoice_number TEXT NOT NULL,
+  reason TEXT,
+  voided_by INTEGER,
+  voided_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY(sale_id) REFERENCES sales(id) ON DELETE CASCADE,
+  FOREIGN KEY(voided_by) REFERENCES users(id)
+);
+
+-- =========================
+-- DEBTS (Dettes) + payments
+-- =========================
+CREATE TABLE IF NOT EXISTS debts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  sale_id INTEGER,
+  invoice_number TEXT,
+  client_name TEXT NOT NULL,
+  total_fc REAL NOT NULL DEFAULT 0,
+  paid_fc REAL NOT NULL DEFAULT 0,
+  remaining_fc REAL NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'open',  -- open|partial|closed
+  note TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  synced_at TEXT,
+  FOREIGN KEY(sale_id) REFERENCES sales(id)
+);
+
+CREATE TABLE IF NOT EXISTS debt_payments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  debt_id INTEGER NOT NULL,
+  amount_fc REAL NOT NULL,
+  payment_mode TEXT NOT NULL DEFAULT 'cash',
+  paid_by INTEGER,
+  paid_at TEXT NOT NULL DEFAULT (datetime('now')),
+  synced_at TEXT,
+  FOREIGN KEY(debt_id) REFERENCES debts(id) ON DELETE CASCADE,
+  FOREIGN KEY(paid_by) REFERENCES users(id)
+);
+
+-- =========================
+-- PRICE LOGS (Stock de prix effectué)
+-- =========================
+CREATE TABLE IF NOT EXISTS price_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at TEXT NOT NULL,
+  product_code TEXT NOT NULL,
+  unit_level TEXT,
+  unit_mark TEXT,
+  unit_price_fc REAL NOT NULL,
+  line_total_fc REAL NOT NULL,
+  invoice_number TEXT,
+  synced_at TEXT
+);
+
+-- =========================
+-- SYNC OUTBOX (local -> Sheets)
+-- =========================
+CREATE TABLE IF NOT EXISTS sync_outbox (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  entity TEXT NOT NULL,           -- products|product_units|sales|debts|rates...
+  entity_id TEXT NOT NULL,        -- id local ou invoice_number
+  op TEXT NOT NULL,               -- upsert|delete|void|payment...
+  payload_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending', -- pending|sent|error
+  tries INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_outbox_pending ON sync_outbox(status, entity);
+
+-- =========================
+-- AUDIT
+-- =========================
+CREATE TABLE IF NOT EXISTS audit_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER,
+  action TEXT NOT NULL,
+  details_json TEXT,
+  at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+4) Règles “quantités fractionnées” (1.5 / 0.5 / 0.25) – partout (POS + Stock + Print)
+Où on gère ça
+
+sale_items.qty est REAL → accepte 0.25 / 0.5 / 1.5
+
+product_units.qty_step définit le “pas” autorisé par unité (ex: pièce = 1, carton = 1, millier = 0.5, etc.)
+
+sale_items.qty_label garde le label utilisateur (ex: 1/2, 0.25, DEMI DZ)
+
+Validation simple (front + backend)
+
+qty doit être multiple de qty_step (tolérance 0.0001)
+
+exemple :
+
+carton : step=1
+
+millier : step=0.5
+
+pièce : step=1
+
+certains produits : step=0.25 (si tu veux autoriser quart)
+
+5) Stock & conversion (Carton / Millier / Pièce) – cohérence automatique
+Principe “base unit”
+
+Tu choisis une unité base (souvent PIÈCE).
+Chaque product_units.auto_stock_factor signifie :
+
+Combien de “base units” sont consommées quand tu vends 1 unité de cette ligne
+
+Exemple :
+
+Carton : auto_stock_factor = 24 (1 carton = 24 pièces)
+
+Millier : auto_stock_factor = 12
+
+Pièce : auto_stock_factor = 1
+
+Décrément stock à la vente
+
+baseConsumed = qty * auto_stock_factor
+
+tu peux soit :
+
+gérer un stock base unique, et recalculer les vues
+
+garder stocks par unité + décrément synchronisé (plus complexe)
+
+Recommandation pro (stable) : stock base unique + “vues” par unité.
+
+6) Mapping Google Sheets (tes feuilles actuelles) → DB locale
+
+Tu gardes tes feuilles telles qu’elles existent :
+
+Carton, Milliers, Piece, Ventes, Dettes, Taux, Compter Utilisateur, Stock de prix effectué
+
+Mapping minimum (robuste)
+
+products.code ⇄ colonne “Code produit”
+
+products.name ⇄ “Nom du produit”
+
+product_units ⇄ chaque feuille stock (Carton/Milliers/Piece)
+
+sales + sale_items ⇄ feuille Ventes (lignes)
+
+debts + debt_payments ⇄ feuille Dettes
+
+exchange_rates ⇄ feuille Taux
+
+users (+ user_devices) ⇄ feuille Compter Utilisateur
+
+price_logs ⇄ feuille “Stock de prix effectué”
+
+Pour éviter l’écrasement Sheets (point critique)
+
+Tu appliques cette règle :
+
+La vérité du stock = SQLite
+
+Sheets = miroir / reporting
+
+Toute modification “admin” dans Sheets doit être importée comme correction (pas comme vérité silencieuse)
+
+Techniquement, on fait ça via sync_outbox + “flags” côté Sheets (comme ton Telephone supprimer), ou via colonnes techniques ajoutées en fin (recommandé si possible) :
+
+_origin (LOCAL/MOBILE/SHEETS)
+
+_syncedAt
+
+_rev
+
+7) Sync Apps Script / Sheets (arrière-plan) – local first, sans blocage
+Flux pro
+
+WebSocket LAN = temps réel interne (PC caisse ↔ PC serveur)
+
+Sync Worker = push/pull vers Sheets toutes les 3–10 secondes (par lots)
+
+Règle de priorité
+
+Si Internet tombe :
+
+ventes, stocks, dettes continuent 100% local
+
+outbox s’accumule
+
+Quand Internet revient :
+
+outbox se vide automatiquement
+
+Deux sens
+
+LOCAL → SHEETS
+
+produits créés/modifiés (depuis page “Produits style Sheets”)
+
+ventes locales
+
+dettes/paiements
+
+taux modifié localement (option)
+
+SHEETS → LOCAL
+
+ventes “mobile” si tu en as (lignes avec flag)
+
+taux mis à jour dans Sheets
+
+corrections stock (si tu autorises)
+
+8) “Produits” page style Google Sheets (création/modif + push Sheets)
+Comportement attendu (exactement ce que tu as demandé)
+
+La grille affiche : Code, Nom, Stock initial, Stock courant, PU FC, PU USD, Mark, Auto Stock, Step, Date update…
+
+L’utilisateur peut :
+
+éditer une cellule
+
+ajouter une ligne vide
+
+enregistrer
+
+À “Enregistrer” :
+
+upsert local DB (products + product_units)
+
+enqueue sync_outbox (entity=products/product_units op=upsert)
+
+worker sync pousse vers Sheets en arrière plan
+
+9) Suppression facture (PRO) = annulation + restauration stock + sync
+
+Au lieu de “DELETE brut”, tu fais :
+
+POST /api/sales/:invoice/void
+
+ça crée sale_voids
+
+met sales.status = 'void'
+
+restaure stock (inverse des consommations)
+
+imprime éventuellement un “ticket d’annulation”
+
+pousse vers Sheets : une ligne “VOID” ou un flag sur la facture
+
+10) Impression par JOB (ton système) – adaptation Glowflixprojet
+Chemins (important)
+
+printDir doit être :
+C:\Glowflixprojet\printer
+
+Renommage variables env (propre)
+
+Remplace toutes les LAGRACE_* par GLOWFLIX_* (ou garde les deux compatibles).
+
+Exemple .env
+GLOWFLIX_ROOT_DIR=C:\Glowflixprojet
+
+GLOWFLIX_PRINT_DIR=C:\Glowflixprojet\printer
+PRINTER_NAME=
+PRINT_DEFAULT_TEMPLATE=receipt-80
+
+APP_BASE_URL=http://localhost:3000
+DETTES_FRONT_BASE=http://localhost:3000
+COMP_PATH=/comp.html
+
+STOCK_API_URL=http://localhost:3000/api/stock
+LOOKUP_MARK_FROM_STOCK=1
+PRINT_ROTATE_180=0
+PRINT_TOP_NUDGE_MM=0.5
+
+PRINT_PIECE_LABEL=PCE
+PRINT_CARTON_LABEL=CARTON
+PRINT_SZN_LABEL=SZN
+
+Job JSON standard (POS → printer queue)
+
+Le POS n’imprime pas directement : il écrit un fichier JSON dans C:\Glowflixprojet\printer\.
+
+{
+  "template": "receipt-80",
+  "copies": 1,
+  "data": {
+    "factureNum": "20251224184530",
+    "client": "Client X",
+    "taux": 2800,
+    "printCurrency": "FC",
+    "lines": [
+      { "code":"A1", "nom":"Golden Milk", "unite":"carton", "mark":"", "qteLabel":"1.5", "qty":1.5, "puFC":12000, "totalFC":18000 }
+    ],
+    "totalFC": 18000,
+    "entreprise": {
+      "nom":"ALIMENTATION",
+      "rccm":"...",
+      "impot":"...",
+      "tel":"+243 ...",
+      "logo":"logo.png",
+      "adresse":"..."
+    },
+    "meta": { "vendeur":"Serge", "dette":"non" }
+  }
+}
+
+Lecture du MARK avant impression (obligatoire)
+
+Tu l’as déjà dans ton module (lookup via STOCK_API_URL).
+La règle à conserver :
+
+avant rendu, le module résout mark par nom/code + unité
+
+applique les règles : carton icon, millier sans mark, pièce label, DZ/SZN…
+
+11) Templates impression (tes 2 HTML) → version Handlebars .hbs
+
+Tu veux exactement ces 2 rendus :
+
+Ticket 80mm (table Qté/Désignation/PU/PT) → receipt-80.hbs
+
+Ticket Produit vertical (prix et nom en vertical) → product-tag-vertical.hbs
+
+Tu peux les mettre tels quels dans :
+
+C:\Glowflixprojet\printer\templates\receipt-80.hbs
+
+C:\Glowflixprojet\printer\templates\product-tag-vertical.hbs
+
+Ton module Handlebars les charge déjà (comme dans ton code).
+
+12) API (routes) – complet et cohérent avec tes pages
+Auth
+
+POST /api/auth/login
+
+Produits / Stock
+
+GET /api/products
+
+POST /api/products (upsert)
+
+PUT /api/products/:code
+
+GET /api/stock?level=carton|millier|piece (pour lookup mark + vues)
+
+POST /api/stock/correction (si tu autorises correction manuelle)
+
+Ventes
+
+POST /api/sales (toujours FC en entrée)
+
+GET /api/sales?from=...&to=...
+
+GET /api/sales/:invoice
+
+POST /api/sales/:invoice/print (écrit job JSON)
+
+POST /api/sales/:invoice/void (annulation pro)
+
+Dettes
+
+GET /api/debts
+
+POST /api/debts/from-sale/:invoice (auto)
+
+POST /api/debts/:id/payments
+
+Taux
+
+GET /api/rates/current
+
+PUT /api/rates/current
+
+Analytics
+
+GET /api/analytics/today
+
+GET /api/analytics/range?from=&to=
+
+GET /api/analytics/top-products
+
+Sync
+
+GET /api/sync/status
+
+POST /api/sync/push-now
+
+POST /api/sync/pull-now
+
+Print monitor
+
+GET /api/print/printers
+
+GET /api/print/templates
+
+GET /api/print/queue
+
+GET /api/print/errors
+
+POST /api/print/errors/retry
+
+13) Point clé : “Produits enregistrés dans Sheets automatiquement”
+
+Le mécanisme exact :
+
+L’utilisateur crée/modifie un produit (page Produits style Sheets)
+
+DB locale upsert
+
+Ajout dans sync_outbox :
+
+entity=products, op=upsert
+
+entity=product_units, op=upsert
+
+sync.worker.js en arrière-plan pousse dans la feuille (Carton/Milliers/Piece) selon unit_level
+
+14) Ce que tu dois renommer dans ton module print (important)
+
+Dans ton code, tu as encore des chemins/variables “LaGrace”. Il faut standardiser :
+
+C:\\Lagrace\\printer → C:\\Glowflixprojet\\printer
+
+LAGRACE_PRINT_DIR → GLOWFLIX_PRINT_DIR (ou fallback compatible)
+
+PS_PATH guardian : C:\\Glowflixprojet\\PrintQueueGuardian.ps1
+
+Event source : Glowflixprojet-Printer
+
+Tu peux garder compatibilité :
+
+si GLOWFLIX_PRINT_DIR vide, alors fallback LAGRACE_PRINT_DIR.
+
+Résultat final
+
+Avec cette structure :
+
+Tout le traitement est local immédiat (SQLite + WebSocket LAN)
+
+Sheets ne bloque jamais (sync worker)
+
+Produits/stock/vendes/dettes sont cohérents
+
+Les pages demandées existent (comptes, dettes, ventes, total jour, analytics, produits type Sheets, suppression facture pro)
+
+Impression est par job queue comme ton système, avec MARK lu avant impression et support 0.25/0.5/1.5.
+
+Ci-dessous, une proposition professionnelle de l’architecture “pages/écrans” d’un logiciel Windows offline-first (installable partout), avec connexion Internet uniquement pour l’activation initiale (si souhaitée), le téléchargement de contenus, et la synchronisation bidirectionnelle Google Sheets ⇄ local (par lots toutes les 10 secondes).
+
+1) Principes de base (offline-first, Windows, installable partout)
+
+Tout le traitement métier est local (ventes, stock, dettes, stats, impressions) : 0 dépendance Internet.
+
+SQLite = base locale principale (fiable, transactionnelle, rapide).
+
+LowDB / JSON = paramètres, cache UI, files d’attente légères (optionnel), mais le “vrai” métier reste en SQLite.
+
+Google Sheets = miroir cloud (ou “hub”) via Apps Script API, jamais la source qui bloque l’utilisateur.
+
+Synchronisation en arrière-plan : si Internet tombe, l’utilisateur continue, la synchro reprendra.
+
+2) Liste des pages (écrans) – noms pro + rôle + Internet/OFFLINE
+
+Format : Nom UI — (Nom interne recommandé) — Internet : Oui/Non — Objectif
+
+A. Démarrage / sécurité
+
+Écran de démarrage — (SplashScreen) — Internet : Non
+Charge config locale, vérifie intégrité DB, lance les services (sync worker, impression, etc.).
+
+Assistant première installation — (FirstRunWizard) — Internet : Optionnel
+
+Crée automatiquement : dossier de données, DB SQLite, tables, paramètres initiaux, utilisateur admin.
+
+Peut proposer : “Activer en ligne maintenant” ou “Continuer hors-ligne”.
+
+Vérification Internet / Activation — (ConnectivityGate / LicenseActivation) — Internet : Oui (si activation)
+Page d’ouverture qui demande Internet si vous imposez une activation/licence.
+
+Bouton Mode hors-ligne (si vous l’autorisez après une activation déjà faite).
+
+Enregistre un jeton/licence local chiffré.
+
+Connexion — (Login) — Internet : Non
+Auth locale (utilisateurs/roles). Verrouillage par PIN ou mot de passe.
+
+B. Pilotage / navigation
+
+Tableau de bord — (Dashboard) — Internet : Non
+KPIs : ventes du jour, stock critique, dettes en cours, bénéfice estimé, alertes.
+
+Centre de notifications — (NotificationsCenter) — Internet : Non
+Alertes : stock bas, échecs de synchro, ventes annulées, conflits résolus, etc.
+
+C. Ventes / caisse (POS)
+
+Page Ventes (POS) — (SalesPOS) — Internet : Non
+
+Recherche produit, panier, remise, TVA (si), client, mode paiement.
+
+Choix Devise d’affichage : FC / USD.
+
+Choix Type de vente : Cash / Dette.
+
+Paiement / Validation de vente — (CheckoutModal / PaymentFlow) — Internet : Non
+
+Si Cash : enregistre mouvement caisse + sortie stock.
+
+Si Dette : crée une dette liée au client + sortie stock.
+
+Historique des ventes — (SalesHistory) — Internet : Non
+Filtre par date, vendeur, client, cash/dette, devise, statut (validée/annulée).
+
+Détail vente + Actions — (SaleDetails) — Internet : Non
+Imprimer facture, dupliquer, annuler/avoir, voir écritures stock & caisse.
+
+D. Dettes / paiements
+
+Page Dettes clients — (Debts) — Internet : Non
+Liste des dettes, échéances, état (ouverte/partielle/réglée).
+
+Paiement de dette — (DebtPayment) — Internet : Non
+Encaissements partiels, reçus, historique paiements, solde restant.
+
+E. Produits / stock (gestion pro)
+
+Page Produits — (Products) — Internet : Non
+CRUD produits (même hors-ligne) : SKU, nom, catégorie, prix FC, prix USD (optionnel), stock min, images.
+
+Fiche produit — (ProductDetails) — Internet : Non
+
+Historique mouvements stock, ventes liées, marges, fournisseurs.
+
+Stock / Inventaire — (Inventory) — Internet : Non
+Vue stock, alertes, inventaire physique, corrections.
+
+Mouvements de stock — (StockMovements) — Internet : Non
+Entrées/sorties/ajustements, traçabilité (référence, utilisateur, motif).
+
+Achats / Approvisionnement — (Purchases) — Internet : Non
+Entrées stock via fournisseurs, coût d’achat, marge automatique.
+
+Fournisseurs — (Suppliers) — Internet : Non
+Fiches fournisseurs, historique achats, dettes fournisseur (si vous ajoutez).
+
+F. Clients / caisse / dépenses
+
+Clients — (Customers) — Internet : Non
+Fiche client, historique ventes, dettes, paiements.
+
+Caisse (Cashbook) — (CashRegister) — Internet : Non
+Entrées/sorties manuelles, solde caisse, journal.
+
+Dépenses — (Expenses) — Internet : Non
+Dépenses opérationnelles, catégories, impact sur résultat.
+
+G. Outils, paramètres, reporting
+
+Statistiques & Rapports — (Analytics) — Internet : Non
+CA, bénéfice, top produits, top clients, périodes, vendeurs.
+
+Impression & Modèles — (PrintingTemplates) — Internet : Non
+Modèle facture (A4, 80mm), logo, mentions légales.
+
+Calculatrice & Taux de change — (ToolsCalculator / ExchangeRate) — Internet : Non
+
+Calculatrice simple.
+
+Gestion du taux (FC↔USD) : changer le taux modifie les conversions d’affichage et les nouveaux enregistrements (voir règle ci-dessous).
+
+Paramètres — (Settings) — Internet : Non
+Devise par défaut, taux, taxes, unités, chemin sauvegarde, thèmes, imprimante.
+
+Utilisateurs & Rôles — (UsersRoles) — Internet : Non
+Admin, caissier, stock, lecture seule, etc.
+
+Journal d’audit — (AuditLog) — Internet : Non
+Qui a fait quoi, quand : création produit, vente, annulation, paiement dette, etc.
+
+Sauvegarde / Restauration — (BackupRestore) — Internet : Non
+Sauvegarde locale, export chiffré, restauration.
+
+H. Synchronisation (les seules pages “cloud”)
+
+Centre de synchronisation — (SyncCenter) — Internet : Oui (pour synchroniser)
+État : “En attente”, “Dernière synchro”, “Échecs”, “Conflits”, “Rejouer”.
+
+Téléchargement de contenu / Catalogue cloud — (CloudDownloads) — Internet : Oui
+Import d’images/ressources/produits partagés.
+
+3) Règles métier essentielles demandées (vente, dette, devise, taux)
+3.1 Devise FC / USD (comportement pro)
+
+Stockage recommandé : tous les montants en FC en base (précision + cohérence), même si l’utilisateur affiche en USD.
+
+Chaque vente enregistre aussi :
+
+currency_display (FC ou USD)
+
+exchange_rate_snapshot (taux utilisé au moment de la vente)
+
+total_fc (valeur réelle stockée)
+
+total_usd (valeur dérivée pour affichage/impression si nécessaire)
+
+Ainsi, si vous changez le taux demain, les anciennes factures restent cohérentes (elles gardent leur taux “snapshot”).
+
+3.2 Vente “Dette”
+
+Si l’utilisateur choisit Dette à la caisse :
+
+Créer debt + debt_items liés à la vente.
+
+Stock sort immédiatement (réservation/consommation réelle).
+
+Paiements partiels via la page dettes.
+
+4) Suppression / annulation de vente (stock restauré, traçabilité)
+
+En gestion pro, on évite de supprimer une vente. On fait :
+
+Option A (recommandée) : Annuler / Void
+
+Statut vente = VOIDED
+
+Création automatique d’une écriture inverse :
+
+Stock : restauration des quantités (mouvement “IN”).
+
+Caisse : sortie/entrée inverse (si cash).
+
+Dette : annulation dette ou ajustement si déjà partiellement payée (générer un avoir).
+
+Option B : Avoir / Retour
+
+Crée une nouvelle pièce “Avoir” (note de crédit), et gère partiellement (retour 1 article sur 5).
+
+Stock restauré uniquement sur les articles retournés.
+
+Dans les deux cas : audit log obligatoire (qui, quand, pourquoi).
+
+5) Synchronisation Google Sheets ⇄ Local (bidirectionnelle, par lots, toutes les 10 s)
+
+Objectif : éviter que Sheets “écrase” un produit local non encore synchronisé, et gérer les modifications des deux côtés.
+
+5.1 Identifiants et versioning (clé anti-écrasement)
+
+Chaque entité (produit, vente, dette…) doit avoir :
+
+id unique (UUID ou timestamp+random)
+
+updated_at (ISO) + updated_by
+
+version (entier) ou hash de contenu
+
+deleted_at (soft delete) si nécessaire
+
+5.2 Journal local de changements (queue)
+
+Dans SQLite :
+
+Table sync_queue : enregistre chaque opération locale (CREATE/UPDATE/DELETE/VOID) avec entity, entity_id, payload, op_id, created_at.
+
+Les opérations sont idempotentes via op_id : si envoyées 2 fois, le serveur ignore le doublon.
+
+5.3 Cycle toutes les 10 secondes (batch)
+
+Toutes les 10 s, le worker fait :
+
+PUSH (Local → Sheets) par lot (ex: 50 ops)
+
+Envoie les ops au backend Apps Script.
+
+Backend applique en Sheets (ou tables “mirror”).
+
+Retourne : succès/échec + remote_version.
+
+PULL (Sheets → Local) par lot
+
+Le local envoie last_remote_sync_at (ou remote_cursor).
+
+Le backend renvoie seulement les lignes modifiées depuis cette date.
+
+Le local applique (UPSERT) si la version distante est plus récente.
+
+5.4 Résolution de conflits (simple et pro)
+
+Conflit = même entity_id modifié des deux côtés avant convergence.
+Stratégie recommandée (pratique) :
+
+Règle 1 : “Last write wins” basé sur updated_at (avec tolérance).
+
+Règle 2 : priorité local si l’app est “maître” et Sheets seulement un miroir.
+
+Les conflits sont listés dans SyncCenter → Conflits avec bouton “Choisir local” / “Choisir cloud”.
+
+5.5 Ne jamais bloquer la vente
+
+Si Sheets est lent : la vente est validée localement en < 100 ms.
+
+La synchro rattrape après, sans impacter l’utilisateur.
+
+6) Mapping “Pages ↔ Feuilles Sheets” (logique pro)
+
+Même si Sheets n’est qu’un miroir, vous pouvez garder des feuilles “tables” :
+
+products
+
+product_images
+
+stock_movements
+
+sales
+
+sale_items
+
+debts
+
+debt_payments
+
+customers
+
+suppliers
+
+purchases
+
+expenses
+
+users (optionnel si vous ne voulez pas pousser les comptes)
+
+sync_log (journal technique)
+
+Chaque feuille doit contenir id, updated_at, version, deleted_at.
+
+7) Pages qui “demandent Internet” (exactement ce que vous avez demandé)
+
+Vérification Internet / Activation (ConnectivityGate) : Internet requis uniquement si activation/licence.
+
+Centre de synchronisation (SyncCenter) : Internet requis pour envoyer/recevoir.
+
+Téléchargement de contenus (CloudDownloads) : Internet requis.
+
+Le reste : strictement hors-ligne.
+
+Si vous le souhaitez, je peux maintenant vous donner :
+
+Une arborescence d’écran (menu latéral + sous-menus) type application pro,
+
+Un schéma SQLite minimal (tables + clés + index),
+
+Le workflow exact “vente cash / vente dette / annulation / retour” avec écritures stock+caisse,
+sans code, mais prêt à être donné à un informaticien. D’accord. Voici une conception cohérente et professionnelle pour que :
+
+La licence fonctionne 100 % hors connexion (clé fixe 0987654321 affichée/saisie).
+
+L’interface soit une app Desktop React + Electron (design pro).
+
+L’application soit consultable depuis d’autres appareils via http://IP:PORT et détectable via Bonjour/mDNS.
+
+1) Licence 100 % hors connexion (clé 0987654321)
+Objectif
+
+Aucune activation Internet.
+
+À la première ouverture, l’utilisateur saisit une clé (ex. 0987654321), le logiciel déverrouille et stocke localement l’état “licencé”.
+
+Flux recommandé (simple et robuste)
+
+Page 1 : “Licence hors connexion”
+
+Champ : Clé de licence
+
+Bouton : Activer
+
+Message : Licence valide / invalide
+
+Validation
+
+Si la clé saisie = 0987654321 → OK.
+
+L’app crée localement un fichier ou une entrée sécurisée :
+
+license.json (ou SQLite table app_license)
+
+Flag is_licensed = true
+
+activated_at, activated_by_user, etc.
+
+Stockage sécurisé (Windows)
+
+Même si vous gardez une clé simple, stockez l’état de licence de façon propre :
+
+Stockage recommandé :
+
+DPAPI Windows (chiffrement lié à la machine), ou
+
+SQLite + champ chiffré, ou
+
+keytar (gestionnaire d’identifiants) si acceptable.
+
+Note pro : une clé fixe universelle est facile à partager. Si vous voulez garder “offline” mais plus pro, vous pouvez plus tard passer à une clé signée (sans Internet), tout en conservant un mode “clé simple” pour vos tests.
+
+2) App “React + Electron” (design pro, pages)
+Architecture UI (Renderer React)
+
+Routing : react-router-dom
+
+UI : votre style “Ultra Pro Glass v3” (dark premium), + composants cohérents.
+
+State : zustand ou redux toolkit (zustand souvent plus simple).
+
+Temps réel : WebSocket (pour mises à jour stock/ventes sur tous les clients web connectés).
+
+Pages principales (exemple pro)
+
+Splash / Boot
+
+Licence (offline)
+
+Login
+
+Dashboard
+
+Ventes (POS)
+
+Historique ventes
+
+Détail vente (annuler/avoir)
+
+Produits
+
+Stock & mouvements
+
+Dettes
+
+Paiement dette
+
+Clients
+
+Dépenses / Caisse
+
+Statistiques & rapports
+
+Paramètres (taux FC/USD, imprimante, etc.)
+
+Centre de synchronisation Sheets (optionnel Internet)
+
+Sauvegarde / restauration
+
+Audit log
+
+3) “Lisible dans le navigateur des autres” via HTTP (IP local)
+Principe
+
+Votre application Electron devient aussi un serveur local :
+
+Elle ouvre un serveur HTTP (Express/Fastify) sur un port fixe ou configurable (ex. 3030).
+
+Elle sert :
+
+une version Web du front React (build web),
+
+et/ou une API (/api/...) + WebSocket (/ws).
+
+Les autres appareils sur le même Wi-Fi/LAN ouvrent :
+
+http://192.168.x.x:3030
+
+Deux modes possibles (recommandé)
+
+Mode A — “Desktop + Web” (le plus simple)
+
+Electron = “serveur + DB + UI”
+
+Les navigateurs = “clients web”
+
+Avantage : une seule base SQLite locale, les autres consultent/encodent via API.
+
+Mode B — “Service Windows” (très pro)
+
+Vous installez un service : LaGraceService.exe (headless) qui héberge DB + API.
+
+Electron n’est qu’un client UI (et peut même ne pas être lancé).
+
+Avantage : stabilité, l’API reste accessible même si l’UI est fermée.
+
+Points indispensables (sinon c’est risqué)
+
+Auth obligatoire côté web (login + token).
+
+Rôles (admin, vendeur, stock…).
+
+Pairing (optionnel mais pro) :
+
+la première connexion web demande un code affiché sur l’ordinateur serveur.
+
+Firewall Windows : l’installateur ajoute une règle pour autoriser le port (3030) sur réseau privé.
+
+HTTPS : optionnel en LAN, mais recommandé si vous gérez des données sensibles (sinon au minimum token + expiration).
+
+4) Bonjour / mDNS (“LaGrace” détectable automatiquement)
+Objectif
+
+Ne pas obliger les gens à chercher l’IP.
+Avec Bonjour (mDNS), les appareils voient automatiquement le service :
+
+Nom : LaGrace
+
+Type : _http._tcp
+
+Port : 3030
+
+Domaine : .local
+
+Les clients peuvent accéder via :
+
+http://lagrace.local:3030 (selon OS/réseau)
+
+ou afficher une liste de services détectés.
+
+Comportement attendu
+
+Dès que le serveur démarre, il “annonce” le service.
+
+Une page “Réseau” dans l’app peut afficher :
+
+IP locale
+
+Port
+
+Nom Bonjour
+
+QR code d’accès (facilite mobile)
+
+5) Cohérence Offline-first + Multi-clients (important)
+
+Comme plusieurs navigateurs peuvent agir en même temps, vous devez imposer :
+
+SQLite en WAL mode
+
+Transactions strictes
+
+Écritures via API uniquement (pas de modifications directes côté client)
+
+Diffusion temps réel via WebSocket :
+
+Dès qu’une vente est validée → tous les clients voient stock et ventes se mettre à jour.
+
+6) Synchronisation Sheets (toujours optionnelle Internet)
+
+Même avec accès web LAN, votre logique reste :
+
+Local = source immédiate (SQLite)
+
+Sync Sheets = worker en arrière-plan par lots (toutes les 10 s ou 30 s selon charge)
+
+Bidirectionnel avec updated_at/version, conflits gérés dans “SyncCenter”.
+
+7) Structure de projet (pro) – React/Electron + serveur
+
+Recommandation d’organisation :
+
+apps/desktop-electron/
+
+main/ (process Electron, lancement serveur, auto-update optionnel)
+
+preload/
+
+renderer/ (React UI Desktop)
+
+apps/web-client/ (React web build pour navigateurs)
+
+packages/server/ (Express/Fastify, API, WebSocket, Bonjour, auth)
+
+packages/db/ (SQLite schema, migrations, repositories)
+
+packages/shared/ (types, validations, utils)
+
+8) Ce que je vous conseille d’afficher dans la page “Licence Offline”
+
+Titre : Activation hors connexion
+
+Champ : Clé de licence
+
+Exemple placeholder : 0987654321
+
+Bouton : Activer
+
+Bloc info : “Aucune connexion Internet requise”
+
+En cas OK : rediriger automatiquement vers Login.
+A) Pages système (démarrage)
+
+Page Splash (Boot)
+
+Chargement : DB locale, services, lecture licence, démarrage serveur local.
+
+Indicateurs : “DB OK”, “Serveur LAN OK”, “Sync prêt”.
+
+Page Licence Hors Connexion
+
+Saisie clé (ex. 0987654321)
+
+Statut : Activé / Non activé
+
+Page Connexion
+
+Login (nom d’utilisateur / mot de passe)
+
+Choix rôle (si multi-roles)
+
+Mode “hors ligne” affiché clairement
+
+B) Pages Accueil / Navigation
+
+Page Accueil (Dashboard)
+
+Résumé du jour : ventes FC/USD, bénéfice estimé, stock critique, dettes dues, caisse.
+
+Widgets : Top produits, alertes, dernières ventes.
+
+Page Notifications & Alertes
+
+Stock bas, produits non synchronisés, erreurs sync, dettes échues, écarts de caisse.
+
+C) Module Ventes (POS)
+
+Page Ventes (POS)
+
+Recherche produit, ajout panier, quantités, remise.
+
+Choix devise : FC / USD
+
+Choix type : Vente Cash / Vente Dette
+
+Paiement : cash, partiel, etc.
+
+Impression facture.
+
+Page Validation Vente (Résumé)
+
+Récap : articles, total, taux appliqué, devise, type (cash/dette)
+
+Bouton : Confirmer / Annuler
+
+Page Historique Ventes
+
+Filtres : date, client, devise, statut sync, annulée/non.
+
+Actions : voir détail, annuler (avoir), réimprimer.
+
+Page Détail Vente
+
+Détails complets + audit (qui a vendu, quand, appareil)
+
+Actions pro :
+
+Annuler vente (Avoir) → restaure stock
+
+Retour partiel (optionnel)
+
+Corriger mode paiement (si autorisé)
+
+D) Module Caisse (Cash Management)
+
+Page Caisse (État de caisse)
+
+Solde initial, entrées, sorties, solde théorique.
+
+Séparation FC / USD.
+
+Boutons : “Ajouter entrée”, “Ajouter sortie”.
+
+Page Opérations de Caisse
+
+Formulaire : motif, montant, devise, catégorie
+
+Justificatif (optionnel) : photo/pdf local
+
+Page Clôture de Caisse
+
+Comptage réel (FC/USD)
+
+Écart calculé
+
+Signature / validation admin
+
+E) Module Produits (style “Sheets”)
+
+Page Produits (Tableur Pro)
+
+Table type Sheets :
+
+Code, Nom, Catégorie, Prix FC, Prix USD, Stock, Seuil, Fournisseur, Statut, Dernière modif
+
+Actions :
+
+Ajouter, modifier, archiver
+
+Import/export (CSV)
+
+Marquer “à synchroniser”
+
+Page Nouveau Produit
+
+Champs : code/barcode, nom, catégorie, prix, devise, stock initial, images, description.
+
+Page Détail Produit
+
+Historique : mouvements stock, dernières ventes, modifications.
+
+Actions : ajuster stock, changer prix, archiver.
+
+F) Module Stock
+
+Page Stock (Vue globale)
+
+Stock actuel, seuils, ruptures, alertes.
+
+Tri : critique / normal / surstock.
+
+Page Mouvements de Stock
+
+Entrée (achat), sortie (perte), transfert, correction.
+
+Chaque mouvement = trace + motif.
+
+Page Inventaire (Correction)
+
+Mode inventaire : stock théorique vs stock réel
+
+Génère ajustements automatiquement.
+
+G) Module Dettes
+
+Page Dettes (Table)
+
+Liste dettes : client, montant, devise, restant, échéance, statut.
+
+Filtres : échue, partielle, soldée.
+
+Page Nouvelle Dette (liée à Vente)
+
+Créée automatiquement si vente = “Dette”
+
+Infos : client, total, acompte, restant, plan de paiement.
+
+Page Détail Dette
+
+Historique paiements
+
+Actions :
+
+Ajouter paiement
+
+Remise exceptionnelle (admin)
+
+Clôturer dette
+
+Page Paiement Dette
+
+Saisie : montant, devise (FC/USD), taux appliqué, mode paiement
+
+Reçu imprimable
+
+H) Module Clients / Comptes
+
+Page Clients
+
+Liste : nom, téléphone, adresse, total dettes, total achats.
+
+Actions : créer, modifier, bloquer.
+
+Page Nouveau Client
+
+Profil client + options (plafond dette, échéance par défaut)
+
+Page Comptes Utilisateurs (Staff)
+
+Gestion des comptes (vendeur, caissier, admin, stock)
+
+Activation/désactivation
+
+Réinitialiser mot de passe
+
+Page Profil & Sécurité
+
+Modifier mot de passe
+
+Sessions ouvertes
+
+Permissions (lecture seule, vente, annulation, etc.)
+
+I) Statistiques & Rapports
+
+Page Statistiques (Global)
+
+Graphiques : ventes jour/semaine/mois, bénéfice, dettes, caisse
+
+Top produits, top clients
+
+Page Rapport Ventes
+
+Export PDF/Excel
+
+Détails par période / par vendeur / par devise
+
+Page Rapport Stock
+
+Produits critiques, rupture, rotation stock
+
+Page Rapport Dettes
+
+Dettes échues, recouvrement, performance
+
+J) Synchronisation & Maintenance
+
+Page Centre de Synchronisation (Sheets)
+
+Statut : “Offline/Online”
+
+File d’attente des opérations (batch)
+
+Conflits (local vs sheets)
+
+Bouton : “Sync maintenant”
+
+Page Paramètres
+
+Taux FC/USD (manuel + historique)
+
+Devise par défaut
+
+Règles de taxe/remise
+
+Imprimante, format ticket, logo
+
+Page Sauvegarde / Restauration
+
+Backup automatique local (zip chiffré)
+
+Restaurer base
+
+Page Audit Log
+
+Journal : ventes, annulations, modifications produit, paiements dette, caisse
+
+Filtrable par utilisateur
+
+Noms courts recommandés (menu)
+
+Accueil
+
+Ventes
+
+Historique
+
+Caisse
+
+Produits
+
+Stock
+
+Dettes
+
+Clients
+
+Comptes
+
+Statistiques
+
+Synchronisation
+
+Paramètres
+
+Sauvegarde
+
+Audit
+
+Si vous voulez, je peux aussi vous donner :
+
+la structure du menu (sidebar) par rôles (admin/vendeur/caissier), est utilise le id de sheets ici https://docs.google.com/spreadsheets/d/111HH1yCU1gB5Uovbcach_Olz1e3hL4-J0z8QGHoOEtI/edit?gid=344303493#gid=344303493 en genera un code.gs complet qui sera avec tout le code complet pro de appscript qui utilise le strcyure est nom de feille site la 

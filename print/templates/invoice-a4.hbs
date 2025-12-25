@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8"/>
+<title>Facture A4</title>
+<style>
+  @page { size: A4 auto; margin: 12mm; }
+  html, body { background:#fff !important; color:#000 !important; margin:0; padding:0; }
+  *, *::before, *::after { color:#000 !important; -webkit-text-fill-color:#000 !important; background:transparent !important; box-shadow:none !important; text-shadow:none !important; }
+  body { font-family: Arial, sans-serif; font-size: 12.5px; }
+  h1 { text-align:center; font-size: 20px; margin: 0 0 8px; }
+  .meta { margin-bottom: 8px; }
+  .grid { display:grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  hr { border:0; border-top:1px dashed #000; margin: 10px 0; }
+  table { width:100%; border-collapse: collapse; }
+  th, td { border: 1px solid #000; padding: 6px; text-align: left; }
+  th.num, td.num { text-align: right; }
+  .totals { margin-top: 12px; text-align: right; font-weight: bold; }
+</style>
+</head>
+<body>
+  <h1>FACTURE (A4)</h1>
+  <div class="grid meta">
+    <div>
+      <div><b>Entreprise :</b> {{entreprise.nom}}</div>
+      {{#if entreprise.rccm}}<div><b>RCCM :</b> {{entreprise.rccm}}</div>{{/if}}
+      {{#if entreprise.impot}}<div><b>Impôt :</b> {{entreprise.impot}}</div>{{/if}}
+      {{#if entreprise.tel}}<div><b>Tél :</b> {{entreprise.tel}}</div>{{/if}}
+    </div>
+    <div>
+      <div><b>Date :</b> {{now "YYYY-MM-DD HH:mm"}}</div>
+      {{#if factureNum}}<div><b>Facture N° :</b> {{factureNum}}</div>{{/if}}
+      {{#if client}}<div><b>Client :</b> {{client}}</div>{{/if}}
+      {{#if taux}}<div><b>Taux :</b> {{fmtFC taux}} FC</div>{{/if}}
+    </div>
+  </div>
+
+  <hr/>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Article</th><th class="num">Qté</th><th class="num">PU (FC)</th><th class="num">Total (FC)</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{#if lines.length}}
+        {{#each lines}}
+        <tr>
+          <td>{{nom}}</td>
+          <td class="num">{{qty}}</td>
+          <td class="num">{{fmtFC pu}}</td>
+          <td class="num"><b>{{fmtFC total}}</b></td>
+        </tr>
+        {{/each}}
+      {{else}}
+        <tr><td colspan="4">—</td></tr>
+      {{/if}}
+    </tbody>
+  </table>
+
+  <div class="totals">
+    <div>Total FC : <b>{{fmtFC total}} FC</b></div>
+    {{#if taux}}<div>USD : <b>{{fmtUSD total taux}} USD</b></div>{{/if}}
+  </div>
+</body>
+</html>
