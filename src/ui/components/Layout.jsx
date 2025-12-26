@@ -1,4 +1,4 @@
-import { Link, useLocation } from 'react-router-dom';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import {
   LayoutDashboard,
@@ -29,7 +29,19 @@ const menuItems = [
 
 const Layout = ({ children }) => {
   const location = useLocation();
+  const navigate = useNavigate();
   const { logout, user, isOnline, socketConnected } = useStore();
+  
+  const handleLogout = () => {
+    logout();
+    // Nettoyer localStorage
+    localStorage.removeItem('token');
+    localStorage.removeItem('glowflix-store');
+    // Rediriger vers la page de login
+    navigate('/login', { replace: true });
+    // Recharger la page pour réinitialiser complètement l'état
+    window.location.reload();
+  };
 
   return (
     <div className="min-h-screen flex">
@@ -129,7 +141,7 @@ const Layout = ({ children }) => {
 
           {/* Logout */}
           <button
-            onClick={logout}
+            onClick={handleLogout}
             className="w-full btn-secondary flex items-center justify-center gap-2"
           >
             <LogOut className="w-4 h-4" />

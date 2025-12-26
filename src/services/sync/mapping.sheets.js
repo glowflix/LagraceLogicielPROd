@@ -63,7 +63,7 @@ export const SHEET_MAPPINGS = {
       mark: 'MARK',
       unit_price: 'Prix unitaire',
       seller: 'Vendeur',
-      unit_level: 'mode stock',
+      unit_level: 'Unite',
       phone: 'Telephone',
       usd: 'USD',
       uuid: '_uuid'

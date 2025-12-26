@@ -56,7 +56,7 @@ router.get('/:id', optionalAuth, (req, res) => {
  */
 router.post('/', authenticate, async (req, res) => {
   try {
-    const { username, password, phone, is_admin } = req.body;
+    const { username, password, phone, is_admin, is_active, device_brand, profile_url, expo_push_token } = req.body;
 
     if (!username || !password) {
       return res.status(400).json({
@@ -79,13 +79,30 @@ router.post('/', authenticate, async (req, res) => {
       password,
       phone,
       is_admin: is_admin ? 1 : 0,
+      is_active: is_active !== undefined ? is_active : 1,
+      is_vendeur: is_vendeur !== undefined ? (is_vendeur ? 1 : 0) : 1,
+      is_gerant_stock: is_gerant_stock ? 1 : 0,
+      can_manage_products: can_manage_products ? 1 : 0,
+      device_brand,
+      profile_url,
+      expo_push_token,
     });
 
-    // Ajouter à l'outbox pour synchronisation
+    // Ajouter à l'outbox pour synchronisation avec UUID - PRO et TOP
     syncRepo.addToOutbox('users', user.id.toString(), 'upsert', {
+      uuid: user.uuid, // CRITIQUE: Inclure UUID pour sync bidirectionnelle
       username: user.username,
-      phone: user.phone,
+      phone: user.phone || '',
       is_admin: user.is_admin,
+      is_active: user.is_active,
+      is_vendeur: user.is_vendeur !== undefined ? user.is_vendeur : 1,
+      is_gerant_stock: user.is_gerant_stock || 0,
+      can_manage_products: user.can_manage_products || 0,
+      created_at: user.created_at,
+      updated_at: user.updated_at,
+      device_brand: user.devices?.[0]?.device_brand || '',
+      profile_url: user.devices?.[0]?.profile_url || '',
+      expo_push_token: user.devices?.map(d => d.expo_push_token).filter(Boolean).join('|') || '',
     });
 
     // Audit log
@@ -110,7 +127,7 @@ router.post('/', authenticate, async (req, res) => {
 router.put('/:id', authenticate, async (req, res) => {
   try {
     const userId = parseInt(req.params.id);
-    const { username, password, phone, is_admin, is_active } = req.body;
+    const { username, password, phone, is_admin, is_active, is_vendeur, is_gerant_stock, can_manage_products, device_brand, profile_url, expo_push_token } = req.body;
 
     const existing = usersRepo.findById(userId);
     if (!existing) {
@@ -126,14 +143,28 @@ router.put('/:id', authenticate, async (req, res) => {
       phone,
       is_admin,
       is_active,
+      is_vendeur,
+      is_gerant_stock,
+      can_manage_products,
+      device_brand,
+      profile_url,
+      expo_push_token,
     });
 
-    // Ajouter à l'outbox pour synchronisation
+    // Ajouter à l'outbox pour synchronisation avec UUID - PRO et TOP
     syncRepo.addToOutbox('users', user.id.toString(), 'upsert', {
+      uuid: user.uuid, // CRITIQUE: Inclure UUID pour sync bidirectionnelle
       username: user.username,
-      phone: user.phone,
+      phone: user.phone || '',
       is_admin: user.is_admin,
       is_active: user.is_active,
+      is_vendeur: user.is_vendeur !== undefined ? user.is_vendeur : 1,
+      is_gerant_stock: user.is_gerant_stock || 0,
+      can_manage_products: user.can_manage_products || 0,
+      updated_at: user.updated_at,
+      device_brand: user.devices?.[0]?.device_brand || '',
+      profile_url: user.devices?.[0]?.profile_url || '',
+      expo_push_token: user.devices?.map(d => d.expo_push_token).filter(Boolean).join('|') || '',
     });
 
     // Audit log

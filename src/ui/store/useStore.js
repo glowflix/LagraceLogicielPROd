@@ -272,13 +272,22 @@ export const useStore = create(
 
       loadSales: async (filters = {}) => {
         try {
-          const params = new URLSearchParams(filters);
-          const response = await axios.get(
-            `${API_URL}/api/sales?${params.toString()}`
-          );
-          set({ sales: response.data });
+          // Construire les paramètres de requête manuellement pour gérer correctement les dates
+          const params = new URLSearchParams();
+          if (filters.from) params.append('from', filters.from);
+          if (filters.to) params.append('to', filters.to);
+          if (filters.status) params.append('status', filters.status);
+          
+          const queryString = params.toString();
+          const url = queryString 
+            ? `${API_URL}/api/sales?${queryString}`
+            : `${API_URL}/api/sales`;
+          
+          const response = await axios.get(url);
+          set({ sales: response.data || [] });
         } catch (error) {
           console.error('Erreur chargement ventes:', error);
+          set({ sales: [] }); // En cas d'erreur, vider la liste
         }
       },
 

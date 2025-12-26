@@ -4,6 +4,7 @@ import path from 'path';
 
 export default defineConfig({
   plugins: [react()],
+  base: './', // Important pour Electron (évite les problèmes d'assets)
   root: '.',
   publicDir: 'public',
   server: {

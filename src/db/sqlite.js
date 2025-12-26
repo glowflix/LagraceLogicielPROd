@@ -132,6 +132,12 @@ function applyMigrations() {
     // Migrations pour la table product_units
     const unitsUuidAdded = ensureColumn('product_units', 'uuid', 'TEXT');
     
+    // Migrations pour la table users
+    const usersUuidAdded = ensureColumn('users', 'uuid', 'TEXT');
+    ensureColumn('users', 'is_vendeur', 'INTEGER DEFAULT 1');
+    ensureColumn('users', 'is_gerant_stock', 'INTEGER DEFAULT 0');
+    ensureColumn('users', 'can_manage_products', 'INTEGER DEFAULT 0');
+    
     // Migrations pour la table debts
     ensureColumn('debts', 'uuid', 'TEXT');
     ensureColumn('debts', 'client_phone', 'TEXT');
@@ -140,6 +146,23 @@ function applyMigrations() {
     ensureColumn('debts', 'debt_fc_in_usd', 'REAL');
     ensureColumn('debts', 'note', 'TEXT');
     ensureColumn('debts', 'synced_at', 'TEXT');
+    
+    // Migrations pour la table sales (CRITIQUE pour synchronisation Sheets)
+    const salesUuidAdded = ensureColumn('sales', 'uuid', 'TEXT');
+    ensureColumn('sales', 'client_phone', 'TEXT');
+    // Note: origin peut déjà exister, on vérifie avant d'ajouter
+    if (!columnExists('sales', 'origin')) {
+      ensureColumn('sales', 'origin', 'TEXT');
+      // Mettre à jour les valeurs existantes
+      try {
+        database.exec(`UPDATE sales SET origin = 'LOCAL' WHERE origin IS NULL`);
+      } catch (e) {
+        logger.warn('[MIGRATION] Erreur mise à jour origin:', e.message);
+      }
+    }
+    
+    // Migrations pour la table sale_items (CRITIQUE pour synchronisation Sheets)
+    const saleItemsUuidAdded = ensureColumn('sale_items', 'uuid', 'TEXT');
     
     // Générer des UUIDs pour les produits existants qui n'en ont pas
     if (productsUuidAdded || columnExists('products', 'uuid')) {
@@ -183,6 +206,69 @@ function applyMigrations() {
       }
     }
     
+    // Générer des UUIDs pour les utilisateurs existants qui n'en ont pas
+    if (usersUuidAdded || columnExists('users', 'uuid')) {
+      try {
+        const usersWithoutUuid = database.prepare('SELECT id FROM users WHERE uuid IS NULL OR uuid = ""').all();
+        
+        if (usersWithoutUuid.length > 0) {
+          logger.info(`[MIGRATION] Génération de ${usersWithoutUuid.length} UUID(s) pour les utilisateurs existants...`);
+          const updateStmt = database.prepare('UPDATE users SET uuid = ? WHERE id = ?');
+          
+          for (const user of usersWithoutUuid) {
+            const uuid = generateUUID();
+            updateStmt.run(uuid, user.id);
+          }
+          
+          logger.info(`[MIGRATION] ✅ ${usersWithoutUuid.length} UUID(s) généré(s) pour les utilisateurs`);
+        }
+      } catch (error) {
+        logger.warn('[MIGRATION] Erreur génération UUIDs utilisateurs:', error.message);
+      }
+    }
+    
+    // Générer des UUIDs pour les ventes existantes qui n'en ont pas
+    if (salesUuidAdded || columnExists('sales', 'uuid')) {
+      try {
+        const salesWithoutUuid = database.prepare('SELECT id FROM sales WHERE uuid IS NULL OR uuid = ""').all();
+        
+        if (salesWithoutUuid.length > 0) {
+          logger.info(`[MIGRATION] Génération de ${salesWithoutUuid.length} UUID(s) pour les ventes existantes...`);
+          const updateStmt = database.prepare('UPDATE sales SET uuid = ? WHERE id = ?');
+          
+          for (const sale of salesWithoutUuid) {
+            const uuid = generateUUID();
+            updateStmt.run(uuid, sale.id);
+          }
+          
+          logger.info(`[MIGRATION] ✅ ${salesWithoutUuid.length} UUID(s) généré(s) pour les ventes`);
+        }
+      } catch (error) {
+        logger.warn('[MIGRATION] Erreur génération UUIDs ventes:', error.message);
+      }
+    }
+    
+    // Générer des UUIDs pour les items de vente existants qui n'en ont pas
+    if (saleItemsUuidAdded || columnExists('sale_items', 'uuid')) {
+      try {
+        const itemsWithoutUuid = database.prepare('SELECT id FROM sale_items WHERE uuid IS NULL OR uuid = ""').all();
+        
+        if (itemsWithoutUuid.length > 0) {
+          logger.info(`[MIGRATION] Génération de ${itemsWithoutUuid.length} UUID(s) pour les items de vente existants...`);
+          const updateStmt = database.prepare('UPDATE sale_items SET uuid = ? WHERE id = ?');
+          
+          for (const item of itemsWithoutUuid) {
+            const uuid = generateUUID();
+            updateStmt.run(uuid, item.id);
+          }
+          
+          logger.info(`[MIGRATION] ✅ ${itemsWithoutUuid.length} UUID(s) généré(s) pour les items de vente`);
+        }
+      } catch (error) {
+        logger.warn('[MIGRATION] Erreur génération UUIDs items de vente:', error.message);
+      }
+    }
+    
     // Créer les index uniques sur uuid si les colonnes existent
     try {
       if (columnExists('products', 'uuid')) {
@@ -193,6 +279,15 @@ function applyMigrations() {
       }
       if (columnExists('debts', 'uuid')) {
         database.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_debts_uuid ON debts(uuid) WHERE uuid IS NOT NULL');
+      }
+      if (columnExists('users', 'uuid')) {
+        database.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_uuid ON users(uuid) WHERE uuid IS NOT NULL');
+      }
+      if (columnExists('sales', 'uuid')) {
+        database.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_uuid ON sales(uuid) WHERE uuid IS NOT NULL');
+      }
+      if (columnExists('sale_items', 'uuid')) {
+        database.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_sale_items_uuid ON sale_items(uuid) WHERE uuid IS NOT NULL');
       }
     } catch (error) {
       // Ignorer si l'index existe déjà

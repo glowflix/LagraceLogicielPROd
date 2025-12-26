@@ -19,11 +19,15 @@ INSERT OR IGNORE INTO settings(key,value) VALUES
 -- =========================
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  uuid TEXT UNIQUE,
   username TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
   phone TEXT,
   is_active INTEGER NOT NULL DEFAULT 1,
   is_admin INTEGER NOT NULL DEFAULT 0,
+  is_vendeur INTEGER NOT NULL DEFAULT 1,
+  is_gerant_stock INTEGER NOT NULL DEFAULT 0,
+  can_manage_products INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   synced_at TEXT
@@ -333,60 +337,94 @@ END;
 CREATE TRIGGER IF NOT EXISTS trg_sale_items_require_unit
 BEFORE INSERT ON sale_items
 BEGIN
+  -- Pour les ventes venant de Sheets, on autorise même si l'unité n'existe pas exactement
+  -- (ces ventes sont historiques et peuvent avoir des unités qui n'existent plus)
+  -- Pour les ventes locales, on vérifie que l'unité existe dans product_units
   SELECT CASE
     WHEN (
+      -- Si la vente vient de Sheets, autoriser (pas de vérification stricte)
+      SELECT origin FROM sales WHERE id = NEW.sale_id
+    ) = 'SHEETS'
+    THEN 1 -- Autoriser pour Sheets
+    WHEN (
+      -- Pour les ventes locales, vérifier que l'unité existe
       SELECT COUNT(*) FROM product_units
       WHERE product_id = NEW.product_id
         AND unit_level = NEW.unit_level
         AND unit_mark  = NEW.unit_mark
     ) = 0
     THEN RAISE(ABORT, 'Unité inconnue pour ce produit (unit_level/unit_mark)')
+    ELSE 1 -- Autoriser si l'unité existe
   END;
 END;
 
 -- =========================
 -- STOCK AUTO: INSERT/UPDATE/DELETE sale_items
+-- IMPORTANT: Ne décrémente PAS le stock pour les ventes venant de Sheets (déjà vendues)
 -- =========================
 CREATE TRIGGER IF NOT EXISTS trg_sale_items_stock_decrease_ai
 AFTER INSERT ON sale_items
 BEGIN
+  -- Ne décrémenter le stock QUE si la vente n'est PAS venue de Sheets
+  -- Les ventes SHEETS sont déjà des ventes passées, le stock a déjà été décrémenté
   UPDATE product_units
   SET stock_current = stock_current - NEW.qty,
       last_update   = datetime('now')
   WHERE product_id = NEW.product_id
     AND unit_level = NEW.unit_level
-    AND unit_mark  = NEW.unit_mark;
+    AND unit_mark  = NEW.unit_mark
+    AND EXISTS (
+      SELECT 1 FROM sales 
+      WHERE id = NEW.sale_id 
+        AND origin != 'SHEETS'
+    );
 END;
 
 CREATE TRIGGER IF NOT EXISTS trg_sale_items_stock_adjust_au
 AFTER UPDATE OF qty, unit_level, unit_mark, product_id ON sale_items
 BEGIN
-  -- Restore OLD
+  -- Restore OLD (seulement si pas SHEETS)
   UPDATE product_units
   SET stock_current = stock_current + OLD.qty,
       last_update   = datetime('now')
   WHERE product_id = OLD.product_id
     AND unit_level = OLD.unit_level
-    AND unit_mark  = OLD.unit_mark;
+    AND unit_mark  = OLD.unit_mark
+    AND EXISTS (
+      SELECT 1 FROM sales 
+      WHERE id = OLD.sale_id 
+        AND origin != 'SHEETS'
+    );
 
-  -- Apply NEW
+  -- Apply NEW (seulement si pas SHEETS)
   UPDATE product_units
   SET stock_current = stock_current - NEW.qty,
       last_update   = datetime('now')
   WHERE product_id = NEW.product_id
     AND unit_level = NEW.unit_level
-    AND unit_mark  = NEW.unit_mark;
+    AND unit_mark  = NEW.unit_mark
+    AND EXISTS (
+      SELECT 1 FROM sales 
+      WHERE id = NEW.sale_id 
+        AND origin != 'SHEETS'
+    );
 END;
 
 CREATE TRIGGER IF NOT EXISTS trg_sale_items_stock_restore_ad
 AFTER DELETE ON sale_items
 BEGIN
+  -- Restaurer le stock seulement si la vente n'était PAS venue de Sheets
   UPDATE product_units
   SET stock_current = stock_current + OLD.qty,
       last_update   = datetime('now')
   WHERE product_id = OLD.product_id
     AND unit_level = OLD.unit_level
-    AND unit_mark  = OLD.unit_mark;
+    AND unit_mark  = OLD.unit_mark
+    AND EXISTS (
+      SELECT 1 FROM sales 
+      WHERE id = OLD.sale_id 
+        AND origin != 'SHEETS'
+    );
 END;
 
 -- =========================

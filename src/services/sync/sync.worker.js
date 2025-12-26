@@ -4,7 +4,10 @@ import { productsRepo } from '../../db/repositories/products.repo.js';
 import { salesRepo } from '../../db/repositories/sales.repo.js';
 import { debtsRepo } from '../../db/repositories/debts.repo.js';
 import { ratesRepo } from '../../db/repositories/rates.repo.js';
+import { usersRepo } from '../../db/repositories/users.repo.js';
 import { syncLogger } from '../../core/logger.js';
+import { generateUUID } from '../../core/crypto.js';
+import bcrypt from 'bcrypt';
 
 // Intervalle de synchronisation (augmenté pour réduire la charge)
 const SYNC_INTERVAL_MS = parseInt(process.env.SYNC_INTERVAL_MS) || 30000; // 30 secondes par défaut (au lieu de 10s)
@@ -15,6 +18,49 @@ let syncRunning = false; // Mutex global pour empêcher les overlaps
 let _started = false; // Flag pour la boucle "après fin"
 let _loopTimeout = null; // Timeout de la boucle
 let isOnline = true; // État de connexion Internet
+let _salesSyncRunning = false; // Mutex pour la synchronisation des ventes
+let _salesLoopTimeout = null; // Timeout de la boucle de synchronisation des ventes
+
+/**
+ * Normalise l'unité depuis Sheets vers le format SQLite
+ * Sheets peut avoir: "millier", "carton", "piece" (ou variations)
+ * SQLite attend: "MILLIER", "CARTON", "PIECE" ou 1, 2, 3
+ */
+function normalizeUnitFromSheets(unitValue) {
+  if (!unitValue || typeof unitValue !== 'string') return null;
+  
+  const trimmed = unitValue.trim();
+  if (!trimmed) return null;
+  
+  const normalized = trimmed.toLowerCase();
+  
+  // Mapping des valeurs possibles depuis Sheets (ordre important : millier avant carton pour éviter les faux positifs)
+  // Gérer "milliers" (pluriel) et "millier" (singulier)
+  if (normalized === 'millier' || normalized === 'milliers' || normalized.includes('millier')) {
+    return 'MILLIER';
+  }
+  // Gérer "carton" et "cartons"
+  if (normalized === 'carton' || normalized === 'cartons' || normalized.includes('carton')) {
+    return 'CARTON';
+  }
+  // Gérer "piece", "pièce", "pieces", "pièces"
+  if (normalized === 'piece' || normalized === 'pièce' || normalized === 'pieces' || normalized === 'pièces' || normalized.includes('piece') || normalized.includes('pièce')) {
+    return 'PIECE';
+  }
+  
+  // Si c'est déjà en majuscules, le retourner tel quel
+  const upper = trimmed.toUpperCase();
+  if (upper === 'MILLIER' || upper === 'MILLIERS' || upper === 'CARTON' || upper === 'CARTONS' || upper === 'PIECE' || upper === 'PIECES' || upper === 'PIÈCE' || upper === 'PIÈCES') {
+    // Normaliser les pluriels en singulier
+    if (upper === 'MILLIERS') return 'MILLIER';
+    if (upper === 'CARTONS') return 'CARTON';
+    if (upper === 'PIECES' || upper === 'PIÈCES') return 'PIECE';
+    return upper;
+  }
+  
+  // Valeur non reconnue, retourner null pour forcer la recherche dans le produit
+  return null;
+}
 
 /**
  * Worker de synchronisation qui tourne en arrière-plan
@@ -107,6 +153,795 @@ export class SyncWorker {
     
     // Démarrer la boucle avec un délai initial pour ne pas bloquer le démarrage
     setTimeout(loop, 5000); // Attendre 5s avant la première sync
+    
+    // Démarrer la synchronisation dédiée des ventes (immédiate + toutes les 10 secondes)
+    this.startSalesSyncLoop();
+  }
+  
+  /**
+   * Synchronisation dédiée des ventes : Immédiate + toutes les 10 secondes
+   * Utilise la pagination avec cursor pour prendre beaucoup de données en lot
+   */
+  async startSalesSyncLoop() {
+    const SALES_SYNC_INTERVAL_MS = 10000; // 10 secondes
+    
+    syncLogger.info(`💰 [SALES-SYNC] Démarrage de la synchronisation dédiée des ventes`);
+    syncLogger.info(`   ⚡ [SALES-SYNC] Mode: IMMÉDIAT + toutes les ${SALES_SYNC_INTERVAL_MS / 1000} secondes`);
+    syncLogger.info(`   📦 [SALES-SYNC] Pagination avec cursor pour lots importants`);
+    syncLogger.info(`   🔄 [SALES-SYNC] Continue proprement là où on s'est arrêté`);
+    
+    // Fonction de synchronisation des ventes
+    const syncSalesLoop = async () => {
+      if (!_started) return; // Arrêter si le worker est arrêté
+      
+      if (_salesSyncRunning) {
+        syncLogger.debug(`⏭️ [SALES-SYNC] Sync ventes déjà en cours, skip`);
+        _salesLoopTimeout = setTimeout(syncSalesLoop, SALES_SYNC_INTERVAL_MS);
+        return;
+      }
+      
+      if (!isOnline) {
+        syncLogger.debug(`⏸️ [SALES-SYNC] Pas de connexion Internet, skip`);
+        _salesLoopTimeout = setTimeout(syncSalesLoop, SALES_SYNC_INTERVAL_MS);
+        return;
+      }
+      
+      _salesSyncRunning = true;
+      const syncStartTime = Date.now();
+      
+      try {
+        await this.syncSalesOnly();
+      } catch (error) {
+        syncLogger.error(`❌ [SALES-SYNC] Erreur lors de la synchronisation des ventes: ${error.message}`);
+      } finally {
+        _salesSyncRunning = false;
+        const elapsed = Date.now() - syncStartTime;
+        const wait = Math.max(1000, SALES_SYNC_INTERVAL_MS - elapsed); // Min 1s entre les syncs
+        
+        if (_started) {
+          _salesLoopTimeout = setTimeout(syncSalesLoop, wait);
+        }
+      }
+    };
+    
+    // Démarrer immédiatement (pas d'attente)
+    setImmediate(() => {
+      syncSalesLoop();
+    });
+  }
+  
+  /**
+   * Synchronise uniquement les ventes depuis Google Sheets avec pagination
+   * Utilise pullAllPaged avec cursor pour continuer là où on s'est arrêté
+   */
+  async syncSalesOnly() {
+    const salesStartTime = Date.now();
+    
+    try {
+      syncLogger.info(`💰 [SALES-SYNC] ==========================================`);
+      syncLogger.info(`💰 [SALES-SYNC] DÉBUT SYNCHRONISATION DES VENTES`);
+      syncLogger.info(`💰 [SALES-SYNC] ==========================================`);
+      
+      // Récupérer le cursor pour continuer là où on s'est arrêté (import initial en cours)
+      const cursor = syncRepo.getCursor('sales');
+      
+      // DÉTERMINER LE MODE DE SYNCHRONISATION
+      let sinceDate;
+      let syncMode;
+      let isIncrementalSync = false;
+      
+      if (cursor) {
+        // Cursor existe = Import initial en cours (pagination)
+        syncMode = 'IMPORT INITIAL (pagination en cours)';
+        sinceDate = new Date(0).toISOString(); // Télécharger toutes les ventes
+        const cursorStr = String(cursor);
+        syncLogger.info(`   📍 [SALES-SYNC] Cursor trouvé: continuation de la pagination`);
+        syncLogger.info(`   📍 [SALES-SYNC] Cursor: ${cursorStr.length > 50 ? cursorStr.substring(0, 50) + '...' : cursorStr}`);
+      } else {
+        // Pas de cursor = Synchronisation incrémentale ou import initial
+        const lastPullDate = syncRepo.getLastPullDate('sales');
+        
+        if (lastPullDate) {
+          // Synchronisation incrémentale : seulement les ventes modifiées/ajoutées depuis lastPullDate
+          // IMPORTANT: Utiliser une date légèrement antérieure pour éviter de manquer des ventes
+          // (à cause des différences de temps entre serveurs ou des arrondis)
+          const adjustedDate = new Date(lastPullDate.getTime() - 60000); // Soustraire 1 minute pour sécurité
+          syncMode = 'SYNC INCRÉMENTALE (mises à jour seulement)';
+          sinceDate = adjustedDate.toISOString();
+          isIncrementalSync = true;
+          syncLogger.info(`   🔄 [SALES-SYNC] Mode: ${syncMode}`);
+          syncLogger.info(`   📅 [SALES-SYNC] Dernière sync: ${lastPullDate.toISOString()} (${lastPullDate.toLocaleString('fr-FR')})`);
+          syncLogger.info(`   📅 [SALES-SYNC] Date ajustée (sécurité -1min): ${sinceDate} (${new Date(sinceDate).toLocaleString('fr-FR')})`);
+          syncLogger.info(`   📥 [SALES-SYNC] Téléchargement des ventes modifiées/ajoutées depuis cette date`);
+        } else {
+          // Pas de lastPullDate = Import initial complet
+          syncMode = 'IMPORT INITIAL (première synchronisation)';
+          sinceDate = new Date(0).toISOString();
+          syncLogger.info(`   🚀 [SALES-SYNC] Mode: ${syncMode}`);
+          syncLogger.info(`   📥 [SALES-SYNC] Téléchargement de TOUTES les ventes depuis Sheets`);
+        }
+      }
+      
+      syncLogger.info(`   📅 [SALES-SYNC] Date 'since': ${sinceDate} (${new Date(sinceDate).toLocaleString('fr-FR')})`);
+      
+      // Vérification AVANT téléchargement
+      let salesCountBefore = 0;
+      let itemsCountBefore = 0;
+      try {
+        const { getDb } = await import('../../db/sqlite.js');
+        const db = getDb();
+        const salesCountResult = db.prepare('SELECT COUNT(*) as count FROM sales WHERE origin = ?').get('SHEETS');
+        const itemsCountResult = db.prepare('SELECT COUNT(*) as count FROM sale_items').get();
+        salesCountBefore = salesCountResult?.count || 0;
+        itemsCountBefore = itemsCountResult?.count || 0;
+        syncLogger.info(`   🔍 [SALES-SYNC] ÉTAT AVANT: ${salesCountBefore} vente(s), ${itemsCountBefore} item(s) dans SQLite`);
+      } catch (initError) {
+        syncLogger.warn(`   ⚠️  [SALES-SYNC] Erreur vérification avant: ${initError.message}`);
+      }
+      
+      // Pull avec pagination PRO
+      if (isIncrementalSync) {
+        syncLogger.info(`   📥 [SALES-SYNC] Mode INCRÉMENTAL: Téléchargement des ventes modifiées/ajoutées depuis ${new Date(sinceDate).toLocaleString('fr-FR')}...`);
+      } else {
+        syncLogger.info(`   📥 [SALES-SYNC] Mode IMPORT COMPLET: Téléchargement depuis Google Sheets (mode PRO - continuera jusqu'à la fin)...`);
+      }
+      
+      let currentCursor = cursor;
+      let totalProcessed = 0;
+      let pageNumber = 0;
+      let isComplete = false;
+      let maxUpdatedAt = null; // Pour suivre la date de mise à jour la plus récente
+      
+      // BOUCLE jusqu'à ce que toutes les pages soient lues
+      while (!isComplete) {
+        pageNumber++;
+        syncLogger.info(`   📄 [SALES-SYNC] Page ${pageNumber} - Cursor: ${currentCursor || 'début'}`);
+        
+        // Utiliser pull() pour récupérer une seule page à la fois
+        // IMPORTANT: Toujours utiliser full=true pour s'assurer de récupérer toutes les ventes
+        // même en mode incrémental, car Google Sheets filtre déjà par _updated_at
+        const result = await sheetsClient.pull('sales', sinceDate, {
+          full: true, // Toujours true - Google Sheets filtre par _updated_at automatiquement
+          cursor: currentCursor,
+          maxRetries: 5,
+          timeout: isIncrementalSync ? 30000 : 60000, // Timeout plus court pour sync incrémentale (moins de données)
+          limit: isIncrementalSync ? 200 : 500 // Limite plus petite pour sync incrémentale (plus rapide)
+        });
+        
+        syncLogger.info(`   📊 [SALES-SYNC] Résultat page ${pageNumber}:`);
+        syncLogger.info(`      ✅ Success: ${result.success}`);
+        syncLogger.info(`      📦 Data length: ${result.data ? result.data.length : 0} ligne(s)`);
+        syncLogger.info(`      📍 Next cursor: ${result.next_cursor || 'null (fin de pagination)'}`);
+        syncLogger.info(`      ✅ Done: ${result.done !== undefined ? (result.done ? 'true (toutes les pages lues)' : 'false (plus de pages à lire)') : 'undefined'}`);
+        
+        // Vérifier si on a des données à appliquer
+        if (!result.success) {
+          syncLogger.warn(`   ⚠️  [SALES-SYNC] Échec du téléchargement page ${pageNumber}: ${result.error || 'Erreur inconnue'}`);
+          break; // Sortir de la boucle en cas d'erreur
+        }
+        
+        if (result.success && result.data && result.data.length > 0) {
+          syncLogger.info(`   ✅ [SALES-SYNC] ${result.data.length} ligne(s) téléchargée(s) depuis Sheets en ${Date.now() - salesStartTime}ms`);
+          
+          // Suivre la date de mise à jour la plus récente pour mettre à jour lastPullDate
+          for (const item of result.data) {
+            const itemUpdatedAt = item._updated_at || item._remote_updated_at || item.sold_at || item.created_at;
+            if (itemUpdatedAt) {
+              const itemDate = new Date(itemUpdatedAt);
+              if (!maxUpdatedAt || itemDate > maxUpdatedAt) {
+                maxUpdatedAt = itemDate;
+              }
+            }
+          }
+          
+          // Log détaillé des premières lignes pour vérification
+          if (result.data.length > 0) {
+            syncLogger.info(`   📋 [SALES-SYNC] Exemple de données téléchargées (3 premières lignes):`);
+            for (let i = 0; i < Math.min(3, result.data.length); i++) {
+              const item = result.data[i];
+              const updatedAt = item._updated_at || item._remote_updated_at || item.sold_at || 'N/A';
+              syncLogger.info(`      [${i + 1}] Facture: ${item.invoice_number || 'N/A'}, Client: ${item.client_name || 'N/A'}, Produit: ${item.product_code || 'N/A'}, Qty: ${item.qty || 0}, Updated: ${updatedAt}`);
+            }
+          }
+          
+          // Appliquer les mises à jour (qui gère le groupement par facture)
+          syncLogger.info(`   🔄 [SALES-SYNC] ==========================================`);
+          syncLogger.info(`   🔄 [SALES-SYNC] APPLICATION DES DONNÉES DANS SQLITE`);
+          syncLogger.info(`   🔄 [SALES-SYNC] ==========================================`);
+          syncLogger.info(`   📦 ${result.data.length} ligne(s) à traiter → Groupement par facture → Stockage dans SQLite`);
+          syncLogger.info(`   💾 Tables SQLite: "sales" + "sale_items"`);
+          const applyStartTime = Date.now();
+          const applyResult = await this.applyUpdates('sales', result.data);
+          const applyDuration = Date.now() - applyStartTime;
+          
+          // Vérification immédiate dans SQLite pour confirmer le stockage
+          let salesCountAfter = 0;
+          let itemsCountAfter = 0;
+          try {
+            const { getDb } = await import('../../db/sqlite.js');
+            const db = getDb();
+            const salesCountResult = db.prepare('SELECT COUNT(*) as count FROM sales WHERE origin = ?').get('SHEETS');
+            const itemsCountResult = db.prepare('SELECT COUNT(*) as count FROM sale_items').get();
+            salesCountAfter = salesCountResult?.count || 0;
+            itemsCountAfter = itemsCountResult?.count || 0;
+          } catch (verifyError) {
+            syncLogger.error(`   ❌ [SALES-SYNC] Erreur vérification après: ${verifyError.message}`);
+          }
+          
+          syncLogger.info(`   ✅ [SALES-SYNC] ==========================================`);
+          syncLogger.info(`   ✅ [SALES-SYNC] APPLICATION TERMINÉE EN ${applyDuration}ms`);
+          syncLogger.info(`   ✅ [SALES-SYNC] ==========================================`);
+          syncLogger.info(`      📊 Résultat de l'application:`);
+          syncLogger.info(`         ✅ ${applyResult.inserted || 0} facture(s) CRÉÉE(S) dans SQLite`);
+          syncLogger.info(`         ✅ ${applyResult.updated || 0} facture(s) MIS(E) À JOUR dans SQLite`);
+          syncLogger.info(`         ⏭️  ${applyResult.skipped || 0} facture(s) IGNORÉE(S) (déjà synchronisées)`);
+          if (applyResult.errorCount && applyResult.errorCount > 0) {
+            syncLogger.warn(`         ❌ ${applyResult.errorCount} facture(s) EN ERREUR`);
+          }
+          
+          // Vérification SQLite immédiate avec comparaison AVANT/APRÈS
+          syncLogger.info(`      🔍 [SALES-SYNC] VÉRIFICATION IMMÉDIATE DANS SQLITE:`);
+          syncLogger.info(`         📊 AVANT: ${salesCountBefore} vente(s), ${itemsCountBefore} item(s)`);
+          syncLogger.info(`         📊 APRÈS: ${salesCountAfter} vente(s), ${itemsCountAfter} item(s)`);
+          
+          const newSales = salesCountAfter - salesCountBefore;
+          const newItems = itemsCountAfter - itemsCountBefore;
+          
+          if (newSales > 0 || newItems > 0) {
+            syncLogger.info(`         ✅ ${newSales} nouvelle(s) vente(s) ajoutée(s) dans SQLite!`);
+            syncLogger.info(`         ✅ ${newItems} nouvel(aux) item(s) ajouté(s) dans SQLite!`);
+          } else if (applyResult.inserted > 0 || applyResult.updated > 0) {
+            syncLogger.warn(`         ⚠️  Des ventes ont été traitées (${applyResult.inserted} créée(s), ${applyResult.updated} mise(s) à jour) mais le nombre total n'a pas changé`);
+            syncLogger.warn(`         💡 Raison possible: Les ventes existaient déjà et ont été mises à jour`);
+          } else if (result.data.length > 0) {
+            syncLogger.error(`         ❌ ERREUR CRITIQUE: ${result.data.length} ligne(s) téléchargée(s) mais aucune vente stockée!`);
+            syncLogger.error(`         💡 Diagnostic: Vérifier les logs d'erreur ci-dessus pour chaque facture`);
+          }
+          
+          if (salesCountAfter > 0) {
+            syncLogger.info(`      ✅ [SALES-SYNC] CONFIRMÉ: ${salesCountAfter} vente(s) stockée(s) dans SQLite (table "sales")`);
+            syncLogger.info(`      ✅ [SALES-SYNC] CONFIRMÉ: ${itemsCountAfter} item(s) stocké(s) dans SQLite (table "sale_items")`);
+            syncLogger.info(`      💾 Les ventes sont maintenant stockées dans la base SQLite locale`);
+            syncLogger.info(`      📱 Elles seront visibles dans la page "Historique des ventes"`);
+          } else {
+            syncLogger.error(`      ❌ [SALES-SYNC] ERREUR CRITIQUE: Aucune vente trouvée dans SQLite après l'application!`);
+            syncLogger.error(`      📊 [SALES-SYNC] Diagnostic:`);
+            syncLogger.error(`         - Lignes téléchargées: ${result.data.length}`);
+            syncLogger.error(`         - Factures créées: ${applyResult.inserted || 0}`);
+            syncLogger.error(`         - Factures mises à jour: ${applyResult.updated || 0}`);
+            syncLogger.error(`         - Factures ignorées: ${applyResult.skipped || 0}`);
+            syncLogger.error(`      💡 [SALES-SYNC] Vérifier que applySalesUpdates() fonctionne correctement`);
+            syncLogger.error(`      💡 [SALES-SYNC] Vérifier les logs d'erreur ci-dessus pour chaque facture`);
+            
+            // Diagnostic supplémentaire
+            if (result.data.length > 0) {
+              const firstItem = result.data[0];
+              syncLogger.error(`      🔍 [SALES-SYNC] Exemple de première ligne téléchargée:`);
+              syncLogger.error(`         - invoice_number: ${firstItem.invoice_number || 'MANQUANT'}`);
+              syncLogger.error(`         - client_name: ${firstItem.client_name || 'N/A'}`);
+              syncLogger.error(`         - product_code: ${firstItem.product_code || 'MANQUANT'}`);
+              syncLogger.error(`         - qty: ${firstItem.qty !== undefined ? firstItem.qty : 'MANQUANT'}`);
+              syncLogger.error(`         - sold_at: ${firstItem.sold_at || 'MANQUANT'}`);
+            }
+          }
+          
+          totalProcessed += result.data.length;
+          
+          // Mettre à jour le cursor pour la prochaine itération
+          if (result.next_cursor && !result.done) {
+            currentCursor = result.next_cursor;
+            syncLogger.info(`   📍 [SALES-SYNC] Page ${pageNumber} traitée: ${result.data.length} ligne(s) | Total: ${totalProcessed} | Continuation...`);
+          } else {
+            // Fin de pagination
+            isComplete = true;
+            syncRepo.setCursor('sales', null);
+            syncLogger.info(`   ✅ [SALES-SYNC] Pagination terminée: ${totalProcessed} ligne(s) traitées au total`);
+          }
+        } else if (result.success && (!result.data || result.data.length === 0)) {
+          // Aucune donnée retournée - fin de pagination
+          syncLogger.info(`   ℹ️  [SALES-SYNC] Page ${pageNumber}: Aucune donnée retournée (fin de pagination)`);
+          isComplete = true;
+          syncRepo.setCursor('sales', null);
+        } else {
+          // Erreur - sortir de la boucle
+          syncLogger.warn(`   ⚠️  [SALES-SYNC] Erreur page ${pageNumber}: ${result.error || 'Erreur inconnue'}`);
+          break;
+        }
+      }
+      
+      // Mettre à jour la date de dernière synchronisation après toutes les pages
+      // Utiliser maxUpdatedAt si disponible (plus précis), sinon utiliser maintenant
+      const finalLastPullDate = maxUpdatedAt && maxUpdatedAt > new Date(sinceDate) 
+        ? maxUpdatedAt.toISOString() 
+        : new Date().toISOString();
+      
+      syncRepo.setLastPullDate('sales', finalLastPullDate);
+      
+      if (isIncrementalSync) {
+        syncLogger.info(`   ✅ [SALES-SYNC] Sync incrémentale terminée: ${totalProcessed} ligne(s) traitées`);
+        syncLogger.info(`   📅 [SALES-SYNC] lastPullDate mis à jour: ${finalLastPullDate} (${new Date(finalLastPullDate).toLocaleString('fr-FR')})`);
+      } else {
+        syncLogger.info(`💰 [SALES-SYNC] SYNCHRONISATION COMPLÈTE TERMINÉE (${Date.now() - salesStartTime}ms)`);
+        syncLogger.info(`💰 [SALES-SYNC] Total: ${totalProcessed} ligne(s) traitées en ${pageNumber} page(s)`);
+      }
+      syncLogger.info(`💰 [SALES-SYNC] ==========================================`);
+      
+      // Synchronisation bidirectionnelle : Push des ventes locales vers Sheets
+      syncLogger.info(`   🔄 [SALES-SYNC] Démarrage synchronisation bidirectionnelle...`);
+      try {
+        await this.syncLocalSalesToSheets();
+      } catch (pushError) {
+        syncLogger.warn(`   ⚠️ [SALES-SYNC] Erreur push ventes locales vers Sheets: ${pushError.message}`);
+        // Ne pas bloquer si erreur push (peut être hors ligne)
+      }
+      
+      // Nettoyage : Supprimer les ventes locales qui n'existent plus dans Sheets (sauf pending)
+      // IMPORTANT: Vérifier la connexion Internet avant le nettoyage
+      if (isOnline) {
+        try {
+          await this.cleanupLocalSalesNotInSheets();
+        } catch (cleanupError) {
+          syncLogger.warn(`   ⚠️ [SALES-SYNC] Erreur nettoyage ventes locales: ${cleanupError.message}`);
+          // Ne pas bloquer si erreur nettoyage
+        }
+      } else {
+        syncLogger.info(`   ⏸️ [SALES-SYNC] Nettoyage annulé: pas de connexion Internet`);
+      }
+      
+      // Vérification automatique post-synchronisation
+      syncLogger.info(`   🔍 [SALES-SYNC] Démarrage de la vérification automatique...`);
+      await this.verifySalesSync();
+    } catch (error) {
+      syncLogger.error(`   ❌ [SALES-SYNC] Erreur: ${error.message}`);
+      if (error.stack) {
+        syncLogger.error(`      Stack: ${error.stack.substring(0, 300)}...`);
+      }
+      // Ne pas réinitialiser le cursor en cas d'erreur pour réessayer au prochain cycle
+    }
+  }
+  
+  /**
+   * Vérifie que les ventes sont bien synchronisées depuis Sheets vers SQLite
+   * Compare la structure et le contenu des tables
+   */
+  async verifySalesSync() {
+    try {
+      syncLogger.info(`🔍 [VERIFY-SALES] ==========================================`);
+      syncLogger.info(`🔍 [VERIFY-SALES] VÉRIFICATION DE LA SYNCHRONISATION DES VENTES`);
+      syncLogger.info(`🔍 [VERIFY-SALES] ==========================================`);
+      
+      const { getDb } = await import('../../db/sqlite.js');
+      const db = getDb();
+      
+      // 1. Vérifier la structure de la table sales
+      syncLogger.info(`   📋 [VERIFY-SALES] Vérification de la structure SQLite (table: sales)`);
+      const salesTableInfo = db.prepare("PRAGMA table_info(sales)").all();
+      syncLogger.info(`      ✅ Table 'sales' existe avec ${salesTableInfo.length} colonne(s)`);
+      
+      const expectedSalesColumns = [
+        'id', 'uuid', 'invoice_number', 'sold_at', 'client_name', 'client_phone',
+        'seller_name', 'seller_user_id', 'total_fc', 'total_usd', 'rate_fc_per_usd',
+        'payment_mode', 'paid_fc', 'paid_usd', 'status', 'origin', 'source_device',
+        'created_at', 'updated_at', 'synced_at'
+      ];
+      
+      const actualSalesColumns = salesTableInfo.map(col => col.name);
+      const missingSalesColumns = expectedSalesColumns.filter(col => !actualSalesColumns.includes(col));
+      if (missingSalesColumns.length > 0) {
+        syncLogger.warn(`      ⚠️  Colonnes manquantes dans 'sales': ${missingSalesColumns.join(', ')}`);
+      } else {
+        syncLogger.info(`      ✅ Toutes les colonnes attendues sont présentes dans 'sales'`);
+      }
+      
+      // 2. Vérifier la structure de la table sale_items
+      syncLogger.info(`   📋 [VERIFY-SALES] Vérification de la structure SQLite (table: sale_items)`);
+      const saleItemsTableInfo = db.prepare("PRAGMA table_info(sale_items)").all();
+      syncLogger.info(`      ✅ Table 'sale_items' existe avec ${saleItemsTableInfo.length} colonne(s)`);
+      
+      const expectedSaleItemsColumns = [
+        'id', 'uuid', 'sale_id', 'product_id', 'product_code', 'product_name',
+        'unit_level', 'unit_mark', 'qty', 'qty_label', 'unit_price_fc',
+        'subtotal_fc', 'unit_price_usd', 'subtotal_usd', 'created_at'
+      ];
+      
+      const actualSaleItemsColumns = saleItemsTableInfo.map(col => col.name);
+      const missingSaleItemsColumns = expectedSaleItemsColumns.filter(col => !actualSaleItemsColumns.includes(col));
+      if (missingSaleItemsColumns.length > 0) {
+        syncLogger.warn(`      ⚠️  Colonnes manquantes dans 'sale_items': ${missingSaleItemsColumns.join(', ')}`);
+      } else {
+        syncLogger.info(`      ✅ Toutes les colonnes attendues sont présentes dans 'sale_items'`);
+      }
+      
+      // 3. Compter les ventes dans SQLite
+      syncLogger.info(`   📊 [VERIFY-SALES] Comptage des ventes dans SQLite`);
+      
+      const totalSalesCount = db.prepare('SELECT COUNT(*) as count FROM sales').get();
+      const salesFromSheetsCount = db.prepare('SELECT COUNT(*) as count FROM sales WHERE origin = ?').get('SHEETS');
+      const salesLocalCount = db.prepare('SELECT COUNT(*) as count FROM sales WHERE origin = ?').get('LOCAL');
+      
+      syncLogger.info(`      📦 Total ventes (sales): ${totalSalesCount.count}`);
+      syncLogger.info(`      📥 Ventes depuis Sheets (origin='SHEETS'): ${salesFromSheetsCount.count}`);
+      syncLogger.info(`      💻 Ventes locales (origin='LOCAL'): ${salesLocalCount.count}`);
+      
+      // 4. Compter les items de vente
+      const totalSaleItemsCount = db.prepare('SELECT COUNT(*) as count FROM sale_items').get();
+      syncLogger.info(`      📦 Total items de vente (sale_items): ${totalSaleItemsCount.count}`);
+      
+      // 5. Vérifier l'intégrité (ventes sans items)
+      const salesWithoutItems = db.prepare(`
+        SELECT COUNT(DISTINCT s.id) as count
+        FROM sales s
+        LEFT JOIN sale_items si ON s.id = si.sale_id
+        WHERE si.id IS NULL
+      `).get();
+      
+      if (salesWithoutItems.count > 0) {
+        syncLogger.warn(`      ⚠️  ${salesWithoutItems.count} vente(s) sans items de vente`);
+      } else {
+        syncLogger.info(`      ✅ Toutes les ventes ont des items associés`);
+      }
+      
+      // 6. Afficher quelques exemples de ventes depuis Sheets
+      const sampleSales = db.prepare(`
+        SELECT 
+          invoice_number, 
+          client_name, 
+          sold_at, 
+          total_fc,
+          (SELECT COUNT(*) FROM sale_items WHERE sale_id = sales.id) as items_count
+        FROM sales 
+        WHERE origin = 'SHEETS' 
+        ORDER BY sold_at DESC 
+        LIMIT 5
+      `).all();
+      
+      if (sampleSales.length > 0) {
+        syncLogger.info(`   📋 [VERIFY-SALES] Exemples de ventes depuis Sheets (5 dernières):`);
+        for (const sale of sampleSales) {
+          syncLogger.info(`      📄 Facture: ${sale.invoice_number}, Client: ${sale.client_name || 'N/A'}, Total: ${sale.total_fc} FC, Items: ${sale.items_count}, Date: ${sale.sold_at}`);
+        }
+      } else {
+        syncLogger.warn(`      ⚠️  Aucune vente depuis Sheets trouvée dans SQLite`);
+        syncLogger.warn(`      💡 Vérifier que getSalesPage() dans Code.gs retourne des données`);
+      }
+      
+      // 7. Vérifier les colonnes attendues dans Sheets (selon Code.gs)
+      syncLogger.info(`   📋 [VERIFY-SALES] Structure attendue dans Google Sheets (feuille "Ventes"):`);
+      syncLogger.info(`      Colonnes attendues: Date, Numéro de facture, Code produit, client, QTE, MARK, Prix unitaire, Vendeur, mode stock, Telephone, USD, _uuid`);
+      syncLogger.info(`      💡 Si getSalesPage() retourne 0 items, vérifier que ces colonnes existent dans Sheets`);
+      
+      syncLogger.info(`🔍 [VERIFY-SALES] ==========================================`);
+      syncLogger.info(`🔍 [VERIFY-SALES] VÉRIFICATION TERMINÉE`);
+      syncLogger.info(`🔍 [VERIFY-SALES] ==========================================`);
+      
+    } catch (error) {
+      syncLogger.error(`❌ [VERIFY-SALES] Erreur: ${error.message}`);
+    }
+  }
+  
+  /**
+   * Synchronise les ventes locales vers Google Sheets (push)
+   * Ne bloque pas si hors ligne ou erreur
+   */
+  async syncLocalSalesToSheets() {
+    try {
+      syncLogger.info(`🔄 [LOCAL-SALES-PUSH] ==========================================`);
+      syncLogger.info(`🔄 [LOCAL-SALES-PUSH] SYNCHRONISATION VENTES LOCALES → SHEETS`);
+      syncLogger.info(`🔄 [LOCAL-SALES-PUSH] ==========================================`);
+      
+      // VÉRIFIER LA CONNEXION INTERNET AVANT DE COMMENCER
+      if (!isOnline) {
+        syncLogger.info(`   ⏸️ [LOCAL-SALES-PUSH] Pas de connexion Internet, synchronisation annulée`);
+        syncLogger.info(`   💡 [LOCAL-SALES-PUSH] La synchronisation sera reprise lorsque la connexion sera rétablie`);
+        return;
+      }
+      
+      const { getDb } = await import('../../db/sqlite.js');
+      const db = getDb();
+      
+      // Récupérer TOUTES les ventes locales (pas seulement 50, pas seulement synchronisées)
+      // IMPORTANT: Pousser toutes les ventes locales vers Sheets pour synchronisation complète
+      const localSales = db.prepare(`
+        SELECT s.*
+        FROM sales s
+        WHERE s.origin = 'LOCAL' AND s.status != 'pending'
+        ORDER BY s.sold_at DESC
+      `).all();
+      
+      if (!localSales || localSales.length === 0) {
+        syncLogger.info(`   ✅ [LOCAL-SALES-PUSH] Aucune vente locale à synchroniser`);
+        return;
+      }
+      
+      syncLogger.info(`   📦 [LOCAL-SALES-PUSH] ${localSales.length} vente(s) locale(s) à synchroniser vers Sheets`);
+      syncLogger.info(`   💡 [LOCAL-SALES-PUSH] Toutes les ventes locales seront poussées vers Sheets (même celles déjà synchronisées)`);
+      
+      // Préparer les opérations pour batchPush (plus efficace)
+      const opsToPush = [];
+      
+      for (const sale of localSales) {
+        try {
+          // Vérifier la connexion avant chaque traitement
+          if (!isOnline) {
+            syncLogger.warn(`   ⚠️ [LOCAL-SALES-PUSH] Connexion Internet perdue, arrêt de la synchronisation`);
+            return;
+          }
+          
+          // Récupérer les items depuis DB
+          const items = db.prepare('SELECT * FROM sale_items WHERE sale_id = ?').all(sale.id);
+          
+          // Préparer le payload pour Sheets
+          const payload = {
+            uuid: sale.uuid,
+            invoice_number: sale.invoice_number,
+            sold_at: sale.sold_at,
+            client_name: sale.client_name,
+            client_phone: sale.client_phone,
+            seller_name: sale.seller_name,
+            total_fc: sale.total_fc,
+            total_usd: sale.total_usd,
+            rate_fc_per_usd: sale.rate_fc_per_usd || 2800,
+            payment_mode: sale.payment_mode || 'cash',
+            paid_fc: sale.paid_fc || 0,
+            paid_usd: sale.paid_usd || 0,
+            status: sale.status,
+            origin: sale.origin,
+            source_device: sale.source_device,
+            items: items.map(item => ({
+              uuid: item.uuid,
+              product_code: item.product_code,
+              product_name: item.product_name,
+              unit_level: item.unit_level,
+              unit_mark: item.unit_mark || '',
+              qty: item.qty,
+              qty_label: item.qty_label || item.qty.toString(),
+              unit_price_fc: item.unit_price_fc,
+              subtotal_fc: item.subtotal_fc,
+              unit_price_usd: item.unit_price_usd || 0,
+              subtotal_usd: item.subtotal_usd || 0
+            }))
+          };
+          
+          opsToPush.push({
+            entity: 'sales',
+            op: 'upsert',
+            payload: payload,
+            base_remote_updated_at: sale.synced_at || sale.updated_at || sale.sold_at
+          });
+        } catch (saleError) {
+          syncLogger.warn(`   ⚠️ [LOCAL-SALES-PUSH] Erreur préparation vente ${sale.invoice_number}: ${saleError.message}`);
+        }
+      }
+      
+      if (opsToPush.length === 0) {
+        syncLogger.info(`   ✅ [LOCAL-SALES-PUSH] Aucune opération à pousser`);
+        return;
+      }
+      
+      syncLogger.info(`   📤 [LOCAL-SALES-PUSH] Envoi de ${opsToPush.length} opération(s) vers Sheets via batchPush...`);
+      
+      // Utiliser batchPush pour envoyer toutes les ventes en une seule requête (plus efficace)
+      const pushResult = await sheetsClient.batchPush(opsToPush);
+      
+      let pushed = 0;
+      let errors = 0;
+      
+      if (pushResult && pushResult.success) {
+        // Mettre à jour synced_at pour les ventes qui ont été appliquées avec succès
+        for (const appliedOp of pushResult.applied || []) {
+          const saleToUpdate = localSales.find(s => s.uuid === appliedOp.uuid || s.invoice_number === appliedOp.invoice_number);
+          if (saleToUpdate) {
+            db.prepare('UPDATE sales SET synced_at = ? WHERE id = ?').run(new Date().toISOString(), saleToUpdate.id);
+            pushed++;
+            syncLogger.debug(`   ✅ [LOCAL-SALES-PUSH] Vente ${saleToUpdate.invoice_number} synchronisée vers Sheets`);
+          }
+        }
+        
+        // Compter les conflits comme erreurs
+        if (pushResult.conflicts && pushResult.conflicts.length > 0) {
+          errors += pushResult.conflicts.length;
+          for (const conflict of pushResult.conflicts) {
+            syncLogger.warn(`   ⚠️ [LOCAL-SALES-PUSH] Conflit pour vente ${conflict.uuid || conflict.invoice_number}: ${conflict.reason || 'Conflit inconnu'}`);
+          }
+        }
+        
+        syncLogger.info(`   ✅ [LOCAL-SALES-PUSH] Synchronisation terminée: ${pushed} poussée(s), ${errors} erreur(s)/conflit(s)`);
+      } else {
+        errors = opsToPush.length;
+        syncLogger.warn(`   ⚠️ [LOCAL-SALES-PUSH] Échec batchPush: ${pushResult?.error || 'Erreur inconnue'}`);
+        
+        // Marquer comme hors ligne si erreur réseau
+        if (pushResult?.error && (pushResult.error.includes('timeout') || pushResult.error.includes('ECONNREFUSED') || pushResult.error.includes('ENOTFOUND'))) {
+          syncLogger.warn(`   🌐 [LOCAL-SALES-PUSH] Connexion Internet perdue détectée`);
+          isOnline = false;
+        }
+      }
+      
+      syncLogger.info(`🔄 [LOCAL-SALES-PUSH] ==========================================`);
+    } catch (error) {
+      syncLogger.warn(`   ⚠️ [LOCAL-SALES-PUSH] Erreur globale: ${error.message}`);
+      
+      // Marquer comme hors ligne si erreur réseau
+      if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND' || error.code === 'ETIMEDOUT' || error.message?.includes('timeout')) {
+        syncLogger.warn(`   🌐 [LOCAL-SALES-PUSH] Connexion Internet perdue détectée`);
+        isOnline = false;
+      }
+      
+      // Ne pas bloquer si erreur (peut être hors ligne)
+    }
+  }
+  
+  /**
+   * Supprime les ventes locales qui n'existent plus dans Sheets (sauf si status = pending)
+   * Ne bloque pas si hors ligne ou erreur
+   */
+  async cleanupLocalSalesNotInSheets() {
+    try {
+      syncLogger.info(`🧹 [CLEANUP-SALES] ==========================================`);
+      syncLogger.info(`🧹 [CLEANUP-SALES] NETTOYAGE VENTES ABSENTES DE SHEETS`);
+      syncLogger.info(`🧹 [CLEANUP-SALES] ==========================================`);
+      
+      // VÉRIFIER LA CONNEXION INTERNET AVANT DE COMMENCER
+      if (!isOnline) {
+        syncLogger.info(`   ⏸️ [CLEANUP-SALES] Pas de connexion Internet, nettoyage annulé`);
+        syncLogger.info(`   💡 [CLEANUP-SALES] Le nettoyage sera repris lorsque la connexion sera rétablie`);
+        return;
+      }
+      
+      const { getDb } = await import('../../db/sqlite.js');
+      const db = getDb();
+      
+      // Récupérer toutes les factures depuis Sheets (via pull complet)
+      syncLogger.info(`   📥 [CLEANUP-SALES] Récupération des factures depuis Sheets...`);
+      const sheetsInvoices = new Set();
+      let cursor = null;
+      let done = false;
+      let pageCount = 0;
+      let totalSheetsRows = 0;
+      
+      try {
+        while (!done && pageCount < 100) { // Limite de sécurité
+          pageCount++;
+          
+          // Vérifier la connexion avant chaque requête
+          if (!isOnline) {
+            syncLogger.warn(`   ⚠️ [CLEANUP-SALES] Connexion Internet perdue pendant la récupération, arrêt du nettoyage`);
+            return; // Arrêter le nettoyage si connexion perdue
+          }
+          
+          const result = await sheetsClient.pull('sales', new Date(0), {
+            full: true,
+            cursor: cursor,
+            limit: 500
+          });
+          
+          // Vérifier si la requête a échoué (connexion perdue)
+          if (!result.success) {
+            syncLogger.warn(`   ⚠️ [CLEANUP-SALES] Échec de la récupération depuis Sheets: ${result.error || 'Erreur inconnue'}`);
+            syncLogger.warn(`   ⚠️ [CLEANUP-SALES] Nettoyage annulé pour éviter de supprimer des ventes par erreur`);
+            
+            // Marquer comme hors ligne si erreur réseau
+            if (result.error && (result.error.includes('timeout') || result.error.includes('ECONNREFUSED') || result.error.includes('ENOTFOUND'))) {
+              syncLogger.warn(`   🌐 [CLEANUP-SALES] Connexion Internet perdue détectée`);
+              isOnline = false;
+            }
+            
+            return; // Arrêter le nettoyage si Sheets est inaccessible
+          }
+          
+          if (result.data && result.data.length > 0) {
+            result.data.forEach(item => {
+              if (item.invoice_number) {
+                sheetsInvoices.add(item.invoice_number);
+              }
+            });
+            totalSheetsRows += result.data.length;
+            
+            if (result.done || !result.next_cursor) {
+              done = true;
+            } else {
+              cursor = result.next_cursor;
+            }
+          } else {
+            done = true;
+          }
+        }
+      } catch (pullError) {
+        syncLogger.warn(`   ⚠️ [CLEANUP-SALES] Erreur lors de la récupération depuis Sheets: ${pullError.message}`);
+        syncLogger.warn(`   ⚠️ [CLEANUP-SALES] Nettoyage annulé pour éviter de supprimer des ventes par erreur`);
+        
+        // Marquer comme hors ligne si erreur réseau
+        if (pullError.code === 'ECONNREFUSED' || pullError.code === 'ENOTFOUND' || pullError.code === 'ETIMEDOUT' || pullError.message?.includes('timeout')) {
+          syncLogger.warn(`   🌐 [CLEANUP-SALES] Connexion Internet perdue détectée`);
+          isOnline = false;
+        }
+        
+        return; // Arrêter le nettoyage si erreur
+      }
+      
+      syncLogger.info(`   📊 [CLEANUP-SALES] ${sheetsInvoices.size} facture(s) unique(s) trouvée(s) dans Sheets (${totalSheetsRows} lignes)`);
+      
+      // IMPORTANT: Récupérer TOUTES les ventes (LOCAL et SHEETS) sauf pending pour comparaison
+      // On supprimera celles qui ne sont plus dans Sheets
+      const allSales = db.prepare(`
+        SELECT id, invoice_number, status, sold_at, synced_at, origin
+        FROM sales
+        WHERE status != 'pending'
+        ORDER BY sold_at DESC
+      `).all();
+      
+      syncLogger.info(`   📊 [CLEANUP-SALES] ${allSales.length} vente(s) totale(s) à vérifier (LOCAL + SHEETS)`);
+      
+      // Séparer par origine
+      const localSales = allSales.filter(s => s.origin === 'LOCAL');
+      const sheetsSales = allSales.filter(s => s.origin === 'SHEETS');
+      
+      syncLogger.info(`   📊 [CLEANUP-SALES] ${localSales.length} vente(s) locale(s), ${sheetsSales.length} vente(s) depuis Sheets`);
+      
+      // Pour les ventes LOCALES : ne supprimer que celles synchronisées
+      const syncedLocalSales = localSales.filter(s => s.synced_at !== null);
+      const notSyncedLocalSales = localSales.filter(s => s.synced_at === null);
+      
+      // Pour les ventes SHEETS : toutes peuvent être supprimées si absentes de Sheets
+      syncLogger.info(`   💡 [CLEANUP-SALES] Les ventes SHEETS absentes de Sheets seront supprimées`);
+      syncLogger.info(`   💡 [CLEANUP-SALES] Les ventes LOCALES non synchronisées seront conservées`);
+      syncLogger.info(`   💡 [CLEANUP-SALES] Les ventes en attente (status='pending') ne seront PAS supprimées`);
+      
+      let deletedLocal = 0;
+      let deletedSheets = 0;
+      let keptLocal = 0;
+      let keptSheets = 0;
+      
+      // Nettoyer les ventes LOCALES synchronisées
+      for (const sale of syncedLocalSales) {
+        if (!sheetsInvoices.has(sale.invoice_number)) {
+          try {
+            db.prepare('DELETE FROM sale_items WHERE sale_id = ?').run(sale.id);
+            db.prepare('DELETE FROM sales WHERE id = ?').run(sale.id);
+            deletedLocal++;
+            syncLogger.info(`   🗑️ [CLEANUP-SALES] Vente LOCALE ${sale.invoice_number} supprimée (absente de Sheets)`);
+          } catch (deleteError) {
+            syncLogger.warn(`   ⚠️ [CLEANUP-SALES] Erreur suppression vente LOCALE ${sale.invoice_number}: ${deleteError.message}`);
+          }
+        } else {
+          keptLocal++;
+        }
+      }
+      
+      // Nettoyer les ventes SHEETS absentes de Sheets
+      for (const sale of sheetsSales) {
+        if (!sheetsInvoices.has(sale.invoice_number)) {
+          try {
+            db.prepare('DELETE FROM sale_items WHERE sale_id = ?').run(sale.id);
+            db.prepare('DELETE FROM sales WHERE id = ?').run(sale.id);
+            deletedSheets++;
+            syncLogger.info(`   🗑️ [CLEANUP-SALES] Vente SHEETS ${sale.invoice_number} supprimée (absente de Sheets)`);
+          } catch (deleteError) {
+            syncLogger.warn(`   ⚠️ [CLEANUP-SALES] Erreur suppression vente SHEETS ${sale.invoice_number}: ${deleteError.message}`);
+          }
+        } else {
+          keptSheets++;
+        }
+      }
+      
+      syncLogger.info(`   ✅ [CLEANUP-SALES] Nettoyage terminé:`);
+      syncLogger.info(`      🗑️ ${deletedLocal} vente(s) LOCALE(s) supprimée(s) (absentes de Sheets)`);
+      syncLogger.info(`      🗑️ ${deletedSheets} vente(s) SHEETS supprimée(s) (absentes de Sheets)`);
+      syncLogger.info(`      ✅ ${keptLocal} vente(s) LOCALE(s) conservée(s) (présentes dans Sheets)`);
+      syncLogger.info(`      ✅ ${keptSheets} vente(s) SHEETS conservée(s) (présentes dans Sheets)`);
+      syncLogger.info(`      ⏭️ ${notSyncedLocalSales.length} vente(s) LOCALE(s) non synchronisée(s) conservée(s)`);
+      syncLogger.info(`🧹 [CLEANUP-SALES] ==========================================`);
+    } catch (error) {
+      syncLogger.warn(`   ⚠️ [CLEANUP-SALES] Erreur globale: ${error.message}`);
+      
+      // Marquer comme hors ligne si erreur réseau
+      if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND' || error.code === 'ETIMEDOUT' || error.message?.includes('timeout')) {
+        syncLogger.warn(`   🌐 [CLEANUP-SALES] Connexion Internet perdue détectée`);
+        isOnline = false;
+      }
+      
+      // Ne pas bloquer si erreur (peut être hors ligne)
+    }
   }
 
   /**
@@ -188,7 +1023,12 @@ export class SyncWorker {
       clearTimeout(_loopTimeout);
       _loopTimeout = null;
     }
-      syncLogger.info('Worker de synchronisation arrêté');
+    if (_salesLoopTimeout) {
+      clearTimeout(_salesLoopTimeout);
+      _salesLoopTimeout = null;
+    }
+    syncLogger.info('Worker de synchronisation arrêté');
+    syncLogger.info('💰 [SALES-SYNC] Synchronisation dédiée des ventes arrêtée');
   }
 
   /**
@@ -389,6 +1229,17 @@ export class SyncWorker {
       isInitialImport = true; // Forcer le mode full pull
     }
 
+    // Vérifier si les utilisateurs sont vides
+    const usersCount = usersRepo.findAll().length;
+    const isUsersEmpty = usersCount === 0;
+    if (isUsersEmpty) {
+      syncLogger.warn(`⚠️  [BOOTSTRAP AUTO] Table users vide détectée (${usersCount} utilisateur(s)) → Forcer import complet pour users`);
+    } else {
+      // Même si la base n'est pas vide, forcer un import complet pour récupérer TOUS les utilisateurs
+      // Cela garantit que tous les utilisateurs (anciens et nouveaux) sont synchronisés
+      syncLogger.info(`👥 [USERS] Base contient ${usersCount} utilisateur(s) → Import complet pour récupérer TOUS les utilisateurs (anciens et nouveaux)`);
+    }
+
     const globalStartTime = Date.now();
     syncLogger.info(`🔄 Début pull depuis Google Sheets${isInitialImport ? ' (BOOTSTRAP/FULL - TOUT EN UNE FOIS)' : ' (synchronisation incrémentale)'}`);
     syncLogger.info(`   ⏰ Début: ${new Date().toISOString()}`);
@@ -403,10 +1254,19 @@ export class SyncWorker {
       syncLogger.info(`   📅 [SYNC] Dates 'since' utilisées pour chaque entité:`);
       for (const e of entities) {
         const lastPullDate = syncRepo.getLastPullDate(e);
-        // Si bootstrap/full import → date très ancienne (1970)
-        sinceMap[e] = isInitialImport ? new Date(0).toISOString() : (lastPullDate || new Date(0).toISOString());
+        
+        // Vérifier si la base est vide pour cette entité
+        // Pour les utilisateurs, TOUJOURS forcer un import complet pour récupérer TOUS les utilisateurs
+        let forceFullImport = isInitialImport;
+        if (e === 'users') {
+          forceFullImport = true; // TOUJOURS récupérer tous les utilisateurs
+          syncLogger.info(`   👥 [USERS] Import complet forcé → Récupération de TOUS les utilisateurs (date since = 1970)`);
+        }
+        
+        // Si bootstrap/full import ou base vide → date très ancienne (1970)
+        sinceMap[e] = forceFullImport ? new Date(0).toISOString() : (lastPullDate || new Date(0).toISOString());
         const sinceDate = new Date(sinceMap[e]);
-        syncLogger.info(`      - ${e.toUpperCase()}: ${sinceMap[e]} (${sinceDate.toLocaleString('fr-FR')})${isInitialImport ? ' 🚀 BOOTSTRAP/FULL' : (!lastPullDate ? ' ⚠️ AUCUNE DATE PRÉCÉDENTE - Import complet' : '')}`);
+        syncLogger.info(`      - ${e.toUpperCase()}: ${sinceMap[e]} (${sinceDate.toLocaleString('fr-FR')})${forceFullImport ? ' 🚀 BOOTSTRAP/FULL' : (!lastPullDate ? ' ⚠️ AUCUNE DATE PRÉCÉDENTE - Import complet' : '')}`);
       }
       
       // Mode PRO: Full import paginé si initial, sinon incrémental
@@ -420,11 +1280,26 @@ export class SyncWorker {
         for (const entity of lightEntities) {
           const entityStartTime = Date.now();
           try {
+            if (entity === 'users') {
+              syncLogger.info(`   👥 [USERS] Début pull depuis Google Sheets...`);
+              syncLogger.info(`   👥 [USERS] Since date: ${sinceMap[entity]}`);
+            }
+            
             const result = await sheetsClient.pullAllPaged(entity, sinceMap[entity], {
               full: true,
               maxRetries: 8,
               timeout: 30000
             });
+            
+            if (entity === 'users') {
+              syncLogger.info(`   👥 [USERS] Résultat pull: success=${result.success}, data.length=${result.data?.length || 0}`);
+              if (result.error) {
+                syncLogger.error(`   👥 [USERS] Erreur pull: ${result.error}`);
+              }
+              if (result.data && result.data.length > 0) {
+                syncLogger.info(`   👥 [USERS] Premier utilisateur reçu:`, JSON.stringify(result.data[0]).substring(0, 200));
+              }
+            }
             
             if (result.success && result.data.length > 0) {
               syncLogger.info(`   ✅ [${entity.toUpperCase()}] ${result.data.length} item(s) téléchargé(s) en ${Date.now() - entityStartTime}ms`);
@@ -433,10 +1308,16 @@ export class SyncWorker {
               results.push({ entity, success: true, data: result.data, duration: Date.now() - entityStartTime });
             } else {
               syncLogger.warn(`   ⏭️  [${entity.toUpperCase()}] Aucune donnée ou erreur`);
+              if (entity === 'users' && result.error) {
+                syncLogger.error(`   👥 [USERS] Détails erreur:`, result.error);
+              }
               results.push({ entity, success: result.success, data: result.data || [], error: result.error, skipped: !result.success });
             }
           } catch (error) {
             syncLogger.error(`   ❌ [${entity.toUpperCase()}] Erreur: ${error.message}`);
+            if (entity === 'users') {
+              syncLogger.error(`   👥 [USERS] Stack trace:`, error.stack);
+            }
             results.push({ entity, success: false, data: [], error: error.message, skipped: true });
           }
         }
@@ -495,6 +1376,9 @@ export class SyncWorker {
         const salesStartTime = Date.now();
         try {
           const cursor = syncRepo.getCursor('sales');
+          const cursorStr = cursor ? String(cursor) : null;
+          syncLogger.info(`   📍 [SALES] Cursor: ${cursorStr ? (cursorStr.length > 50 ? cursorStr.substring(0, 50) + '...' : cursorStr) : 'null (début)'}`);
+          
           const result = await sheetsClient.pullAllPaged('sales', sinceMap['sales'], {
             full: true,
             startCursor: cursor,
@@ -503,18 +1387,73 @@ export class SyncWorker {
             limit: 300
           });
           
-          if (result.success && result.data.length > 0) {
-            syncLogger.info(`   ✅ [SALES] ${result.data.length} vente(s) téléchargée(s) en ${Date.now() - salesStartTime}ms`);
-            await this.applyUpdates('sales', result.data);
-            syncRepo.setLastPullDate('sales', new Date().toISOString());
-            syncRepo.setCursor('sales', result.last_cursor || null);
-            results.push({ entity: 'sales', success: true, data: result.data, duration: Date.now() - salesStartTime });
+          syncLogger.info(`   📊 [SALES] Résultat pullAllPaged:`);
+          syncLogger.info(`      ✅ Success: ${result.success}`);
+          syncLogger.info(`      📦 Data length: ${result.data ? result.data.length : 0} ligne(s)`);
+          syncLogger.info(`      📍 Next cursor: ${result.last_cursor || 'null (fin)'}`);
+          syncLogger.info(`      ✅ Done: ${result.done ? 'true' : 'false'}`);
+          
+          if (result.success && result.data && result.data.length > 0) {
+            syncLogger.info(`   ✅ [SALES] ${result.data.length} ligne(s) téléchargée(s) en ${Date.now() - salesStartTime}ms`);
+            syncLogger.info(`   🔄 [SALES] Application dans SQLite...`);
+            
+            // Vérification avant application
+            let salesCountBefore = 0;
+            try {
+              const { getDb } = await import('../../db/sqlite.js');
+              const db = getDb();
+              const countResult = db.prepare('SELECT COUNT(*) as count FROM sales WHERE origin = ?').get('SHEETS');
+              salesCountBefore = countResult?.count || 0;
+              syncLogger.info(`   🔍 [SALES] Ventes avant application: ${salesCountBefore}`);
+            } catch (countError) {
+              syncLogger.warn(`   ⚠️  [SALES] Erreur comptage avant: ${countError.message}`);
+            }
+            
+            try {
+              const applyResult = await this.applyUpdates('sales', result.data);
+              syncLogger.info(`   ✅ [SALES] Application terminée: ${applyResult.inserted || 0} créée(s), ${applyResult.updated || 0} mise(s) à jour`);
+              
+              // Vérification après application
+              let salesCountAfter = 0;
+              try {
+                const { getDb } = await import('../../db/sqlite.js');
+                const db = getDb();
+                const countResult = db.prepare('SELECT COUNT(*) as count FROM sales WHERE origin = ?').get('SHEETS');
+                salesCountAfter = countResult?.count || 0;
+                syncLogger.info(`   🔍 [SALES] Ventes après application: ${salesCountAfter}`);
+                
+                const newSales = salesCountAfter - salesCountBefore;
+                if (newSales > 0) {
+                  syncLogger.info(`   ✅ [SALES] ${newSales} nouvelle(s) vente(s) ajoutée(s) avec succès!`);
+                } else if (applyResult.inserted > 0 || applyResult.updated > 0) {
+                  syncLogger.warn(`   ⚠️  [SALES] Des ventes ont été traitées mais le nombre total n'a pas changé`);
+                }
+              } catch (countError) {
+                syncLogger.warn(`   ⚠️  [SALES] Erreur comptage après: ${countError.message}`);
+              }
+              
+              syncRepo.setLastPullDate('sales', new Date().toISOString());
+              syncRepo.setCursor('sales', result.last_cursor || null);
+              results.push({ entity: 'sales', success: true, data: result.data, duration: Date.now() - salesStartTime });
+            } catch (applyError) {
+              syncLogger.error(`   ❌ [SALES] ERREUR lors de l'application: ${applyError.message}`);
+              syncLogger.error(`   📋 [SALES] Stack: ${applyError.stack?.substring(0, 500)}`);
+              results.push({ entity: 'sales', success: false, data: [], error: applyError.message, skipped: true });
+            }
+          } else if (result.success) {
+            syncLogger.warn(`   ⏭️ [SALES] Aucune donnée retournée (0 ligne)`);
+            syncLogger.warn(`   💡 [SALES] Raisons possibles:`);
+            syncLogger.warn(`      - Feuille "Ventes" vide dans Google Sheets`);
+            syncLogger.warn(`      - Toutes les ventes filtrées par date`);
+            syncLogger.warn(`      - Cursor invalide`);
+            results.push({ entity: 'sales', success: true, data: [], error: 'Aucune donnée', skipped: false });
           } else {
-            syncLogger.warn(`   ⏭️ [SALES] Aucune donnée ou erreur`);
-            results.push({ entity: 'sales', success: result.success, data: result.data || [], error: result.error, skipped: !result.success });
+            syncLogger.error(`   ❌ [SALES] Erreur lors du pull: ${result.error || 'Erreur inconnue'}`);
+            results.push({ entity: 'sales', success: false, data: [], error: result.error, skipped: true });
           }
         } catch (error) {
           syncLogger.error(`   ❌ [SALES] Erreur: ${error.message}`);
+          syncLogger.error(`   📋 [SALES] Stack: ${error.stack?.substring(0, 500)}`);
           results.push({ entity: 'sales', success: false, data: [], error: error.message, skipped: true });
         }
         
@@ -522,11 +1461,20 @@ export class SyncWorker {
         // Mode incrémental normal (rapide)
         syncLogger.info(`   🔄 [SYNC INCRÉMENTALE] Mode rapide (depuis lastPullDate)`);
         
+        // Pour les utilisateurs, TOUJOURS forcer un import complet même en mode incrémental
+        // Cela garantit que tous les utilisateurs (anciens et nouveaux) sont récupérés
+        syncLogger.info(`   👥 [USERS] Import complet forcé même en mode incrémental → Récupération de TOUS les utilisateurs`);
+        sinceMap['users'] = new Date(0).toISOString();
+        
         // Pull en parallèle limité (légers d'abord)
         const lightEntities = ['users', 'rates', 'debts'];
-        const heavyEntities = ['products', 'sales'];
+        // Sales exclu: synchronisé séparément toutes les 10s avec pagination via startSalesSyncLoop()
+        const heavyEntities = ['products'];
         
         syncLogger.info(`   ⚡ [SYNC] Pull parallèle des entités légères: ${lightEntities.join(', ')}`);
+        if (isUsersEmpty) {
+          syncLogger.info(`   👥 [USERS] Date 'since' forcée à 1970 pour import complet: ${sinceMap['users']}`);
+        }
         const lightResults = await sheetsClient.pullMany(lightEntities, sinceMap, { 
           maxRetries: 1 
         });
@@ -608,22 +1556,34 @@ export class SyncWorker {
               if (result.data && result.data.length > 0) {
                 syncLogger.info(`   ✅ [${entity.toUpperCase()}] ${result.data.length} item(s) téléchargé(s) en ${pullDuration}ms`);
                 
-                // Logs détaillés uniquement si SYNC_VERBOSE=1 (optimisation)
-                const VERBOSE = process.env.SYNC_VERBOSE === '1';
-                if (VERBOSE) {
-                if (entity === 'products' && result.data.length > 0) {
-                    syncLogger.info(`   📋 Détail produits: ${result.data.length} produit(s)`);
-                    result.data.slice(0, 3).forEach((product, index) => {
-                    const unitsCount = product.units ? product.units.length : 0;
-                      syncLogger.info(`      [${index + 1}] Code: "${product.code || 'N/A'}", Nom: "${product.name || 'N/A'}", Unités: ${unitsCount}`);
-                      });
-                    }
+                // Logs détaillés pour les ventes (toujours affichés pour debug)
                 if (entity === 'sales' && result.data.length > 0) {
-                    syncLogger.info(`   📋 Détail ventes: ${result.data.length} ligne(s)`);
-                    result.data.slice(0, 3).forEach((sale, index) => {
-                      syncLogger.info(`      [${index + 1}] Facture: ${sale.invoice_number || 'N/A'}, Client: ${sale.client_name || 'N/A'}`);
-                    });
+                  syncLogger.info(`   📋 [SALES] Détail des lignes téléchargées depuis Sheets:`);
+                  const invoiceCounts = {};
+                  result.data.forEach(item => {
+                    const inv = item.invoice_number || 'N/A';
+                    invoiceCounts[inv] = (invoiceCounts[inv] || 0) + 1;
+                  });
+                  const uniqueInvoices = Object.keys(invoiceCounts).length;
+                  syncLogger.info(`   📊 [SALES] ${result.data.length} ligne(s) → ${uniqueInvoices} facture(s) unique(s) détectée(s)`);
+                  
+                  // Afficher les 5 premières factures pour debug
+                  result.data.slice(0, 5).forEach((sale, index) => {
+                    syncLogger.info(`      [${index + 1}] Facture: ${sale.invoice_number || 'N/A'}, Client: ${sale.client_name || 'N/A'}, Produit: ${sale.product_code || 'N/A'}, Qty: ${sale.qty || 0}`);
+                  });
+                  if (result.data.length > 5) {
+                    syncLogger.info(`      ... et ${result.data.length - 5} autre(s) ligne(s)`);
                   }
+                }
+                
+                // Logs détaillés pour produits uniquement si VERBOSE
+                const VERBOSE = process.env.SYNC_VERBOSE === '1';
+                if (VERBOSE && entity === 'products' && result.data.length > 0) {
+                  syncLogger.info(`   📋 Détail produits: ${result.data.length} produit(s)`);
+                  result.data.slice(0, 3).forEach((product, index) => {
+                    const unitsCount = product.units ? product.units.length : 0;
+                    syncLogger.info(`      [${index + 1}] Code: "${product.code || 'N/A'}", Nom: "${product.name || 'N/A'}", Unités: ${unitsCount}`);
+                  });
                 }
                 
                 // APPLIQUER IMMÉDIATEMENT après téléchargement réussi (pas d'attente)
@@ -640,9 +1600,14 @@ export class SyncWorker {
                     syncLogger.info(`   🎉 [IMPORT] Import initial terminé avec succès (${result.data.length} produit(s))`);
                   }
                   
-                  // Logs optimisés (stats seulement)
+                  // Logs optimisés avec détails spécifiques pour les ventes
                   if (upsertStats) {
-                    syncLogger.info(`   ✅ [${entity.toUpperCase()}] ${result.data.length} item(s) → SQL: ${upsertStats.inserted || 0} inséré(s), ${upsertStats.updated || 0} mis à jour, ${upsertStats.skipped || 0} ignoré(s) (${applyDuration}ms)`);
+                    if (entity === 'sales') {
+                      syncLogger.info(`   ✅ [SALES] Stockage SQL réussi: ${upsertStats.inserted || 0} facture(s) créée(s), ${upsertStats.updated || 0} facture(s) mise(s) à jour (${applyDuration}ms)`);
+                      syncLogger.info(`   📱 [SALES] Les ventes sont maintenant disponibles dans la page "Historique des ventes"`);
+                    } else {
+                      syncLogger.info(`   ✅ [${entity.toUpperCase()}] ${result.data.length} item(s) → SQL: ${upsertStats.inserted || 0} inséré(s), ${upsertStats.updated || 0} mis à jour, ${upsertStats.skipped || 0} ignoré(s) (${applyDuration}ms)`);
+                    }
                   } else {
                     syncLogger.info(`   ✅ [${entity.toUpperCase()}] ${result.data.length} item(s) appliqué(s) en ${applyDuration}ms`);
                   }
@@ -746,6 +1711,10 @@ export class SyncWorker {
       const skippedCount = results.filter(r => r.skipped).length;
       const totalDuration = Date.now() - globalStartTime;
       
+      // Compter spécifiquement les ventes pour le résumé
+      const salesResult = results.find(r => r.entity === 'sales');
+      const salesCount = salesResult?.data?.length || 0;
+      
       syncLogger.info(`✅ [SYNC] Synchronisation terminée en ${(totalDuration / 1000).toFixed(1)}s`);
       syncLogger.info(`   📊 [SYNC] Résumé global:`);
       syncLogger.info(`      ✅ ${successCount}/${entities.length} entité(s) synchronisée(s) avec succès`);
@@ -756,6 +1725,11 @@ export class SyncWorker {
         syncLogger.warn(`      ❌ ${failedCount}/${entities.length} entité(s) en échec`);
       }
       syncLogger.info(`      📦 ${totalItems} item(s) téléchargé(s) et STOCKÉ(S) dans SQLite`);
+      if (salesCount > 0 && salesResult?.success) {
+        syncLogger.info(`      💰 [SALES] ${salesCount} ligne(s) de vente téléchargée(s) depuis Sheets`);
+        syncLogger.info(`      📄 [SALES] ✅ Ventes stockées dans SQLite → Disponibles dans la page "Historique des ventes"`);
+        syncLogger.info(`      💡 [SALES] Pour voir toutes les ventes: Menu → Historique → Ajuster les dates (Du/Au)`);
+      }
       
       if (skippedCount > 0) {
         results.filter(r => r.skipped).forEach(r => {
@@ -791,8 +1765,36 @@ export class SyncWorker {
    * @returns {Promise<{inserted: number, updated: number, skipped: number}>} Stats d'upsert
    */
   async applyUpdates(entity, data) {
+    const applyStartTime = Date.now();
     try {
-      syncLogger.info(`⚙️  Application des mises à jour pour ${entity} (${data.length} item(s))...`);
+      syncLogger.info(`⚙️  [APPLY-UPDATES] ==========================================`);
+      syncLogger.info(`⚙️  [APPLY-UPDATES] Application des mises à jour pour ${entity}`);
+      syncLogger.info(`⚙️  [APPLY-UPDATES] ==========================================`);
+      syncLogger.info(`   📦 Données reçues: ${data ? data.length : 0} item(s)`);
+      syncLogger.info(`   📋 Type: ${Array.isArray(data) ? 'Array' : typeof data}`);
+      
+      // Validation des données
+      if (!data) {
+        syncLogger.error(`   ❌ [APPLY-UPDATES] ERREUR: data est null ou undefined`);
+        return { inserted: 0, updated: 0, skipped: 0 };
+      }
+      
+      if (!Array.isArray(data)) {
+        syncLogger.error(`   ❌ [APPLY-UPDATES] ERREUR: data n'est pas un tableau (type: ${typeof data})`);
+        return { inserted: 0, updated: 0, skipped: 0 };
+      }
+      
+      if (data.length === 0) {
+        syncLogger.warn(`   ⚠️  [APPLY-UPDATES] Aucune donnée à appliquer (tableau vide)`);
+        return { inserted: 0, updated: 0, skipped: 0 };
+      }
+      
+      // Log spécial pour les ventes
+      if (entity === 'sales') {
+        syncLogger.info(`   🔄 [APPLY-UPDATES] Appel de applySalesUpdates() pour ${data.length} ligne(s) de vente`);
+        syncLogger.info(`   🔄 [APPLY-UPDATES] Les ventes vont être stockées dans SQLite (tables: sales + sale_items)`);
+        syncLogger.info(`   📋 [APPLY-UPDATES] Exemple de première ligne: invoice_number="${data[0]?.invoice_number || 'N/A'}", product_code="${data[0]?.product_code || 'N/A'}"`);
+      }
       
       let stats = { inserted: 0, updated: 0, skipped: 0 };
       
@@ -802,7 +1804,38 @@ export class SyncWorker {
           stats = await this.applyProductUpdates(data);
           break;
         case 'sales':
-          stats = await this.applySalesUpdates(data);
+          try {
+            stats = await this.applySalesUpdates(data);
+            syncLogger.info(`   ✅ [APPLY-UPDATES] applySalesUpdates() terminé avec succès`);
+            syncLogger.info(`      📊 Résultat: ${stats.inserted || 0} créée(s), ${stats.updated || 0} mise(s) à jour, ${stats.skipped || 0} ignorée(s)`);
+            
+            // Vérification automatique post-application pour les ventes
+            if (stats.inserted > 0 || stats.updated > 0) {
+              syncLogger.info(`   🔍 [APPLY-UPDATES] Vérification automatique post-application...`);
+              try {
+                const { getDb } = await import('../../db/sqlite.js');
+                const db = getDb();
+                const salesCount = db.prepare('SELECT COUNT(*) as count FROM sales WHERE origin = ?').get('SHEETS');
+                const itemsCount = db.prepare('SELECT COUNT(*) as count FROM sale_items').get();
+                syncLogger.info(`      ✅ [VERIFY] Ventes dans SQLite: ${salesCount.count} (origin='SHEETS')`);
+                syncLogger.info(`      ✅ [VERIFY] Items dans SQLite: ${itemsCount.count}`);
+                
+                if (salesCount.count === 0 && (stats.inserted > 0 || stats.updated > 0)) {
+                  syncLogger.error(`      ❌ [VERIFY] ERREUR: Aucune vente trouvée malgré ${stats.inserted + stats.updated} traitement(s) réussi(s)`);
+                  syncLogger.error(`      💡 [VERIFY] Diagnostic: Les ventes n'ont peut-être pas été persistées en base`);
+                } else {
+                  syncLogger.info(`      ✅ [VERIFY] Vérification réussie: Les ventes sont bien présentes en base`);
+                }
+              } catch (verifyError) {
+                syncLogger.warn(`      ⚠️  [VERIFY] Erreur lors de la vérification automatique: ${verifyError.message}`);
+              }
+            }
+          } catch (salesError) {
+            syncLogger.error(`   ❌ [APPLY-UPDATES] ERREUR lors de l'application des ventes:`);
+            syncLogger.error(`      Message: ${salesError.message || 'Erreur inconnue'}`);
+            syncLogger.error(`      Stack: ${salesError.stack?.substring(0, 500)}`);
+            throw salesError; // Re-lancer pour être capturé par le catch externe
+          }
           break;
         case 'debts':
           stats = await this.applyDebtsUpdates(data);
@@ -816,13 +1849,22 @@ export class SyncWorker {
           stats = { inserted: 0, updated: data.length, skipped: 0 };
           break;
         default:
-          syncLogger.warn(`⚠️  Type d'entité non géré pour pull: ${entity}`);
+          syncLogger.warn(`⚠️  [APPLY-UPDATES] Type d'entité non géré: ${entity}`);
+          stats = { inserted: 0, updated: 0, skipped: 0 };
       }
       
-      syncLogger.info(`✅ Application des mises à jour pour ${entity} terminée`);
+      const applyDuration = Date.now() - applyStartTime;
+      syncLogger.info(`✅ [APPLY-UPDATES] Application terminée en ${applyDuration}ms`);
+      syncLogger.info(`   📊 Résultat final: ${stats.inserted || 0} inséré(s), ${stats.updated || 0} mis à jour, ${stats.skipped || 0} ignoré(s)`);
+      syncLogger.info(`⚙️  [APPLY-UPDATES] ==========================================`);
+      
       return stats;
     } catch (error) {
-      syncLogger.error(`❌ Erreur applyUpdates ${entity}:`, error.message || error);
+      const applyDuration = Date.now() - applyStartTime;
+      syncLogger.error(`❌ [APPLY-UPDATES] ERREUR lors de l'application pour ${entity} (après ${applyDuration}ms):`);
+      syncLogger.error(`   Message: ${error.message || 'Erreur inconnue'}`);
+      syncLogger.error(`   Stack: ${error.stack?.substring(0, 500)}`);
+      syncLogger.error(`⚙️  [APPLY-UPDATES] ==========================================`);
       throw error;
     }
   }
@@ -1022,94 +2064,750 @@ export class SyncWorker {
    * @returns {Promise<{inserted: number, updated: number, skipped: number}>} Stats d'upsert
    */
   async applySalesUpdates(data) {
-    syncLogger.info(`💰 Application de ${data.length} vente(s)/item(s) de vente...`);
+    const startTime = Date.now();
+    syncLogger.info(`💰 [SALES] ==========================================`);
+    syncLogger.info(`💰 [SALES] DÉBUT SYNCHRONISATION DES VENTES`);
+    syncLogger.info(`💰 [SALES] ==========================================`);
+    syncLogger.info(`   📥 SOURCE: Google Sheets (feuille "Ventes")`);
+    syncLogger.info(`   📦 RÉCEPTION: ${data.length} ligne(s) téléchargée(s) depuis Sheets`);
+    syncLogger.info(`   🔄 DESTINATION: Base de données SQLite locale (tables: sales + sale_items)`);
+    syncLogger.info(`💰 [SALES] ==========================================`);
     
-    // Grouper par facture
+    // Vérification initiale du nombre de ventes dans SQLite AVANT traitement
+    let salesCountBefore = 0;
+    let itemsCountBefore = 0;
+    try {
+      const { getDb } = await import('../../db/sqlite.js');
+      const db = getDb();
+      const salesCountResult = db.prepare('SELECT COUNT(*) as count FROM sales WHERE origin = ?').get('SHEETS');
+      const itemsCountResult = db.prepare('SELECT COUNT(*) as count FROM sale_items').get();
+      salesCountBefore = salesCountResult?.count || 0;
+      itemsCountBefore = itemsCountResult?.count || 0;
+      syncLogger.info(`   🔍 [SALES] ÉTAT INITIAL SQLite: ${salesCountBefore} vente(s) avec origin='SHEETS', ${itemsCountBefore} item(s)`);
+    } catch (initError) {
+      syncLogger.error(`   ❌ [SALES] Erreur lors de la vérification initiale: ${initError.message}`);
+      syncLogger.error(`   📋 [SALES] Stack: ${initError.stack?.substring(0, 500)}`);
+    }
+    
+    if (!data || data.length === 0) {
+      syncLogger.warn(`⚠️  [SALES] Aucune donnée vente à appliquer dans SQLite`);
+      syncLogger.warn(`   💡 [SALES] Vérifier que la feuille "Ventes" contient des données dans Google Sheets`);
+      syncLogger.warn(`   🔍 [SALES] Diagnostic: data=${data ? 'existe mais vide' : 'null/undefined'}, length=${data?.length || 0}`);
+      return { inserted: 0, updated: 0, skipped: 0 };
+    }
+    
+    // Log détaillé des premières lignes pour diagnostic
+    syncLogger.info(`   📋 [SALES] Analyse des données reçues:`);
+    syncLogger.info(`      ✅ Type: ${Array.isArray(data) ? 'Array' : typeof data}`);
+    syncLogger.info(`      ✅ Longueur: ${data.length} ligne(s)`);
+    if (data.length > 0) {
+      const firstItem = data[0];
+      syncLogger.info(`      📋 [SALES] Premier item (échantillon):`);
+      syncLogger.info(`         - invoice_number: ${firstItem.invoice_number || 'MANQUANT'}`);
+      syncLogger.info(`         - client_name: ${firstItem.client_name || 'N/A'}`);
+      syncLogger.info(`         - product_code: ${firstItem.product_code || 'N/A'}`);
+      syncLogger.info(`         - qty: ${firstItem.qty !== undefined ? firstItem.qty : 'MANQUANT'}`);
+      syncLogger.info(`         - uuid: ${firstItem.uuid || 'MANQUANT'}`);
+      syncLogger.info(`         - sold_at: ${firstItem.sold_at || 'MANQUANT'}`);
+    }
+    
+    syncLogger.info(`   📥 [SALES] ${data.length} ligne(s) reçue(s) depuis Google Sheets (feuille "Ventes")`);
+    syncLogger.info(`   🔄 [SALES] SYNCHRONISATION EN COURS: Sheets → SQLite local`);
+    syncLogger.info(`   📋 [SALES] Structure des données:`);
+    if (data.length > 0) {
+      const firstItem = data[0];
+      syncLogger.info(`      ✅ invoice_number: ${firstItem.invoice_number ? '✓' : '✗'}`);
+      syncLogger.info(`      ✅ client_name: ${firstItem.client_name ? '✓' : '✗'}`);
+      syncLogger.info(`      ✅ product_code: ${firstItem.product_code ? '✓' : '✗'}`);
+      syncLogger.info(`      ✅ qty: ${firstItem.qty !== undefined ? '✓' : '✗'}`);
+      syncLogger.info(`      ✅ unit_price_fc: ${firstItem.unit_price_fc !== undefined ? '✓' : '✗'}`);
+      syncLogger.info(`      ✅ uuid: ${firstItem.uuid ? '✓' : '✗'}`);
+    }
+    
+    // Grouper les lignes par facture (une facture peut avoir plusieurs lignes)
     const salesByInvoice = {};
+    let skippedLinesCount = 0;
     
-    for (const item of data) {
+    for (let i = 0; i < data.length; i++) {
+      const item = data[i];
       const invoiceNumber = item.invoice_number;
-      if (!invoiceNumber) continue;
+      
+      if (!invoiceNumber || invoiceNumber.toString().trim() === '') {
+        skippedLinesCount++;
+        if (i < 5) { // Log les 5 premiers pour debug
+          syncLogger.warn(`   ⚠️  [SALES] Ligne ${i + 1}/${data.length} ignorée: pas de numéro de facture`);
+        }
+        continue;
+      }
       
       if (!salesByInvoice[invoiceNumber]) {
         salesByInvoice[invoiceNumber] = {
+          uuid: null, // UUID de la vente (sera récupéré depuis la première ligne ou généré)
           invoice_number: invoiceNumber,
           sold_at: item.sold_at,
           client_name: item.client_name || '',
+          client_phone: item.client_phone || '',
           seller_name: item.seller_name || '',
           items: []
         };
+        syncLogger.debug(`   📋 [SALES] Nouvelle facture détectée: ${invoiceNumber}`);
       }
       
-      // Trouver le product_id depuis le code
-      const product = productsRepo.findByCode(item.product_code);
+      // Utiliser le UUID de la première ligne si disponible (pour la vente elle-même)
+      // Note: Chaque item peut avoir son propre UUID, mais la vente (sales) a aussi un UUID
+      if (!salesByInvoice[invoiceNumber].uuid && item._sale_uuid) {
+        salesByInvoice[invoiceNumber].uuid = item._sale_uuid;
+      }
+      
+      // Trouver le product_id depuis le code produit
+      let product = null;
+      let productName = item.product_name || '';
+      if (item.product_code) {
+        product = productsRepo.findByCode(item.product_code);
+        if (product && !productName) {
+          productName = product.name || '';
+        }
+        if (!product) {
+          syncLogger.debug(`   ⚠️  [SALES] Produit non trouvé localement: code="${item.product_code}" (sera stocké avec product_id=null)`);
+        }
+      }
+      
+      // Normaliser l'unité depuis Sheets (colonne H = unité réelle)
+      // IMPORTANT: Utiliser l'unité de Sheets telle quelle, ne pas la remplacer par celle du produit
+      let unitLevel = null;
+      let unitLevelFromSheets = null; // Conserver l'unité originale de Sheets
+      
+      // Récupérer l'unité depuis Sheets (peut être dans unit_level ou vide)
+      const rawUnit = item.unit_level ? String(item.unit_level).trim() : '';
+      
+      if (rawUnit) {
+        // Log toujours pour diagnostiquer les problèmes d'unité
+        syncLogger.info(`   🔍 [SALES] Unité brute depuis Sheets: "${rawUnit}" pour produit ${item.product_code} (facture: ${invoiceNumber})`);
+        
+        // Normaliser l'unité depuis Sheets (peut être "millier", "carton", "piece" en minuscules)
+        unitLevelFromSheets = normalizeUnitFromSheets(rawUnit);
+        
+        if (!unitLevelFromSheets) {
+          // Si normalisation échoue, utiliser la valeur telle quelle (peut être déjà normalisée)
+          const upperValue = rawUnit.toUpperCase();
+          // Vérifier que c'est une valeur valide
+          if (upperValue === 'MILLIER' || upperValue === 'CARTON' || upperValue === 'PIECE' || upperValue === 'MILLIERS') {
+            unitLevelFromSheets = upperValue === 'MILLIERS' ? 'MILLIER' : upperValue;
+            syncLogger.info(`   ✅ [SALES] Unité normalisée depuis majuscules: "${unitLevelFromSheets}" pour produit ${item.product_code}`);
+          } else {
+            syncLogger.warn(`   ⚠️ [SALES] Unité non reconnue depuis Sheets: "${rawUnit}" (upper: "${upperValue}") pour produit ${item.product_code}`);
+          }
+        } else {
+          syncLogger.info(`   ✅ [SALES] Unité normalisée depuis Sheets: "${unitLevelFromSheets}" (brut: "${rawUnit}") pour produit ${item.product_code}`);
+        }
+      } else {
+        syncLogger.warn(`   ⚠️ [SALES] Pas d'unité dans Sheets pour produit ${item.product_code} (facture: ${invoiceNumber}) - item.unit_level="${item.unit_level}"`);
+      }
+      
+      // Utiliser l'unité de Sheets si elle est valide (PRIORITAIRE - ne jamais remplacer)
+      if (unitLevelFromSheets) {
+        unitLevel = unitLevelFromSheets;
+        syncLogger.info(`   ✅ [SALES] Unité depuis Sheets: "${unitLevel}" pour produit ${item.product_code} (PRÉSERVÉE)`);
+      }
+      
+      let unitMark = item.unit_mark || '';
+      
+      // Si unitLevel n'est pas spécifié dans Sheets, chercher dans le produit
+      if (!unitLevel && product?.id && product.units && product.units.length > 0) {
+        // Utiliser la première unité disponible du produit
+        const foundUnit = product.units[0];
+        unitLevel = foundUnit.unit_level;
+        unitMark = foundUnit.unit_mark || '';
+        syncLogger.debug(`   🔍 [SALES] Unité non spécifiée dans Sheets, utilisation de la première unité disponible "${unitLevel}/${unitMark}" pour produit ${item.product_code}`);
+      } else if (unitLevel && product?.id && product.units && product.units.length > 0) {
+        // Chercher l'unité exacte dans le produit pour récupérer le unit_mark si nécessaire
+        let foundUnit = product.units.find(
+          u => u.unit_level === unitLevel && u.unit_mark === unitMark
+        );
+        
+        // Si pas trouvée exactement, chercher une unité avec le même unit_level pour récupérer le mark
+        if (!foundUnit) {
+          foundUnit = product.units.find(u => u.unit_level === unitLevel);
+          if (foundUnit && !unitMark) {
+            // Utiliser le mark du produit seulement si pas de mark dans Sheets
+            unitMark = foundUnit.unit_mark || '';
+            syncLogger.debug(`   🔍 [SALES] Mark récupéré depuis produit: "${unitMark}" pour unité "${unitLevel}" du produit ${item.product_code}`);
+          }
+        } else {
+          // Utiliser le mark du produit si trouvé
+          unitMark = foundUnit.unit_mark || unitMark;
+        }
+        
+        // IMPORTANT: Ne PAS remplacer unitLevel par celle du produit si elle vient de Sheets
+        // L'unité de Sheets est la source de vérité pour les ventes historiques
+      }
+      
+      // Fallback final: si toujours pas d'unité, utiliser PIECE (seulement en dernier recours)
+      if (!unitLevel) {
+        unitLevel = 'PIECE';
+        syncLogger.warn(`   ⚠️  [SALES] Aucune unité trouvée pour produit ${item.product_code}, utilisation de PIECE par défaut`);
+      }
+      
+      // VÉRIFICATION FINALE: S'assurer que l'unité de Sheets est préservée
+      // Si unitLevelFromSheets existe, l'utiliser même si le produit n'a pas cette unité
+      if (unitLevelFromSheets && unitLevel !== unitLevelFromSheets) {
+        syncLogger.warn(`   ⚠️ [SALES] CORRECTION: Unité remplacée incorrectement, restauration de "${unitLevelFromSheets}" pour produit ${item.product_code}`);
+        unitLevel = unitLevelFromSheets;
+      }
+      
+      // Calculer subtotal si non fourni
+      const qty = item.qty || 0;
+      const unitPriceFC = item.unit_price_fc || 0;
+      const unitPriceUSD = item.unit_price_usd || 0;
+      const subtotalFC = item.subtotal_fc !== undefined ? item.subtotal_fc : (qty * unitPriceFC);
+      const subtotalUSD = item.subtotal_usd !== undefined ? item.subtotal_usd : (qty * unitPriceUSD);
+      
+      syncLogger.debug(`   📝 [SALES] Item final: produit=${item.product_code}, unité="${unitLevel}", mark="${unitMark}", qty=${qty}`);
       
       salesByInvoice[invoiceNumber].items.push({
+        uuid: item.uuid || null, // UUID de l'item de vente (sale_items)
         product_id: product?.id || null,
         product_code: item.product_code || '',
-        product_name: item.product_name || product?.name || '',
-        unit_level: item.unit_level || 'PIECE',
-        unit_mark: item.unit_mark || '',
-        qty: item.qty || 0,
-        qty_label: item.qty_label || (item.qty ? item.qty.toString() : '0'),
-        unit_price_fc: item.unit_price_fc || 0,
-        subtotal_fc: item.subtotal_fc || (item.qty * item.unit_price_fc),
-        unit_price_usd: item.unit_price_usd || 0,
-        subtotal_usd: item.subtotal_usd || (item.qty * item.unit_price_usd)
+        product_name: productName,
+        unit_level: unitLevel, // IMPORTANT: Utiliser l'unité de Sheets (préservée)
+        unit_mark: unitMark,
+        qty: qty,
+        qty_label: item.qty_label || (qty ? qty.toString() : '0'),
+        unit_price_fc: unitPriceFC,
+        subtotal_fc: subtotalFC,
+        unit_price_usd: unitPriceUSD,
+        subtotal_usd: subtotalUSD
       });
+      
+      // Utiliser les données de la dernière ligne pour les métadonnées de la vente
+      // (client_name, client_phone, seller_name peuvent varier entre lignes, on prend la dernière)
+      if (item.client_name) salesByInvoice[invoiceNumber].client_name = item.client_name;
+      if (item.client_phone) salesByInvoice[invoiceNumber].client_phone = item.client_phone;
+      if (item.seller_name) salesByInvoice[invoiceNumber].seller_name = item.seller_name;
+      if (item.sold_at) salesByInvoice[invoiceNumber].sold_at = item.sold_at;
     }
     
-    // Vérifier si la vente existe déjà (pour éviter les doublons)
-    // Si elle existe et vient de Sheets, on ne l'écrase pas si elle est locale
+    if (skippedLinesCount > 0) {
+      syncLogger.warn(`   ⚠️  [SALES] ${skippedLinesCount} ligne(s) ignorée(s) (sans numéro de facture)`);
+    }
+    
+    const uniqueInvoicesCount = Object.keys(salesByInvoice).length;
+    syncLogger.info(`   📊 [SALES] GROUPEMENT: ${data.length} ligne(s) → ${uniqueInvoicesCount} facture(s) unique(s)`);
+    
     let insertedCount = 0;
     let updatedCount = 0;
     let skippedCount = 0;
     let errorCount = 0;
     
+    // Traiter chaque facture
+    let invoiceIndex = 0;
     for (const invoiceNumber in salesByInvoice) {
+      invoiceIndex++;
       try {
         const saleData = salesByInvoice[invoiceNumber];
-        // Calculer les totaux
+        
+        syncLogger.info(`   🔄 [SALES] Traitement facture #${invoiceIndex}/${uniqueInvoicesCount}: ${invoiceNumber}`);
+        syncLogger.info(`      📋 Items: ${saleData.items.length}, Client: ${saleData.client_name || 'N/A'}`);
+        
+        // Calculer les totaux de la facture
         let totalFC = 0;
         let totalUSD = 0;
         for (const item of saleData.items) {
-          totalFC += item.subtotal_fc;
-          totalUSD += item.subtotal_usd;
+          totalFC += item.subtotal_fc || 0;
+          totalUSD += item.subtotal_usd || 0;
         }
         
-        // Vérifier si la vente existe
+        syncLogger.info(`      💰 Total FC: ${totalFC.toLocaleString()}, Total USD: ${totalUSD.toLocaleString()}`);
+        
+        // Vérifier si la vente existe déjà dans SQLite
         const existing = salesRepo.findByInvoice(invoiceNumber);
-        if (!existing || existing.origin === 'SHEETS') {
-          // Créer la vente (sans décrémenter le stock car elle vient de Sheets)
-          // TODO: Gérer le stock différemment pour les ventes Sheets
-          const isNew = !existing;
-          syncLogger.info(`   💰 ${isNew ? 'Création' : 'Mise à jour'} vente ${invoiceNumber} avec ${saleData.items.length} item(s) (Total: ${totalFC} FC)`);
-          salesRepo.create({
-            ...saleData,
+        const isNew = !existing;
+        
+        syncLogger.info(`      🔍 [SALES] Recherche dans SQLite: ${isNew ? 'Nouvelle facture (sera créée)' : 'Facture existante trouvée (sera mise à jour si nécessaire)'}`);
+        
+        // IMPORTANT: Toujours mettre à jour les ventes depuis Sheets pour s'assurer que les unités sont correctes
+        // Même si la vente existe déjà, on la met à jour pour garantir la cohérence avec Sheets
+        if (existing) {
+          const existingTotalFC = existing.total_fc || 0;
+          const existingItemsCount = existing.items ? existing.items.length : 0;
+          
+          // Vérifier si les unités ont changé (comparer les unit_level des items)
+          let unitsChanged = false;
+          if (existing.items && existing.items.length === saleData.items.length) {
+            for (let i = 0; i < existing.items.length; i++) {
+              const existingItem = existing.items[i];
+              const newItem = saleData.items[i];
+              if (existingItem.unit_level !== newItem.unit_level) {
+                unitsChanged = true;
+                syncLogger.info(`   🔍 [SALES] Unité changée pour item ${i+1}: "${existingItem.unit_level}" → "${newItem.unit_level}"`);
+                break;
+              }
+            }
+          }
+          
+          const hasChanges = Math.abs(existingTotalFC - totalFC) > 0.01 || 
+                            existingItemsCount !== saleData.items.length ||
+                            unitsChanged;
+          
+          // Toujours mettre à jour pour s'assurer que les unités sont correctes
+          // Même si les données semblent identiques, Sheets est la source de vérité
+          syncLogger.info(`   🔄 [SALES] Facture ${invoiceNumber} existe → MISE À JOUR FORCÉE (Sheets = source de vérité)`);
+          if (hasChanges) {
+            syncLogger.debug(`      📊 Changements détectés: Total FC ${existingTotalFC} → ${totalFC}, Items ${existingItemsCount} → ${saleData.items.length}, Unités changées: ${unitsChanged}`);
+          } else {
+            syncLogger.debug(`      📊 Pas de changements détectés mais mise à jour forcée pour garantir la cohérence des unités`);
+          }
+        }
+        
+        // Générer UUID pour la vente si non fourni
+        if (!saleData.uuid) {
+          saleData.uuid = existing?.uuid || generateUUID();
+        }
+        
+        syncLogger.info(`   💰 [SALES] Facture ${invoiceNumber}: ${isNew ? 'CRÉATION' : 'MISE À JOUR'}`);
+        syncLogger.info(`      📋 Client: ${saleData.client_name || 'N/A'}, Vendeur: ${saleData.seller_name || 'N/A'}`);
+        syncLogger.info(`      📦 ${saleData.items.length} article(s), Total: ${totalFC.toLocaleString()} FC`);
+        syncLogger.info(`      💾 [SQL] ${isNew ? 'INSERT' : 'UPDATE'} dans SQLite (table: sales + sale_items)`);
+        syncLogger.info(`      📥 [SQL] Source: Google Sheets → Local SQLite`);
+        
+        // Validation des données avant upsert
+        if (!saleData.sold_at) {
+          syncLogger.warn(`      ⚠️  [SALES] ATTENTION: Facture ${invoiceNumber} sans date (sold_at) - utilisation de la date actuelle`);
+          saleData.sold_at = new Date().toISOString();
+        }
+        
+        // Utiliser upsert (qui ne décrémente PAS le stock car vente déjà effectuée dans Sheets)
+        syncLogger.info(`      🔄 [SQL] Appel salesRepo.upsert() pour facture ${invoiceNumber}...`);
+        syncLogger.info(`         📋 Données à stocker: ${saleData.items.length} item(s), Total FC: ${totalFC}, Total USD: ${totalUSD}`);
+        syncLogger.info(`         🔍 [SQL] UUID vente: ${saleData.uuid || 'sera généré'}`);
+        syncLogger.info(`         🔍 [SQL] Date vente: ${saleData.sold_at}`);
+        
+        const upsertStartTime = Date.now();
+        let savedSale = null;
+        let upsertError = null;
+        
+        try {
+          savedSale = salesRepo.upsert({
+            uuid: saleData.uuid,
+            invoice_number: invoiceNumber,
+            sold_at: saleData.sold_at,
+            client_name: saleData.client_name,
+            client_phone: saleData.client_phone,
+            seller_name: saleData.seller_name,
             total_fc: totalFC,
             total_usd: totalUSD,
             payment_mode: 'cash',
             status: 'paid',
             origin: 'SHEETS',
-            rate_fc_per_usd: 2800 // Par défaut, sera calculé si nécessaire
+            rate_fc_per_usd: 2800, // Par défaut
+            items: saleData.items
           });
-          if (isNew) {
-            insertedCount++;
-          } else {
-            updatedCount++;
+        } catch (error) {
+          upsertError = error;
+          syncLogger.error(`      ❌ [SQL] ERREUR lors de l'upsert de la facture ${invoiceNumber}:`);
+          syncLogger.error(`         Message: ${error.message || 'Erreur inconnue'}`);
+          syncLogger.error(`         Stack: ${error.stack?.substring(0, 500)}`);
+          throw error; // Re-lancer pour être capturé par le catch externe
+        }
+        
+        const upsertDuration = Date.now() - upsertStartTime;
+        
+        if (savedSale && savedSale.id) {
+          syncLogger.info(`      ✅ [SQL] Facture ${invoiceNumber} ${isNew ? 'CRÉÉE' : 'MISE À JOUR'} dans SQLite en ${upsertDuration}ms`);
+          syncLogger.info(`         📍 Sale ID: ${savedSale.id}, UUID: ${savedSale.uuid || 'N/A'}`);
+          syncLogger.info(`         📊 Items stockés: ${saleData.items.length}, Total FC: ${totalFC.toLocaleString()}`);
+          syncLogger.info(`         💾 Stockage confirmé: Table "sales" → ID=${savedSale.id}, Table "sale_items" → ${saleData.items.length} ligne(s)`);
+          
+          // Vérification post-stockage IMMÉDIATE pour confirmer
+          try {
+            const verifySale = salesRepo.findByInvoice(invoiceNumber);
+            if (verifySale && verifySale.id === savedSale.id) {
+              const itemsCount = verifySale.items ? verifySale.items.length : 0;
+              syncLogger.info(`      ✅ [SQL] VÉRIFICATION IMMÉDIATE: Facture ${invoiceNumber} trouvée dans SQLite`);
+              syncLogger.info(`         📍 ID: ${verifySale.id}, UUID: ${verifySale.uuid || 'N/A'}`);
+              syncLogger.info(`         📊 Items: ${itemsCount} item(s) trouvé(s) dans sale_items`);
+              syncLogger.info(`         💰 Total FC: ${verifySale.total_fc || 0}`);
+              syncLogger.info(`      ✅ [SQL] ✅ CONFIRMÉ: Les données sont bien écrites dans la base SQLite locale`);
+              
+              // Vérification supplémentaire: compter les items dans sale_items
+              try {
+                const { getDb } = await import('../../db/sqlite.js');
+                const db = getDb();
+                const itemsInDb = db.prepare('SELECT COUNT(*) as count FROM sale_items WHERE sale_id = ?').get(savedSale.id);
+                syncLogger.info(`      ✅ [SQL] Vérification table sale_items: ${itemsInDb.count} item(s) lié(s) à cette facture`);
+                if (itemsInDb.count !== saleData.items.length) {
+                  syncLogger.warn(`      ⚠️  [SQL] ATTENTION: Nombre d'items différent (attendu: ${saleData.items.length}, trouvé: ${itemsInDb.count})`);
+                }
+              } catch (itemsCheckError) {
+                syncLogger.warn(`      ⚠️  [SQL] Erreur lors de la vérification des items: ${itemsCheckError.message}`);
+              }
+            } else {
+              syncLogger.error(`      ❌ [SQL] VÉRIFICATION ÉCHOUÉE: Facture ${invoiceNumber} non trouvée après stockage`);
+              syncLogger.error(`         📋 Recherche effectuée avec invoice_number="${invoiceNumber}"`);
+              syncLogger.error(`         🔍 Résultat: ${verifySale ? 'trouvée mais ID différent' : 'non trouvée'}`);
+            }
+          } catch (verifyError) {
+            syncLogger.error(`      ❌ [SQL] Erreur lors de la vérification post-stockage: ${verifyError.message}`);
+            syncLogger.error(`         Stack: ${verifyError.stack?.substring(0, 300)}`);
           }
         } else {
-          skippedCount++;
-          syncLogger.debug(`   ⏭️  Vente ${invoiceNumber} déjà existante (locale), ignorée`);
+          syncLogger.error(`      ❌ [SQL] ÉCHEC: Impossible de stocker la facture ${invoiceNumber} dans SQLite`);
+          syncLogger.error(`         📋 Résultat upsert: ${savedSale ? JSON.stringify(savedSale).substring(0, 200) : 'null/undefined'}`);
+          if (!savedSale || !savedSale.id) {
+            syncLogger.error(`         💡 Diagnostic: salesRepo.upsert() n'a pas retourné de vente avec un ID`);
+            syncLogger.error(`         💡 Vérifier que la transaction SQLite s'est bien exécutée`);
+          }
+        }
+        
+        if (isNew) {
+          insertedCount++;
+        } else {
+          updatedCount++;
         }
       } catch (error) {
         errorCount++;
-        syncLogger.error(`   ❌ Erreur upsert vente ${invoiceNumber}:`, error.message || error);
+        syncLogger.error(`   ❌ [SALES] Erreur lors du stockage de la facture ${invoiceNumber}:`, error.message || error);
+        if (error.stack) {
+          syncLogger.error(`      Stack: ${error.stack.substring(0, 300)}...`);
+        }
       }
     }
     
-    syncLogger.info(`✅ Ventes traitées: ${insertedCount} insérée(s), ${updatedCount} mise(s) à jour, ${skippedCount} ignorée(s), ${errorCount} erreur(s)`);
-    return { inserted: insertedCount, updated: updatedCount, skipped: skippedCount };
+    const duration = Date.now() - startTime;
+    const totalProcessed = insertedCount + updatedCount;
+    
+    // Vérification finale dans SQLite pour confirmer le stockage
+    let totalSalesInDb = 0;
+    try {
+      // Utiliser salesRepo pour vérifier le nombre de ventes dans SQLite
+      const allSales = salesRepo.findAll({}); // Récupérer toutes les ventes
+      totalSalesInDb = allSales.filter(s => s.origin === 'SHEETS').length;
+      syncLogger.info(`   🔍 [SQL] VÉRIFICATION SQLite: ${totalSalesInDb} facture(s) avec origin='SHEETS' trouvée(s) dans la table "sales"`);
+      syncLogger.info(`   ✅ [SQL] Les ventes sont bien stockées dans la base de données SQLite locale`);
+    } catch (verifyError) {
+      syncLogger.warn(`   ⚠️  [SQL] Erreur lors de la vérification SQLite: ${verifyError.message}`);
+    }
+    
+    syncLogger.info(`💰 [SALES] ==========================================`);
+    syncLogger.info(`💰 [SALES] RÉSULTAT FINAL DE LA SYNCHRONISATION:`);
+    syncLogger.info(`💰 [SALES] ==========================================`);
+    syncLogger.info(`   📥 SOURCE: Google Sheets (feuille "Ventes")`);
+    syncLogger.info(`   📦 RÉCEPTION: ${data.length} ligne(s) téléchargée(s) depuis Sheets`);
+    syncLogger.info(`   🔄 GROUPEMENT: ${uniqueInvoicesCount} facture(s) unique(s) détectée(s)`);
+    syncLogger.info(`   💾 STOCKAGE SQLite:`);
+    syncLogger.info(`      ✅ ${insertedCount} facture(s) CRÉÉE(S) (INSERT INTO sales)`);
+    syncLogger.info(`      ✅ ${updatedCount} facture(s) MIS(E) À JOUR (UPDATE sales)`);
+    if (skippedCount > 0) {
+      syncLogger.info(`      ⏭️  ${skippedCount} facture(s) IGNORÉE(S) (déjà synchronisées et identiques)`);
+      syncLogger.info(`         💡 Ces ventes existent déjà dans SQLite avec les mêmes données → Pas de retéléchargement nécessaire`);
+    }
+    if (errorCount > 0) {
+      syncLogger.warn(`      ❌ ${errorCount} facture(s) EN ERREUR (non stockées)`);
+    }
+    syncLogger.info(`   📊 TOTAL TRAITÉ: ${totalProcessed} facture(s) traitée(s) (${insertedCount} créée(s) + ${updatedCount} mise(s) à jour) dans SQLite`);
+    syncLogger.info(`   ✅ VÉRIFICATION SQLite: ${totalSalesInDb} facture(s) avec origin='SHEETS' dans la base de données`);
+    
+    // Vérification des items dans sale_items
+    let totalItemsInDb = 0;
+    try {
+      const { getDb } = await import('../../db/sqlite.js');
+      const db = getDb();
+      const itemsCountResult = db.prepare('SELECT COUNT(*) as count FROM sale_items').get();
+      totalItemsInDb = itemsCountResult?.count || 0;
+      syncLogger.info(`   ✅ VÉRIFICATION SQLite: ${totalItemsInDb} item(s) dans la table "sale_items"`);
+    } catch (itemsError) {
+      syncLogger.warn(`   ⚠️  Erreur lors de la vérification des items: ${itemsError.message}`);
+    }
+    
+    // LOG FINAL TRÈS VISIBLE POUR CONFIRMER LE STOCKAGE
+    syncLogger.info(`   🎉 [SALES] ==========================================`);
+    syncLogger.info(`   🎉 [SALES] ✅ CONFIRMATION FINALE DU STOCKAGE:`);
+    syncLogger.info(`   🎉 [SALES] ==========================================`);
+    
+    // Calculer les nouvelles ventes ajoutées
+    const newSalesAdded = totalSalesInDb - salesCountBefore;
+    const newItemsAdded = totalItemsInDb - itemsCountBefore;
+    
+    syncLogger.info(`   📊 [SALES] COMPARAISON AVANT/APRÈS:`);
+    syncLogger.info(`      📥 AVANT: ${salesCountBefore} vente(s), ${itemsCountBefore} item(s)`);
+    syncLogger.info(`      📥 APRÈS: ${totalSalesInDb} vente(s), ${totalItemsInDb} item(s)`);
+    syncLogger.info(`      ➕ AJOUTÉ: ${newSalesAdded} nouvelle(s) vente(s), ${newItemsAdded} nouvel(aux) item(s)`);
+    
+    if (totalSalesInDb > 0 && totalItemsInDb > 0) {
+      syncLogger.info(`   ✅ [SALES] ✅ LES VENTES SONT BIEN STOCKÉES DANS SQLITE!`);
+      syncLogger.info(`   ✅ [SALES] ✅ ${totalSalesInDb} vente(s) dans la table "sales" (origin='SHEETS')`);
+      syncLogger.info(`   ✅ [SALES] ✅ ${totalItemsInDb} item(s) dans la table "sale_items"`);
+      
+      if (newSalesAdded > 0 || newItemsAdded > 0) {
+        syncLogger.info(`   🎉 [SALES] ✅ ${newSalesAdded} nouvelle(s) vente(s) ajoutée(s) avec succès!`);
+        syncLogger.info(`   🎉 [SALES] ✅ ${newItemsAdded} nouvel(aux) item(s) ajouté(s) avec succès!`);
+      } else if (insertedCount > 0 || updatedCount > 0) {
+        syncLogger.warn(`   ⚠️  [SALES] ATTENTION: Des ventes ont été traitées (${insertedCount} créée(s), ${updatedCount} mise(s) à jour) mais le nombre total n'a pas changé`);
+        syncLogger.warn(`   💡 [SALES] Raison possible: Les ventes existaient déjà et ont été mises à jour`);
+      }
+      
+      syncLogger.info(`   ✅ [SALES] ✅ Les ventes sont disponibles dans la page "Historique des ventes"`);
+      syncLogger.info(`   ✅ [SALES] ✅ URL: /sales/history (Menu → Historique)`);
+    } else {
+      syncLogger.error(`   ❌ [SALES] ERREUR CRITIQUE: Aucune vente trouvée dans SQLite après traitement!`);
+      syncLogger.error(`   📊 [SALES] Statistiques de traitement:`);
+      syncLogger.error(`      ✅ Traitées: ${insertedCount} créée(s), ${updatedCount} mise(s) à jour, ${skippedCount} ignorée(s)`);
+      syncLogger.error(`      ❌ Erreurs: ${errorCount}`);
+      syncLogger.error(`   💡 [SALES] Diagnostic:`);
+      syncLogger.error(`      1. Vérifier que salesRepo.upsert() fonctionne correctement`);
+      syncLogger.error(`      2. Vérifier que la transaction SQLite s'exécute sans erreur`);
+      syncLogger.error(`      3. Vérifier les logs d'erreur ci-dessus pour chaque facture`);
+      syncLogger.error(`      4. Vérifier que la base de données SQLite est accessible`);
+      
+      // Tentative de diagnostic supplémentaire
+      try {
+        const { getDb } = await import('../../db/sqlite.js');
+        const db = getDb();
+        const allSales = db.prepare('SELECT COUNT(*) as count FROM sales').get();
+        const allItems = db.prepare('SELECT COUNT(*) as count FROM sale_items').get();
+        syncLogger.error(`   🔍 [SALES] Diagnostic SQLite:`);
+        syncLogger.error(`      📊 Total ventes (toutes origines): ${allSales.count}`);
+        syncLogger.error(`      📊 Total items (toutes origines): ${allItems.count}`);
+        if (allSales.count > 0) {
+          const sampleSale = db.prepare('SELECT invoice_number, origin FROM sales LIMIT 1').get();
+          syncLogger.error(`      📋 Exemple de vente: ${sampleSale?.invoice_number || 'N/A'}, origin=${sampleSale?.origin || 'N/A'}`);
+        }
+      } catch (diagError) {
+        syncLogger.error(`   ❌ [SALES] Erreur lors du diagnostic: ${diagError.message}`);
+      }
+    }
+    syncLogger.info(`   🎉 [SALES] ==========================================`);
+    
+    syncLogger.info(`   ⏱️  Durée totale: ${duration}ms`);
+    syncLogger.info(`💰 [SALES] ==========================================`);
+    
+    if (totalProcessed > 0) {
+      syncLogger.info(`   🎉 [SALES] ✅ SYNCHRONISATION RÉUSSIE!`);
+      syncLogger.info(`   📱 [SALES] Les ventes sont maintenant disponibles dans l'application:`);
+      syncLogger.info(`      📄 Page "Historique des ventes" (Menu → Historique)`);
+      syncLogger.info(`      🔗 URL: /sales/history`);
+      syncLogger.info(`      💡 Note: Ajustez les dates (Du/Au) pour voir toutes les ventes synchronisées`);
+    }
+    
+    if (skippedCount > 0 && totalProcessed === 0) {
+      syncLogger.info(`   ℹ️  [SALES] Toutes les ventes téléchargées étaient déjà synchronisées → Aucune modification nécessaire`);
+      syncLogger.info(`   ✅ [SALES] Les ventes sont déjà présentes dans SQLite et visibles dans l'interface`);
+    }
+    
+    // Log final de confirmation
+    syncLogger.info(`   ✅ [SALES] SYNCHRONISATION TERMINÉE: Les ventes de Sheets sont bien synchronisées vers SQLite local`);
+    syncLogger.info(`   📍 [SALES] LOCALISATION: Base de données SQLite → Tables "sales" et "sale_items"`);
+    
+    return { 
+      inserted: insertedCount, 
+      updated: updatedCount, 
+      skipped: skippedCount,
+      errorCount: errorCount
+    };
+  }
+  
+  /**
+   * Vérifie que les ventes sont bien synchronisées depuis Sheets vers SQLite
+   * Compare la structure et le contenu des tables
+   */
+  async verifySalesSync() {
+    try {
+      syncLogger.info(`🔍 [VERIFY-SALES] ==========================================`);
+      syncLogger.info(`🔍 [VERIFY-SALES] VÉRIFICATION DE LA SYNCHRONISATION DES VENTES`);
+      syncLogger.info(`🔍 [VERIFY-SALES] ==========================================`);
+      
+      const { getDb } = await import('../../db/sqlite.js');
+      const db = getDb();
+      
+      // 1. Compter les ventes dans SQLite
+      const allSalesInDb = salesRepo.findAll({});
+      const salesFromSheets = allSalesInDb.filter(s => s.origin === 'SHEETS');
+      const totalSalesInDb = allSalesInDb.length;
+      const salesFromSheetsCount = salesFromSheets.length;
+      
+      syncLogger.info(`   📊 [VERIFY-SALES] SQLite (table 'sales'):`);
+      syncLogger.info(`      ✅ Total ventes: ${totalSalesInDb}`);
+      syncLogger.info(`      ✅ Ventes depuis Sheets (origin='SHEETS'): ${salesFromSheetsCount}`);
+      
+      // 2. Compter les items dans SQLite
+      const itemsCountResult = db.prepare('SELECT COUNT(*) as count FROM sale_items').get();
+      const totalItemsInDb = itemsCountResult?.count || 0;
+      
+      syncLogger.info(`   📊 [VERIFY-SALES] SQLite (table 'sale_items'):`);
+      syncLogger.info(`      ✅ Total items: ${totalItemsInDb}`);
+      
+      // 4. Afficher quelques exemples de ventes stockées
+      if (salesFromSheets.length > 0) {
+        syncLogger.info(`   📋 [VERIFY-SALES] Exemples de ventes stockées (5 dernières):`);
+        const recentSales = salesFromSheets
+          .sort((a, b) => new Date(b.sold_at || 0) - new Date(a.sold_at || 0))
+          .slice(0, 5);
+        
+        for (const sale of recentSales) {
+          const itemsCount = sale.items ? sale.items.length : 0;
+          syncLogger.info(`      📄 Facture: ${sale.invoice_number || 'N/A'}`);
+          syncLogger.info(`         Client: ${sale.client_name || 'N/A'}, Total: ${(sale.total_fc || 0).toLocaleString()} FC`);
+          syncLogger.info(`         Date: ${sale.sold_at || 'N/A'}, Items: ${itemsCount}, UUID: ${sale.uuid || 'N/A'}`);
+        }
+      } else {
+        syncLogger.warn(`      ⚠️  Aucune vente depuis Sheets trouvée dans SQLite`);
+        syncLogger.warn(`      💡 Vérifier que getSalesPage() dans Code.gs retourne des données`);
+      }
+      
+      // 5. Récupérer un échantillon depuis Sheets pour comparer
+      syncLogger.info(`   📥 [VERIFY-SALES] Vérification de la disponibilité des données dans Sheets...`);
+      
+      try {
+        // Récupérer quelques lignes depuis Sheets (première page seulement pour vérification)
+        const sampleResult = await sheetsClient.pullAllPaged('sales', new Date(0).toISOString(), {
+          full: true,
+          startCursor: 2, // Commencer à la ligne 2 (après header)
+          maxRetries: 2,
+          timeout: 15000,
+          limit: 50 // Récupérer les 50 premières lignes pour vérification
+        });
+        
+        if (sampleResult.success && sampleResult.data && sampleResult.data.length > 0) {
+          const sampleLinesFromSheets = sampleResult.data.length;
+          syncLogger.info(`   📥 [VERIFY-SALES] Google Sheets (feuille "Ventes"):`);
+          syncLogger.info(`      ✅ Échantillon récupéré: ${sampleLinesFromSheets} ligne(s) (sur probablement beaucoup plus)`);
+          syncLogger.info(`      ✅ Les données sont disponibles dans Google Sheets`);
+          
+          // Vérifier la structure des données
+          const firstItem = sampleResult.data[0];
+          if (firstItem) {
+            syncLogger.info(`   📋 [VERIFY-SALES] Structure des données Sheets vérifiée:`);
+            syncLogger.info(`      ✅ invoice_number: ${firstItem.invoice_number ? '✓ Présent' : '✗ Manquant'}`);
+            syncLogger.info(`      ✅ sold_at: ${firstItem.sold_at ? '✓ Présent' : '✗ Manquant'}`);
+            syncLogger.info(`      ✅ product_code: ${firstItem.product_code ? '✓ Présent' : '✗ Manquant'}`);
+            syncLogger.info(`      ✅ client_name: ${firstItem.client_name ? '✓ Présent' : '✗ Manquant'}`);
+            syncLogger.info(`      ✅ qty: ${firstItem.qty !== undefined ? '✓ Présent' : '✗ Manquant'}`);
+            syncLogger.info(`      ✅ unit_price_fc: ${firstItem.unit_price_fc !== undefined ? '✓ Présent' : '✗ Manquant'}`);
+            syncLogger.info(`      ✅ seller_name: ${firstItem.seller_name ? '✓ Présent' : '✗ Manquant'}`);
+            syncLogger.info(`      ✅ unit_level: ${firstItem.unit_level ? '✓ Présent' : '✗ Manquant'}`);
+            syncLogger.info(`      ✅ client_phone: ${firstItem.client_phone !== undefined ? '✓ Présent' : '✗ Manquant'}`);
+            syncLogger.info(`      ✅ uuid: ${firstItem.uuid ? '✓ Présent' : '✗ Manquant'}`);
+          }
+          
+          // Grouper par facture pour compter les factures uniques
+          const invoicesInSample = new Set();
+          sampleResult.data.forEach(item => {
+            if (item.invoice_number) {
+              invoicesInSample.add(item.invoice_number);
+            }
+          });
+          
+          syncLogger.info(`   📊 [VERIFY-SALES] Échantillon Sheets: ${invoicesInSample.size} facture(s) unique(s) dans les ${sampleLinesFromSheets} ligne(s)`);
+          
+          // Vérifier si ces factures existent dans SQLite
+          let foundInDb = 0;
+          let missingInDb = 0;
+          const missingInvoices = [];
+          
+          for (const invoiceNumber of invoicesInSample) {
+            const saleInDb = salesRepo.findByInvoice(invoiceNumber);
+            if (saleInDb) {
+              foundInDb++;
+            } else {
+              missingInDb++;
+              if (missingInDb <= 10) { // Logger les 10 premiers manquants
+                missingInvoices.push(invoiceNumber);
+              }
+            }
+          }
+          
+          syncLogger.info(`   ✅ [VERIFY-SALES] Factures de l'échantillon vérifiées dans SQLite:`);
+          syncLogger.info(`      ✅ Trouvées: ${foundInDb}/${invoicesInSample.size}`);
+          if (missingInDb > 0) {
+            syncLogger.warn(`      ⚠️  Manquantes: ${missingInDb}/${invoicesInSample.size}`);
+            if (missingInvoices.length > 0) {
+              syncLogger.warn(`      ⚠️  Exemples de factures manquantes: ${missingInvoices.slice(0, 5).join(', ')}${missingInvoices.length > 5 ? '...' : ''}`);
+            }
+            syncLogger.info(`      💡 [VERIFY-SALES] Ces factures seront synchronisées au prochain cycle (dans 10s)`);
+          }
+        } else {
+          syncLogger.warn(`   ⚠️  [VERIFY-SALES] Impossible de récupérer l'échantillon depuis Sheets: ${sampleResult.error || 'Aucune donnée'}`);
+        }
+      } catch (verifyError) {
+        syncLogger.warn(`   ⚠️  [VERIFY-SALES] Erreur lors de la récupération de l'échantillon depuis Sheets: ${verifyError.message}`);
+      }
+      
+      // 6. Vérification de l'intégrité des données
+      syncLogger.info(`   🔍 [VERIFY-SALES] Vérification de l'intégrité des données...`);
+      
+      // Vérifier les ventes sans items
+      const salesWithoutItems = db.prepare(`
+        SELECT s.id, s.invoice_number, s.origin
+        FROM sales s
+        LEFT JOIN sale_items si ON s.id = si.sale_id
+        WHERE si.id IS NULL AND s.origin = 'SHEETS'
+        LIMIT 10
+      `).all();
+      
+      if (salesWithoutItems.length > 0) {
+        syncLogger.warn(`      ⚠️  ${salesWithoutItems.length} vente(s) synchronisée(s) sans items détectée(s) (exemples):`);
+        for (const sale of salesWithoutItems.slice(0, 5)) {
+          syncLogger.warn(`         - Facture ${sale.invoice_number} (ID: ${sale.id})`);
+        }
+      } else {
+        syncLogger.info(`      ✅ Toutes les ventes synchronisées ont des items associés`);
+      }
+      
+      // Vérifier les items sans vente (ne devrait jamais arriver)
+      const itemsWithoutSale = db.prepare(`
+        SELECT COUNT(*) as count
+        FROM sale_items si
+        LEFT JOIN sales s ON si.sale_id = s.id
+        WHERE s.id IS NULL
+      `).get();
+      
+      if (itemsWithoutSale.count > 0) {
+        syncLogger.error(`      ❌ ${itemsWithoutSale.count} item(s) orphelin(s) (sans vente associée) - CORRECTION NÉCESSAIRE`);
+      } else {
+        syncLogger.info(`      ✅ Tous les items sont associés à une vente`);
+      }
+      
+      // 7. Statistiques détaillées par période
+      const last7Days = new Date();
+      last7Days.setDate(last7Days.getDate() - 7);
+      const salesLast7Days = db.prepare(`
+        SELECT COUNT(*) as count, SUM(total_fc) as total_fc
+        FROM sales
+        WHERE origin = 'SHEETS' AND sold_at >= ?
+      `).get(last7Days.toISOString());
+      
+      syncLogger.info(`   📊 [VERIFY-SALES] Statistiques des 7 derniers jours:`);
+      syncLogger.info(`      ✅ Ventes synchronisées: ${salesLast7Days.count || 0}`);
+      syncLogger.info(`      ✅ Total FC: ${(salesLast7Days.total_fc || 0).toLocaleString()}`);
+      
+      // 8. Vérification finale et résumé
+      syncLogger.info(`   ✅ [VERIFY-SALES] RÉSUMÉ DE LA VÉRIFICATION:`);
+      syncLogger.info(`      📊 Ventes dans SQLite: ${totalSalesInDb} total (${salesFromSheetsCount} depuis Sheets)`);
+      syncLogger.info(`      📦 Items dans SQLite: ${totalItemsInDb}`);
+      syncLogger.info(`      ✅ Intégrité: ${salesWithoutItems.length === 0 ? 'OK' : 'ATTENTION - Ventes sans items détectées'}`);
+      
+      if (salesFromSheetsCount > 0 && totalItemsInDb > 0) {
+        syncLogger.info(`      🎉 [VERIFY-SALES] ✅ CONFIRMÉ: Les ventes sont bien téléchargées et stockées dans SQLite!`);
+        syncLogger.info(`      📍 [VERIFY-SALES] Tables: "sales" (${totalSalesInDb} ventes) + "sale_items" (${totalItemsInDb} items)`);
+        syncLogger.info(`      📄 [VERIFY-SALES] Les ventes sont disponibles dans la page "Historique des ventes"`);
+        syncLogger.info(`      🔗 [VERIFY-SALES] URL: /sales/history (Menu → Historique)`);
+      } else if (salesFromSheetsCount === 0) {
+        syncLogger.warn(`      ⚠️  [VERIFY-SALES] Aucune vente avec origin='SHEETS' trouvée dans SQLite`);
+        syncLogger.info(`      💡 [VERIFY-SALES] La synchronisation continue... Les ventes seront téléchargées progressivement`);
+        syncLogger.info(`      💡 [VERIFY-SALES] Vérifier les logs précédents pour voir si des ventes sont en cours de téléchargement`);
+      } else {
+        syncLogger.warn(`      ⚠️  [VERIFY-SALES] Items manquants: ${salesFromSheetsCount} ventes mais seulement ${totalItemsInDb} items`);
+        syncLogger.warn(`      💡 [VERIFY-SALES] Vérifier que les items sont bien créés lors de l'upsert`);
+      }
+      
+      syncLogger.info(`🔍 [VERIFY-SALES] ==========================================`);
+      
+    } catch (error) {
+      syncLogger.error(`   ❌ [VERIFY-SALES] Erreur lors de la vérification: ${error.message}`);
+      if (error.stack) {
+        syncLogger.error(`      Stack: ${error.stack.substring(0, 300)}...`);
+      }
+    }
   }
 
   /**
@@ -1255,25 +2953,307 @@ export class SyncWorker {
   }
 
   /**
-   * Applique les mises à jour d'utilisateurs
+   * Applique les mises à jour d'utilisateurs (basé sur UUID)
    */
   async applyUsersUpdates(data) {
-    syncLogger.info(`👥 Application de ${data.length} utilisateur(s)...`);
+    if (!data || data.length === 0) {
+      syncLogger.warn('⚠️  [USERS] Aucune donnée utilisateur à appliquer');
+      return;
+    }
+
+    syncLogger.info(`👥 [USERS] ==========================================`);
+    syncLogger.info(`👥 [USERS] Début application de ${data.length} utilisateur(s)...`);
+    syncLogger.info(`👥 [USERS] ==========================================`);
     
-    // Note: usersRepo.upsert n'existe peut-être pas encore
-    // Pour l'instant, on log juste
-    for (const user of data) {
-      syncLogger.info(`   👥 Utilisateur: ${user.name || user.nom || 'Inconnu'} (${user.numero || 'N/A'})`);
+    // Construire index local pour matching rapide
+    const localUsers = usersRepo.findAll();
+    const byUuid = new Map();
+    const byUsername = new Map();
+    
+    for (const user of localUsers) {
+      if (user.uuid) {
+        byUuid.set(user.uuid.trim(), user);
+      }
+      if (user.username) {
+        const normalized = usersRepo.normalizeUsername(user.username);
+        byUsername.set(normalized, user);
+      }
     }
     
-    syncLogger.info(`✅ ${data.length} utilisateur(s) logué(s) (fonctionnalité à implémenter)`);
+    syncLogger.info(`   📊 [USERS] Index local: ${byUuid.size} avec UUID, ${byUsername.size} par username`);
+    
+    // Log du premier utilisateur pour voir la structure
+    if (data.length > 0) {
+      syncLogger.info(`👥 [USERS] Exemple de données reçues (premier utilisateur):`);
+      syncLogger.info(`   📋 UUID: ${data[0].uuid || data[0]._uuid || 'N/A (VIDE)'}`);
+      syncLogger.info(`   📋 Username: ${data[0].username || data[0].nom || 'N/A'}`);
+      syncLogger.info(`   📋 Phone: ${data[0].phone || data[0].numero || 'N/A'}`);
+      syncLogger.info(`   📋 Is Active: ${data[0].is_active}`);
+      syncLogger.info(`   📋 Is Admin: ${data[0].is_admin}`);
+    }
+    
+    let inserted = 0;
+    let updated = 0;
+    let skipped = 0;
+    let repaired = 0; // UUID réparés
+
+    for (let i = 0; i < data.length; i++) {
+      const userData = data[i];
+      try {
+        const username = userData.username || userData.nom || '';
+        if (!username || username.trim() === '') {
+          syncLogger.warn(`   ⚠️  [USERS] Utilisateur #${i + 1} ignoré: nom vide`);
+          skipped++;
+          continue;
+        }
+
+        syncLogger.info(`   🔍 [USERS] Traitement utilisateur #${i + 1}/${data.length}: ${username}`);
+
+        // Extraire UUID (peut être dans uuid ou _uuid)
+        const remoteUuid = (userData.uuid || userData._uuid || '').trim();
+        
+        // A) Si UUID existe → UPSERT par UUID
+        if (remoteUuid) {
+          syncLogger.info(`   🔑 [USERS] UUID présent: ${remoteUuid}`);
+          
+          const existing = byUuid.get(remoteUuid);
+          
+          if (existing) {
+            syncLogger.info(`   📝 [USERS] Utilisateur existant trouvé par UUID: ID=${existing.id}, Username=${existing.username}`);
+            
+            const updateData = {
+              phone: userData.phone || userData.numero || existing.phone,
+              is_active: userData.is_active !== undefined ? (userData.is_active ? 1 : 0) : existing.is_active,
+              is_admin: userData.is_admin !== undefined ? (userData.is_admin ? 1 : 0) : existing.is_admin,
+              is_vendeur: userData.is_vendeur !== undefined ? (userData.is_vendeur ? 1 : 0) : (existing.is_vendeur !== undefined ? existing.is_vendeur : 1),
+              is_gerant_stock: userData.is_gerant_stock !== undefined ? (userData.is_gerant_stock ? 1 : 0) : (existing.is_gerant_stock || 0),
+              can_manage_products: userData.can_manage_products !== undefined ? (userData.can_manage_products ? 1 : 0) : (existing.can_manage_products || 0),
+              // PRÉSERVER les URLs existantes : ne pas écraser si vide depuis Sheets
+              device_brand: userData.device_brand || existing.device_brand || '',
+              profile_url: userData.profile_url || existing.profile_url || '',
+              expo_push_token: userData.expo_push_token || existing.expo_push_token || '',
+            };
+            
+            await usersRepo.update(existing.id, updateData);
+            updated++;
+            syncLogger.info(`   ✅ [USERS] Utilisateur mis à jour par UUID: ${username}`);
+          } else {
+            // UUID existe mais utilisateur non trouvé par UUID → vérifier par username
+            syncLogger.info(`   🔍 [USERS] UUID présent mais utilisateur non trouvé par UUID, recherche par username: ${username}`);
+            
+            const normalized = usersRepo.normalizeUsername(username);
+            const existingByUsername = byUsername.get(normalized);
+            
+            if (existingByUsername) {
+              // Utilisateur existe par username mais UUID différent → UPDATE avec réparation UUID
+              syncLogger.info(`   🔧 [USERS] Utilisateur trouvé par username mais UUID différent: ID=${existingByUsername.id}, UUID local=${existingByUsername.uuid || 'VIDE'}, UUID Sheets=${remoteUuid}`);
+              
+              // Réparer UUID : assigner le UUID de Sheets à l'utilisateur local
+              usersRepo.setUuid(existingByUsername.id, remoteUuid);
+              existingByUsername.uuid = remoteUuid;
+              byUuid.set(remoteUuid, existingByUsername);
+              repaired++;
+              
+              // Mettre à jour avec les données de Sheets
+              const updateData = {
+                phone: userData.phone || userData.numero || existingByUsername.phone,
+                is_active: userData.is_active !== undefined ? (userData.is_active ? 1 : 0) : existingByUsername.is_active,
+                is_admin: userData.is_admin !== undefined ? (userData.is_admin ? 1 : 0) : existingByUsername.is_admin,
+                is_vendeur: userData.is_vendeur !== undefined ? (userData.is_vendeur ? 1 : 0) : (existingByUsername.is_vendeur !== undefined ? existingByUsername.is_vendeur : 1),
+                is_gerant_stock: userData.is_gerant_stock !== undefined ? (userData.is_gerant_stock ? 1 : 0) : (existingByUsername.is_gerant_stock || 0),
+                can_manage_products: userData.can_manage_products !== undefined ? (userData.can_manage_products ? 1 : 0) : (existingByUsername.can_manage_products || 0),
+                device_brand: userData.device_brand || existingByUsername.device_brand || '',
+                profile_url: userData.profile_url || existingByUsername.profile_url || '',
+                expo_push_token: userData.expo_push_token || existingByUsername.expo_push_token || '',
+              };
+              
+              await usersRepo.update(existingByUsername.id, updateData);
+              updated++;
+              syncLogger.info(`   ✅ [USERS] Utilisateur mis à jour avec réparation UUID: ${username} (UUID=${remoteUuid})`);
+            } else {
+              // Vraiment nouveau : créer
+              syncLogger.info(`   ➕ [USERS] Nouvel utilisateur avec UUID: ${username}`);
+              
+              const createData = {
+                uuid: remoteUuid,
+                username: username.trim(),
+                password: 'changeme123',
+                phone: userData.phone || userData.numero || '',
+                is_active: userData.is_active !== undefined ? (userData.is_active ? 1 : 0) : 1,
+                is_admin: userData.is_admin !== undefined ? (userData.is_admin ? 1 : 0) : 0,
+                is_vendeur: userData.is_vendeur !== undefined ? (userData.is_vendeur ? 1 : 0) : 1,
+                is_gerant_stock: userData.is_gerant_stock !== undefined ? (userData.is_gerant_stock ? 1 : 0) : 0,
+                can_manage_products: userData.can_manage_products !== undefined ? (userData.can_manage_products ? 1 : 0) : 0,
+                created_at: userData.created_at || new Date().toISOString(),
+                device_brand: userData.device_brand || '',
+                profile_url: userData.profile_url || '',
+                expo_push_token: userData.expo_push_token || '',
+              };
+              
+              try {
+                const newUser = await usersRepo.create(createData);
+                byUuid.set(remoteUuid, newUser);
+                byUsername.set(usersRepo.normalizeUsername(username), newUser);
+                inserted++;
+                syncLogger.info(`   ✅ [USERS] Nouvel utilisateur créé avec UUID: ${username} (UUID=${remoteUuid})`);
+              } catch (createError) {
+                // Fallback : si erreur UNIQUE sur username, essayer update
+                if (createError?.code === 'SQLITE_CONSTRAINT_UNIQUE' && String(createError.message || '').includes('users.username')) {
+                  syncLogger.warn(`   ⚠️  [USERS] Erreur UNIQUE username lors de la création, tentative UPDATE par username: ${username}`);
+                  const existingByUsernameFallback = usersRepo.findByUsername(username.trim());
+                  if (existingByUsernameFallback) {
+                    // Réparer UUID et mettre à jour
+                    usersRepo.setUuid(existingByUsernameFallback.id, remoteUuid);
+                    const updateDataFallback = {
+                      phone: userData.phone || userData.numero || existingByUsernameFallback.phone,
+                      is_active: userData.is_active !== undefined ? (userData.is_active ? 1 : 0) : existingByUsernameFallback.is_active,
+                      is_admin: userData.is_admin !== undefined ? (userData.is_admin ? 1 : 0) : existingByUsernameFallback.is_admin,
+                      is_vendeur: userData.is_vendeur !== undefined ? (userData.is_vendeur ? 1 : 0) : (existingByUsernameFallback.is_vendeur !== undefined ? existingByUsernameFallback.is_vendeur : 1),
+                      is_gerant_stock: userData.is_gerant_stock !== undefined ? (userData.is_gerant_stock ? 1 : 0) : (existingByUsernameFallback.is_gerant_stock || 0),
+                      can_manage_products: userData.can_manage_products !== undefined ? (userData.can_manage_products ? 1 : 0) : (existingByUsernameFallback.can_manage_products || 0),
+                      device_brand: userData.device_brand || existingByUsernameFallback.device_brand || '',
+                      profile_url: userData.profile_url || existingByUsernameFallback.profile_url || '',
+                      expo_push_token: userData.expo_push_token || existingByUsernameFallback.expo_push_token || '',
+                    };
+                    await usersRepo.update(existingByUsernameFallback.id, updateDataFallback);
+                    updated++;
+                    repaired++;
+                    syncLogger.info(`   ✅ [USERS] Utilisateur mis à jour (fallback après erreur UNIQUE): ${username} (UUID=${remoteUuid})`);
+                  } else {
+                    throw createError; // Re-throw si on ne peut pas résoudre
+                  }
+                } else {
+                  throw createError; // Re-throw les autres erreurs
+                }
+              }
+            }
+          }
+          continue;
+        }
+        
+        // B) Si UUID vide → chercher par username normalisé
+        syncLogger.info(`   ⚠️  [USERS] UUID vide, recherche par username: ${username}`);
+        
+        const normalized = usersRepo.normalizeUsername(username);
+        const existing = byUsername.get(normalized);
+        
+        if (existing) {
+          syncLogger.info(`   🔧 [USERS] Utilisateur trouvé par username: ID=${existing.id}, UUID local=${existing.uuid || 'VIDE'}`);
+          
+          // Réparer : assigner UUID local si absent, puis mettre à jour
+          let userUuid = existing.uuid;
+          if (!userUuid || userUuid.trim() === '') {
+            userUuid = generateUUID();
+            usersRepo.setUuid(existing.id, userUuid);
+            existing.uuid = userUuid;
+            byUuid.set(userUuid, existing);
+            repaired++;
+            syncLogger.info(`   🔧 [USERS] UUID réparé: ${userUuid} pour ${username}`);
+            
+            // Pousser vers Sheets pour backfill UUID - PRO et TOP
+            syncRepo.addToOutbox('users', existing.id.toString(), 'upsert', {
+              uuid: userUuid,
+              username: existing.username,
+              phone: existing.phone || '',
+              is_admin: existing.is_admin,
+              is_active: existing.is_active,
+              is_vendeur: existing.is_vendeur !== undefined ? existing.is_vendeur : 1,
+              is_gerant_stock: existing.is_gerant_stock || 0,
+              can_manage_products: existing.can_manage_products || 0,
+            });
+          }
+          
+          // Mettre à jour (PRÉSERVER les URLs existantes)
+          const updateData = {
+            phone: userData.phone || userData.numero || existing.phone,
+            is_active: userData.is_active !== undefined ? (userData.is_active ? 1 : 0) : existing.is_active,
+            is_admin: userData.is_admin !== undefined ? (userData.is_admin ? 1 : 0) : existing.is_admin,
+            is_vendeur: userData.is_vendeur !== undefined ? (userData.is_vendeur ? 1 : 0) : (existing.is_vendeur !== undefined ? existing.is_vendeur : 1),
+            is_gerant_stock: userData.is_gerant_stock !== undefined ? (userData.is_gerant_stock ? 1 : 0) : (existing.is_gerant_stock || 0),
+            can_manage_products: userData.can_manage_products !== undefined ? (userData.can_manage_products ? 1 : 0) : (existing.can_manage_products || 0),
+            // PRÉSERVER : ne pas écraser si vide depuis Sheets
+            device_brand: userData.device_brand || existing.device_brand || '',
+            profile_url: userData.profile_url || existing.profile_url || '',
+            expo_push_token: userData.expo_push_token || existing.expo_push_token || '',
+          };
+          
+          await usersRepo.update(existing.id, updateData);
+          updated++;
+          syncLogger.info(`   ✅ [USERS] Utilisateur mis à jour (username match): ${username}`);
+        } else {
+          // C) Nouvel utilisateur sans UUID
+          syncLogger.info(`   ➕ [USERS] Nouvel utilisateur sans UUID: ${username}`);
+          
+          const newUuid = generateUUID();
+          const createData = {
+            uuid: newUuid,
+            username: username.trim(),
+            password: 'changeme123',
+            phone: userData.phone || userData.numero || '',
+            is_active: userData.is_active !== undefined ? (userData.is_active ? 1 : 0) : 1,
+            is_admin: userData.is_admin !== undefined ? (userData.is_admin ? 1 : 0) : 0,
+            is_vendeur: userData.is_vendeur !== undefined ? (userData.is_vendeur ? 1 : 0) : 1,
+            is_gerant_stock: userData.is_gerant_stock !== undefined ? (userData.is_gerant_stock ? 1 : 0) : 0,
+            can_manage_products: userData.can_manage_products !== undefined ? (userData.can_manage_products ? 1 : 0) : 0,
+            created_at: userData.created_at || new Date().toISOString(),
+            // PRÉSERVER les URLs : utiliser telles quelles depuis Sheets
+            device_brand: userData.device_brand || '',
+            profile_url: userData.profile_url || '', // Ne pas modifier l'URL
+            expo_push_token: userData.expo_push_token || '',
+          };
+          
+          const newUser = await usersRepo.create(createData);
+          byUuid.set(newUuid, newUser);
+          byUsername.set(normalized, newUser);
+          inserted++;
+          
+          // Pousser vers Sheets pour backfill UUID - PRO et TOP
+          syncRepo.addToOutbox('users', newUser.id.toString(), 'upsert', {
+            uuid: newUuid,
+            username: newUser.username,
+            phone: newUser.phone || '',
+            is_admin: newUser.is_admin,
+            is_active: newUser.is_active,
+            is_vendeur: newUser.is_vendeur !== undefined ? newUser.is_vendeur : 1,
+            is_gerant_stock: newUser.is_gerant_stock || 0,
+            can_manage_products: newUser.can_manage_products || 0,
+          });
+          
+          syncLogger.info(`   ✅ [USERS] Nouvel utilisateur créé avec UUID généré: ${username} (UUID=${newUuid})`);
+        }
+      } catch (error) {
+        // Logger les erreurs proprement (éviter les objets caractère par caractère)
+        const username = userData.username || userData.nom || 'Inconnu';
+        const errorDetails = {
+          username: username,
+          message: String(error?.message || error || 'Erreur inconnue'),
+          code: error?.code || 'UNKNOWN'
+        };
+        syncLogger.error(`   ❌ [USERS] Erreur traitement utilisateur #${i + 1} (${username}):`, errorDetails);
+        if (error?.stack) {
+          syncLogger.error(`   📋 Stack trace:`, String(error.stack).substring(0, 500));
+        }
+        skipped++;
+      }
+    }
+
+    syncLogger.info(`👥 [USERS] ==========================================`);
+    syncLogger.info(`✅ [USERS] Synchronisation terminée: ${inserted} créé(s), ${updated} mis à jour, ${repaired} UUID réparé(s), ${skipped} ignoré(s)`);
+    syncLogger.info(`👥 [USERS] ==========================================`);
   }
 
   /**
    * Force une synchronisation immédiate
    */
   async syncNow() {
-    await this.runSyncSafe();
+    syncLogger.info('🔄 [SYNC NOW] Début synchronisation manuelle (syncNow)');
+    try {
+      await this.runSyncSafe();
+      syncLogger.info('✅ [SYNC NOW] Synchronisation manuelle terminée avec succès');
+    } catch (error) {
+      syncLogger.error('❌ [SYNC NOW] Erreur synchronisation manuelle:', error);
+      throw error;
+    }
   }
 }
 

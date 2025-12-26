@@ -65,14 +65,28 @@ function toNumber(v) {
 }
 
 /**
- * Convertit une valeur en Date (gère formats FR dd/mm/yyyy)
+ * Convertit une valeur en Date (gère formats FR dd/mm/yyyy et ISO)
  */
 function toDate(v) {
   if (!v) return null;
-  if (v instanceof Date) return v;
-  if (typeof v === 'number') return new Date(v);
+  if (v instanceof Date) {
+    // Vérifier que la date est valide
+    return isNaN(v.getTime()) ? null : v;
+  }
+  if (typeof v === 'number') {
+    const dt = new Date(v);
+    return isNaN(dt.getTime()) ? null : dt;
+  }
   
   const s = String(v).trim();
+  if (!s || s === '') return null;
+  
+  // Essayer d'abord le format ISO (2025-11-20T10:44:58.918Z)
+  // Le constructeur Date() gère déjà ce format correctement
+  const dtIso = new Date(s);
+  if (!isNaN(dtIso.getTime())) {
+    return dtIso;
+  }
   
   // Format FR: dd/mm/yyyy ou dd-mm-yyyy
   const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
@@ -81,9 +95,11 @@ function toDate(v) {
     const mo = parseInt(m[2], 10) - 1;
     let y = parseInt(m[3], 10);
     if (y < 100) y = 2000 + y;
-    return new Date(y, mo, d);
+    const dtFr = new Date(y, mo, d);
+    return isNaN(dtFr.getTime()) ? null : dtFr;
   }
   
+  // Dernier essai avec le constructeur Date standard
   const dt = new Date(s);
   return isNaN(dt.getTime()) ? null : dt;
 }
@@ -339,9 +355,16 @@ function doGet(e) {
         break;
       case 'sales':
         console.log('💰 [SALES] Récupération ventes (mode paginé PRO)...');
+        console.log('📅 [SALES] Paramètres: sinceDate=', sinceDate, '| cursor=', cursor, '| limit=', limit, '| full=', full);
         // TOUJOURS utiliser pagination pour sales (évite timeout)
-        out = getSalesPage(sinceDate, cursor, limit);
+        // Passer sinceDate comme Date (pas string) pour getSalesPage
+        const salesSinceDate = full ? new Date(0) : sinceDate;
+        console.log('📅 [SALES] sinceDate pour getSalesPage:', salesSinceDate.toISOString(), '| getTime():', salesSinceDate.getTime());
+        out = getSalesPage(salesSinceDate, cursor, limit);
         console.log('✅ [SALES] Ventes récupérées:', out.data?.length || 0, '| Done:', out.done, '| Next cursor:', out.next_cursor);
+        if (out.data && out.data.length === 0) {
+          console.log('⚠️ [SALES] Aucune vente retournée - Vérifier que la feuille "Ventes" contient des données');
+        }
         break;
       case 'debts':
         console.log('💳 [DEBTS] Récupération dettes (mode paginé PRO)...');
@@ -514,6 +537,7 @@ function handleSaleUpsert(payload) {
   ensureColumn(sheet, 'QTE');
   ensureColumn(sheet, 'MARK');
   ensureColumn(sheet, 'Prix unitaire');
+  ensureColumn(sheet, 'Unite');
   ensureColumn(sheet, 'Vendeur');
   ensureColumn(sheet, 'mode stock');
   ensureColumn(sheet, 'Telephone');
@@ -527,6 +551,7 @@ function handleSaleUpsert(payload) {
   const colQte = findColumnIndex(sheet, 'QTE');
   const colMark = findColumnIndex(sheet, 'MARK');
   const colPrixUnitaire = findColumnIndex(sheet, 'Prix unitaire');
+  const colUnite = findColumnIndex(sheet, 'Unite');
   const colVendeur = findColumnIndex(sheet, 'Vendeur');
   const colModeStock = findColumnIndex(sheet, 'mode stock');
   const colTelephone = findColumnIndex(sheet, 'Telephone');
@@ -568,6 +593,7 @@ function handleSaleItemUpsert(payload) {
   const colQte = findColumnIndex(sheet, 'QTE');
   const colMark = findColumnIndex(sheet, 'MARK');
   const colPrixUnitaire = findColumnIndex(sheet, 'Prix unitaire');
+  const colUnite = findColumnIndex(sheet, 'Unite');
   const colVendeur = findColumnIndex(sheet, 'Vendeur');
   const colModeStock = findColumnIndex(sheet, 'mode stock');
   const colTelephone = findColumnIndex(sheet, 'Telephone');
@@ -606,7 +632,7 @@ function handleSaleItemUpsert(payload) {
   }
   
   const maxCol = Math.max(colDate, colFacture, colCode, colClient, colQte, 
-                          colMark, colPrixUnitaire, colVendeur, colModeStock, 
+                          colMark, colPrixUnitaire, colUnite, colVendeur, colModeStock, 
                           colTelephone, colUSD, colUuid);
   const rowData = [];
   for (let i = 0; i < maxCol; i++) {
@@ -620,8 +646,9 @@ function handleSaleItemUpsert(payload) {
   if (colQte > 0) rowData[colQte - 1] = payload.qty || 0;
   if (colMark > 0) rowData[colMark - 1] = payload.unit_mark || '';
   if (colPrixUnitaire > 0) rowData[colPrixUnitaire - 1] = payload.unit_price_fc || 0;
+  if (colUnite > 0) rowData[colUnite - 1] = payload.unit_level || '';
   if (colVendeur > 0) rowData[colVendeur - 1] = payload.seller_name || '';
-  if (colModeStock > 0) rowData[colModeStock - 1] = payload.unit_level || '';
+  if (colModeStock > 0) rowData[colModeStock - 1] = payload.unit_level || ''; // Garder pour compatibilité
   if (colTelephone > 0) rowData[colTelephone - 1] = payload.client_phone || '';
   if (colUSD > 0) rowData[colUSD - 1] = payload.unit_price_usd || payload.subtotal_usd || 0;
   if (colUuid > 0) rowData[colUuid - 1] = searchUuid || '';
@@ -858,16 +885,24 @@ function handleUserUpsert(payload) {
   }
   
   if (colNom > 0) rowData[colNom - 1] = payload.username || '';
-  // Ne pas écrire le mot de passe en clair
+  // Ne pas écrire le mot de passe en clair (sécurité)
   // if (colModePasse > 0) rowData[colModePasse - 1] = ''; 
   if (colNumero > 0) rowData[colNumero - 1] = payload.phone || '';
   if (colValide > 0) rowData[colValide - 1] = payload.is_active ? 1 : 0;
   if (colDateCreation > 0) rowData[colDateCreation - 1] = payload.created_at || new Date().toISOString();
   if (colToken > 0) rowData[colToken - 1] = payload.expo_push_token || '';
   if (colMarque > 0) rowData[colMarque - 1] = payload.device_brand || '';
-  if (colUrlProfile > 0) rowData[colUrlProfile - 1] = payload.profile_url || '';
+  // CRITIQUE: PRÉSERVER l'URL existante si payload.profile_url est vide
+  if (colUrlProfile > 0) {
+    const existingUrl = rowIndex > 0 ? (values[rowIndex - 1][colUrlProfile - 1] || '') : '';
+    rowData[colUrlProfile - 1] = payload.profile_url || existingUrl || '';
+  }
   if (colAdmi > 0) rowData[colAdmi - 1] = payload.is_admin ? 1 : 0;
-  if (colUuid > 0) rowData[colUuid - 1] = searchUuid || '';
+  // CRITIQUE: PRÉSERVER l'UUID existant si payload.uuid est vide
+  if (colUuid > 0) {
+    const existingUuid = rowIndex > 0 ? (values[rowIndex - 1][colUuid - 1] || '') : '';
+    rowData[colUuid - 1] = searchUuid || existingUuid || '';
+  }
   
   if (rowIndex > 0) {
     sheet.getRange(rowIndex, 1, 1, rowData.length).setValues([rowData]);
@@ -1178,6 +1213,7 @@ function getSalesSince(sinceDate) {
   const colQte = findColumnIndex(sheet, 'QTE');
   const colMark = findColumnIndex(sheet, 'MARK');
   const colPrixUnitaire = findColumnIndex(sheet, 'Prix unitaire');
+  const colUnite = findColumnIndex(sheet, 'Unite');
   const colVendeur = findColumnIndex(sheet, 'Vendeur');
   const colModeStock = findColumnIndex(sheet, 'mode stock');
   const colTelephone = findColumnIndex(sheet, 'Telephone');
@@ -1195,6 +1231,7 @@ function getSalesSince(sinceDate) {
     QTE: colQte,
     MARK: colMark,
     PrixUnitaire: colPrixUnitaire,
+    Unite: colUnite,
     Vendeur: colVendeur,
     ModeStock: colModeStock,
     Telephone: colTelephone,
@@ -1279,7 +1316,9 @@ function getSalesSince(sinceDate) {
       qty: qty,
       qty_label: qtyValue ? qtyValue.toString().trim() : '0',
       unit_mark: colMark > 0 ? (values[i][colMark - 1] ? values[i][colMark - 1].toString().trim() : '') : '',
-      unit_level: colModeStock > 0 ? (values[i][colModeStock - 1] ? values[i][colModeStock - 1].toString().trim().toUpperCase() : 'PIECE') : 'PIECE',
+      // Colonne H "Unite" = unité réelle (prioritaire), sinon colonne I "mode stock" (compatibilité)
+      unit_level: colUnite > 0 ? (values[i][colUnite - 1] ? values[i][colUnite - 1].toString().trim() : '') : 
+                (colModeStock > 0 ? (values[i][colModeStock - 1] ? values[i][colModeStock - 1].toString().trim() : '') : ''),
       unit_price_fc: unitPriceFC,
       subtotal_fc: qty * unitPriceFC,
       unit_price_usd: unitPriceUSD,
@@ -1501,6 +1540,18 @@ function getProductsPage(sinceDate, cursor, limit, unitLevelParam) {
  */
 function getSalesPage(sinceDate, cursor, limit) {
   console.log('📄 [getSalesPage] Feuille: Ventes | Cursor:', cursor, '| Limit:', limit);
+  console.log('📅 [getSalesPage] sinceDate reçu:', sinceDate, '| Type:', typeof sinceDate);
+  
+  // Convertir sinceDate en Date si c'est une string
+  let sinceDateObj = sinceDate;
+  if (typeof sinceDate === 'string') {
+    sinceDateObj = new Date(sinceDate);
+  } else if (!(sinceDate instanceof Date)) {
+    sinceDateObj = new Date(sinceDate);
+  }
+  
+  const isFullImport = sinceDateObj.getTime() <= new Date('1970-01-02').getTime();
+  console.log('📅 [getSalesPage] sinceDate converti:', sinceDateObj.toISOString(), '| getTime():', sinceDateObj.getTime(), '| Full import:', isFullImport);
   
   const sheet = getSheet(SHEETS.VENTES);
   ensureTechColumns(sheet);
@@ -1513,11 +1564,14 @@ function getSalesPage(sinceDate, cursor, limit) {
   const colQte = findColumnIndex(sheet, 'QTE');
   const colMark = findColumnIndex(sheet, 'MARK');
   const colPrixUnitaire = findColumnIndex(sheet, 'Prix unitaire');
+  const colUnite = findColumnIndex(sheet, 'Unite');
   const colVendeur = findColumnIndex(sheet, 'Vendeur');
   const colModeStock = findColumnIndex(sheet, 'mode stock');
   const colTelephone = findColumnIndex(sheet, 'Telephone');
   const colUSD = findColumnIndex(sheet, 'USD');
   const colUuid = findColumnIndex(sheet, '_uuid');
+  
+  console.log('📋 [getSalesPage] Colonnes trouvées: Date=' + colDate + ', Facture=' + colFacture + ', Code=' + colCode + ', Client=' + colClient + ', QTE=' + colQte);
   
   if (colDate === -1 || colFacture === -1) {
     console.log('⚠️ [getSalesPage] Colonnes Date ou Facture manquantes');
@@ -1528,6 +1582,8 @@ function getSalesPage(sinceDate, cursor, limit) {
                           colPrixUnitaire, colVendeur, colModeStock, colTelephone, colUSD, colUuid);
   
   const lastRow = sheet.getLastRow();
+  console.log('📊 [getSalesPage] Dernière ligne dans Sheets:', lastRow);
+  
   if (lastRow <= 1) {
     console.log('⚠️ [getSalesPage] Pas de données (seulement en-tête)');
     return { data: [], next_cursor: null, done: true };
@@ -1540,55 +1596,121 @@ function getSalesPage(sinceDate, cursor, limit) {
   console.log('📊 [getSalesPage] Lecture lignes', startRow, 'à', endRow, '(', numRows, 'lignes)');
   
   const rows = sheet.getRange(startRow, 1, numRows, maxCol).getValues();
+  console.log('📊 [getSalesPage] Lignes lues depuis Sheets:', rows.length);
   
   const data = [];
   const nowIso = new Date().toISOString();
   let processedCount = 0;
   let skippedCount = 0;
+  let skippedNoInvoice = 0;
+  let skippedNoRefDate = 0;
+  let skippedDateFilter = 0;
+  let skippedNoDate = 0;
   
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
     const invoice = (r[colFacture - 1] || '').toString().trim();
     
     if (!invoice) {
+      skippedNoInvoice++;
       skippedCount++;
+      if (i < 5) {
+        console.log('   ⚠️ [getSalesPage] Ligne', startRow + i, 'ignorée: pas de numéro de facture');
+      }
       continue;
     }
     
-    // Utiliser _updated_at si présent, sinon fallback sur Date
-    const refVal = (colUpdatedAt > 0) ? r[colUpdatedAt - 1] : r[colDate - 1];
-    const refDate = toDate(refVal);
-    
-    if (!refDate) {
-      skippedCount++;
-      continue;
-    }
-    
-    if (sinceDate.getTime() > 0 && refDate < sinceDate) {
-      skippedCount++;
-      continue;
-    }
-    
+    // Lire la date de vente d'abord
     const d = toDate(r[colDate - 1]);
-    if (!d) {
+    
+    // Utiliser _updated_at si présent, sinon fallback sur Date de vente
+    const refVal = (colUpdatedAt > 0) ? r[colUpdatedAt - 1] : r[colDate - 1];
+    let refDate = toDate(refVal);
+    
+    // IMPORTANT: En mode full import (isFullImport = true), on accepte TOUTES les ventes même sans date
+    // Si pas de date de référence mais full import, utiliser la date de la vente ou date actuelle
+    if (!refDate) {
+      if (isFullImport) {
+        // En mode full import, utiliser la date de vente comme date de référence si disponible
+        refDate = d || new Date();
+      } else {
+        skippedNoRefDate++;
+        skippedCount++;
+        if (i < 5) {
+          console.log('   ⚠️ [getSalesPage] Ligne', startRow + i, 'ignorée: pas de date de référence valide (refVal:', refVal, ')');
+        }
+        continue;
+      }
+    }
+    
+    // IMPORTANT: Si sinceDate est 1970 (full import), on accepte TOUTES les ventes
+    // sinceDateObj.getTime() === 0 signifie qu'on veut TOUTES les ventes
+    if (!isFullImport && sinceDateObj.getTime() > 0 && refDate && refDate < sinceDateObj) {
+      skippedDateFilter++;
       skippedCount++;
+      if (i < 5) {
+        console.log('   ⚠️ [getSalesPage] Ligne', startRow + i, 'ignorée: date trop ancienne (refDate:', refDate.toISOString(), '< sinceDate:', sinceDateObj.toISOString(), ')');
+      }
       continue;
     }
     
-    const qty = toNumber(colQte > 0 ? r[colQte - 1] : 0);
+    // En mode full import, accepter même les ventes sans date (utiliser date actuelle)
+    if (!d) {
+      if (isFullImport) {
+        // En mode full import, utiliser date actuelle si pas de date
+        // On continue avec d = new Date() (sera défini plus bas)
+      } else {
+        skippedNoDate++;
+        skippedCount++;
+        if (i < 5) {
+          console.log('   ⚠️ [getSalesPage] Ligne', startRow + i, 'ignorée: pas de date valide dans colonne Date');
+        }
+        continue;
+      }
+    }
+    
+    // Préserver le format original de la quantité (avec virgule si présent) pour qty_label
+    const qtyRaw = colQte > 0 ? r[colQte - 1] : 0;
+    const qtyLabel = qtyRaw ? String(qtyRaw).trim() : '0';
+    const qty = toNumber(qtyRaw);
     const unitPriceFC = toNumber(colPrixUnitaire > 0 ? r[colPrixUnitaire - 1] : 0);
     const unitPriceUSD = toNumber(colUSD > 0 ? r[colUSD - 1] : 0);
+    
+    // Utiliser la date de vente ou date actuelle si pas de date (full import)
+    const finalSaleDate = d || new Date();
+    // Utiliser la date de référence ou date de vente ou date actuelle
+    const finalRefDate = refDate || finalSaleDate || new Date();
     
     data.push({
       uuid: colUuid > 0 ? (r[colUuid - 1] || null) : null,
       invoice_number: invoice,
-      sold_at: d.toISOString(),
+      sold_at: finalSaleDate.toISOString(),
       product_code: colCode > 0 ? (r[colCode - 1] || '').toString().trim() : '',
+      product_name: '', // Sera rempli depuis les produits lors de l'application
       client_name: colClient > 0 ? (r[colClient - 1] || '').toString().trim() : '',
       client_phone: colTelephone > 0 ? (r[colTelephone - 1] || '').toString().trim() : '',
-      qty,
+      qty: qty,
+      qty_label: qtyLabel,
       unit_mark: colMark > 0 ? (r[colMark - 1] || '').toString().trim() : '',
-      unit_level: colModeStock > 0 ? (r[colModeStock - 1] || '').toString().trim().toUpperCase() : 'PIECE',
+      // Colonne H "Unite" = unité réelle (millier, carton, piece) - PRIORITAIRE
+      // Colonne I "mode stock" = fallback pour compatibilité
+      // IMPORTANT: Vérifier que la colonne Unite existe et contient une valeur
+      unit_level: (() => {
+        if (colUnite > 0 && r[colUnite - 1]) {
+          const uniteValue = (r[colUnite - 1] || '').toString().trim();
+          if (uniteValue) {
+            return uniteValue;
+          }
+        }
+        // Fallback sur mode stock si Unite est vide
+        if (colModeStock > 0 && r[colModeStock - 1]) {
+          const modeStockValue = (r[colModeStock - 1] || '').toString().trim();
+          if (modeStockValue) {
+            return modeStockValue;
+          }
+        }
+        return ''; // Retourner chaîne vide si aucune unité trouvée
+      })(),
       unit_price_fc: unitPriceFC,
       subtotal_fc: qty * unitPriceFC,
       unit_price_usd: unitPriceUSD,
@@ -1596,7 +1718,7 @@ function getSalesPage(sinceDate, cursor, limit) {
       seller_name: colVendeur > 0 ? (r[colVendeur - 1] || '').toString().trim() : '',
       _origin: 'SHEETS',
       _syncedAt: nowIso,
-      _remote_updated_at: refDate.toISOString()
+      _remote_updated_at: finalRefDate.toISOString()
     });
     processedCount++;
   }
@@ -1605,6 +1727,29 @@ function getSalesPage(sinceDate, cursor, limit) {
   const next_cursor = done ? null : (endRow + 1);
   
   console.log('✅ [getSalesPage] Traité:', processedCount, 'vente(s) | Skippé:', skippedCount, '| Done:', done, '| Next cursor:', next_cursor);
+  console.log('📊 [getSalesPage] Détail des lignes ignorées:');
+  console.log('   - Sans facture:', skippedNoInvoice);
+  console.log('   - Sans date de référence:', skippedNoRefDate);
+  console.log('   - Filtrées par date:', skippedDateFilter);
+  console.log('   - Sans date valide:', skippedNoDate);
+  
+  // Log détaillé pour les premières ventes traitées (debug)
+  if (processedCount > 0 && data.length > 0) {
+    console.log('📋 [getSalesPage] Exemple de ventes traitées (3 premières):');
+    for (let i = 0; i < Math.min(3, data.length); i++) {
+      const item = data[i];
+      console.log(`   [${i + 1}] Facture: ${item.invoice_number || 'N/A'}, Client: ${item.client_name || 'N/A'}, Produit: ${item.product_code || 'N/A'}, Qty: ${item.qty || 0}`);
+    }
+  } else if (rows.length > 0) {
+    // Si on a lu des lignes mais rien n'a été traité, afficher les premières lignes pour debug
+    console.log('⚠️ [getSalesPage] Aucune vente traitée sur', rows.length, 'ligne(s) lue(s). Exemple de la première ligne:');
+    const firstRow = rows[0];
+    console.log('   Facture:', firstRow[colFacture - 1]);
+    console.log('   Date:', firstRow[colDate - 1]);
+    console.log('   Client:', firstRow[colClient - 1]);
+    console.log('   Code produit:', firstRow[colCode - 1]);
+    console.log('   _updated_at:', colUpdatedAt > 0 ? firstRow[colUpdatedAt - 1] : 'N/A');
+  }
   
   return { data, next_cursor, done };
 }
@@ -1800,38 +1945,159 @@ function getUsersSince(sinceDate) {
   const colValide = findColumnIndex(sheet, 'Valide');
   const colAdmi = findColumnIndex(sheet, 'admi');
   const colUuid = findColumnIndex(sheet, '_uuid');
+  const colToken = findColumnIndex(sheet, 'Token Expo Push');
+  const colMarque = findColumnIndex(sheet, 'marque');
+  const colUrlProfile = findColumnIndex(sheet, 'Urlprofile');
   
-  if (colDateCreation === -1) return [];
+  if (colDateCreation === -1) {
+    console.log('[USERS] ❌ Colonne "date de creation du compter" introuvable');
+    return [];
+  }
   
   const dataRange = sheet.getDataRange();
   const values = dataRange.getValues();
   const results = [];
   
+  // Logs de débogage
+  const sinceDateObj = new Date(sinceDate);
+  const isFullImport = sinceDateObj.getTime() <= new Date('1970-01-02').getTime(); // Si date <= 1970, c'est un import complet
+  console.log(`[USERS] 🔍 Recherche utilisateurs depuis: ${sinceDate} (${sinceDateObj.toLocaleString('fr-FR')})`);
+  console.log(`[USERS] 📊 Mode: ${isFullImport ? 'IMPORT COMPLET (tous les utilisateurs)' : 'SYNC INCRÉMENTALE (depuis date)'}`);
+  console.log(`[USERS] 📊 Total lignes dans la feuille: ${values.length}`);
+  console.log(`[USERS] 📋 Colonnes trouvées: Nom=${colNom}, Numero=${colNumero}, Valide=${colValide}, Admi=${colAdmi}, UUID=${colUuid}, Token=${colToken}, Marque=${colMarque}, UrlProfile=${colUrlProfile}`);
+  
+  let skippedNoDate = 0;
+  let skippedOldDate = 0;
+  let skippedEmptyName = 0;
+  let processed = 0;
+  let processedWithoutDate = 0;
+  
+  let uuidBackfilled = 0;
+  
   for (let i = 1; i < values.length; i++) {
-    // Utiliser _updated_at si présent, sinon fallback sur date de creation
-    const refVal = (colUpdatedAt > 0) ? values[i][colUpdatedAt - 1] : values[i][colDateCreation - 1];
+    // PRIORITÉ: Utiliser la date de création (colonne E) comme date de référence principale
+    // Utiliser _updated_at seulement si date de création n'est pas disponible
+    const dateCreationVal = values[i][colDateCreation - 1];
+    const updatedAtVal = (colUpdatedAt > 0) ? values[i][colUpdatedAt - 1] : null;
+    
+    // Prioriser la date de création
+    const refVal = dateCreationVal || updatedAtVal;
     const refDate = toDate(refVal);
     
-    if (!refDate) continue;
+    // Si import complet, inclure même les utilisateurs sans date
+    // Sinon, ignorer ceux sans date
+    if (!refDate) {
+      if (isFullImport) {
+        // En mode import complet, utiliser la date actuelle comme fallback
+        processedWithoutDate++;
+        console.log(`[USERS] ⚠️  Ligne ${i} sans date valide mais incluse (import complet)`);
+      } else {
+        skippedNoDate++;
+        continue;
+      }
+    }
     
-    if (refDate < sinceDate) {
+    // Si on a une date valide, vérifier si elle est trop ancienne (sauf en mode import complet)
+    // Utiliser la date de création comme référence principale pour le filtrage
+    if (refDate && !isFullImport) {
+      // Comparer les dates (convertir sinceDate en Date si c'est une string)
+      const sinceDateObj2 = typeof sinceDate === 'string' ? new Date(sinceDate) : sinceDate;
+      // Utiliser la date de création pour la comparaison (pas _updated_at)
+      const dateToCompare = refDate; // refDate est déjà basé sur dateCreation en priorité
+      if (dateToCompare < sinceDateObj2) {
+        skippedOldDate++;
+        if (i <= 5) { // Log les 5 premiers pour debug
+          const nomValue = colNom > 0 ? values[i][colNom - 1] : '';
+          console.log(`[USERS] ⏭️  Ligne ${i} ignorée (date de création trop ancienne): ${nomValue || 'Sans nom'}, dateCreation=${dateToCompare.toISOString()}, sinceDate=${sinceDateObj2.toISOString()}`);
+        }
+        continue;
+      }
+    }
+    
+    const dateCreationRaw = values[i][colDateCreation - 1];
+    const nomValue = colNom > 0 ? values[i][colNom - 1] : '';
+    const numeroValue = colNumero > 0 ? values[i][colNumero - 1] : '';
+    
+    // Ignorer les lignes vides
+    if (!nomValue || nomValue.toString().trim() === '') {
+      skippedEmptyName++;
       continue;
     }
     
-    const dateCreation = values[i][colDateCreation - 1];
+    // BACKFILL UUID si manquant
+    let userUuid = colUuid > 0 ? String(values[i][colUuid - 1] || '').trim() : '';
+    if (!userUuid) {
+      // Générer un UUID et l'écrire dans la feuille
+      userUuid = Utilities.getUuid();
+      if (colUuid > 0) {
+        sheet.getRange(i + 1, colUuid).setValue(userUuid);
+        uuidBackfilled++;
+        console.log(`[USERS] 🔧 UUID généré pour ligne ${i + 1}: ${userUuid} (${nomValue})`);
+      }
+    }
     
-    results.push({
-      uuid: colUuid > 0 ? values[i][colUuid - 1] : null,
-      username: colNom > 0 ? values[i][colNom - 1] : '',
-      phone: colNumero > 0 ? values[i][colNumero - 1] : '',
-      is_active: colValide > 0 ? (values[i][colValide - 1] == 1) : true,
-      is_admin: colAdmi > 0 ? (values[i][colAdmi - 1] == 1) : false,
-      created_at: dateCreation,
+    processed++;
+    
+    // Utiliser la date de référence ou la date actuelle si pas de date (import complet)
+    // S'assurer que finalRefDate est toujours un objet Date valide
+    let finalRefDate = refDate;
+    if (!finalRefDate || !(finalRefDate instanceof Date) || isNaN(finalRefDate.getTime())) {
+      finalRefDate = new Date();
+      if (isFullImport) {
+        processedWithoutDate++;
+      }
+    }
+    
+    // Convertir dateCreation en Date si nécessaire
+    let finalCreatedAt = null;
+    if (dateCreationRaw) {
+      const dateCreatedObj = toDate(dateCreationRaw);
+      if (dateCreatedObj && !isNaN(dateCreatedObj.getTime())) {
+        finalCreatedAt = dateCreatedObj;
+      }
+    }
+    
+    // Si pas de date de création valide, utiliser la date de référence
+    if (!finalCreatedAt) {
+      finalCreatedAt = finalRefDate;
+    }
+    
+    // Double vérification : s'assurer que finalCreatedAt est un objet Date valide
+    if (!(finalCreatedAt instanceof Date) || isNaN(finalCreatedAt.getTime())) {
+      finalCreatedAt = new Date();
+    }
+    
+    const userData = {
+      uuid: userUuid, // UUID backfillé si nécessaire
+      _uuid: userUuid, // Alias pour compatibilité
+      username: nomValue ? String(nomValue).trim() : '',
+      phone: numeroValue ? String(numeroValue).trim() : '',
+      is_active: colValide > 0 ? (String(values[i][colValide - 1]).toLowerCase() === 'oui' || values[i][colValide - 1] == 1 || values[i][colValide - 1] === true) : true,
+      is_admin: colAdmi > 0 ? (String(values[i][colAdmi - 1]).toLowerCase() === 'oui' || values[i][colAdmi - 1] == 1 || values[i][colAdmi - 1] === true) : false,
+      created_at: (finalCreatedAt instanceof Date && !isNaN(finalCreatedAt.getTime())) ? finalCreatedAt.toISOString() : new Date().toISOString(),
+      // Informations device
+      device_brand: colMarque > 0 ? (values[i][colMarque - 1] ? String(values[i][colMarque - 1]).trim() : '') : '',
+      profile_url: colUrlProfile > 0 ? (values[i][colUrlProfile - 1] ? String(values[i][colUrlProfile - 1]).trim() : '') : '',
+      expo_push_token: colToken > 0 ? (values[i][colToken - 1] ? String(values[i][colToken - 1]).trim() : '') : '',
       _origin: 'SHEETS',
       _syncedAt: new Date().toISOString(),
-      _remote_updated_at: refDate.toISOString()
-    });
+      _remote_updated_at: (finalRefDate && finalRefDate instanceof Date && !isNaN(finalRefDate.getTime())) ? finalRefDate.toISOString() : new Date().toISOString()
+    };
+    
+    if (processed <= 3) { // Log les 3 premiers utilisateurs
+      const refDateStr = (refDate && refDate instanceof Date && !isNaN(refDate.getTime())) ? refDate.toISOString() : 'N/A (utilisé date actuelle)';
+      console.log(`[USERS] ✅ Utilisateur ${processed}: ${userData.username}, UUID=${userData.uuid || 'N/A'}, phone=${userData.phone}, is_active=${userData.is_active}, is_admin=${userData.is_admin}, refDate=${refDateStr}`);
+    }
+    
+    results.push(userData);
   }
+  
+  if (uuidBackfilled > 0) {
+    console.log(`[USERS] 🔧 ${uuidBackfilled} UUID(s) généré(s) et écrit(s) dans Sheets`);
+  }
+  
+  console.log(`[USERS] 📊 Résumé: ${results.length} utilisateur(s) trouvé(s), ${processedWithoutDate} sans date (inclus), ${skippedNoDate} sans date (ignorés), ${skippedOldDate} date trop ancienne, ${skippedEmptyName} nom vide, ${uuidBackfilled} UUID(s) backfillé(s)`);
+  console.log(`[USERS] ✅ Tous les utilisateurs avec nom valide ont été récupérés${isFullImport ? ' (IMPORT COMPLET)' : ''}`);
   
   return results;
 }

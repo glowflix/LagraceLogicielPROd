@@ -78,17 +78,26 @@ router.post('/full-import', optionalAuth, async (req, res) => {
 /**
  * POST /api/sync/now
  * Force une synchronisation complète (push + pull)
+ * Utilise optionalAuth pour permettre la synchronisation même sans token (pour le bootstrap)
  */
-router.post('/now', authenticate, async (req, res) => {
+router.post('/now', optionalAuth, async (req, res) => {
+  const { logger } = await import('../../core/logger.js');
   try {
+    logger.info('🔄 [SYNC/NOW] Début synchronisation manuelle demandée');
+    logger.info(`   👤 Utilisateur: ${req.user ? req.user.username : 'Non authentifié'}`);
+    
     await syncWorker.syncNow();
     const status = syncRepo.getStatus();
+    
+    logger.info('✅ [SYNC/NOW] Synchronisation terminée avec succès');
+    
     res.json({
       success: true,
       message: 'Synchronisation terminée',
       status,
     });
   } catch (error) {
+    logger.error('❌ [SYNC/NOW] Erreur synchronisation:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });

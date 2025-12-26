@@ -1,6 +1,7 @@
 import { getDb } from '../sqlite.js';
 import { logger } from '../../core/logger.js';
 import bcrypt from 'bcrypt';
+import { generateUUID } from '../../core/crypto.js';
 
 /**
  * Repository pour la gestion des utilisateurs
@@ -15,6 +16,65 @@ export class UsersRepository {
       return db.prepare('SELECT * FROM users WHERE username = ? AND is_active = 1').get(username);
     } catch (error) {
       logger.error('Erreur findByUsername:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Trouve un utilisateur par UUID
+   */
+  findByUuid(uuid) {
+    const db = getDb();
+    try {
+      if (!uuid || uuid.trim() === '') return null;
+      const user = db.prepare('SELECT * FROM users WHERE uuid = ?').get(uuid.trim());
+      if (!user) return null;
+      const { password_hash, ...userWithoutHash } = user;
+      return userWithoutHash;
+    } catch (error) {
+      logger.error('Erreur findByUuid:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Normalise un username pour comparaison
+   */
+  normalizeUsername(username) {
+    return String(username || '').trim().replace(/\s+/g, ' ').toLowerCase();
+  }
+
+  /**
+   * Trouve un utilisateur par username normalisé (pour matching sans uuid)
+   */
+  findByUsernameNormalized(username) {
+    const db = getDb();
+    try {
+      const normalized = this.normalizeUsername(username);
+      const allUsers = db.prepare('SELECT * FROM users').all();
+      for (const user of allUsers) {
+        if (this.normalizeUsername(user.username) === normalized) {
+          const { password_hash, ...userWithoutHash } = user;
+          return userWithoutHash;
+        }
+      }
+      return null;
+    } catch (error) {
+      logger.error('Erreur findByUsernameNormalized:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Met à jour l'UUID d'un utilisateur
+   */
+  setUuid(userId, uuid) {
+    const db = getDb();
+    try {
+      db.prepare('UPDATE users SET uuid = ? WHERE id = ?').run(uuid, userId);
+      logger.info(`💾 [UsersRepo] UUID mis à jour pour user ID=${userId}: ${uuid}`);
+    } catch (error) {
+      logger.error('Erreur setUuid:', error);
       throw error;
     }
   }
@@ -44,45 +104,240 @@ export class UsersRepository {
   }
 
   /**
+   * Crée ou met à jour un device pour un utilisateur
+   */
+  upsertDevice(userId, deviceData) {
+    const db = getDb();
+    try {
+      // Si device_brand ou profile_url sont fournis, créer/mettre à jour un device
+      if (deviceData.device_brand || deviceData.profile_url || deviceData.expo_push_token) {
+        // Chercher un device existant pour cet utilisateur avec les mêmes infos
+        const existingDevice = db.prepare(`
+          SELECT id FROM user_devices 
+          WHERE user_id = ? AND device_brand = ? AND profile_url = ?
+        `).get(
+          userId,
+          deviceData.device_brand || null,
+          deviceData.profile_url || null
+        );
+
+        if (existingDevice) {
+          // Mettre à jour le device existant
+          db.prepare(`
+            UPDATE user_devices 
+            SET device_brand = ?, expo_push_token = ?, profile_url = ?
+            WHERE id = ?
+          `).run(
+            deviceData.device_brand || null,
+            deviceData.expo_push_token || null,
+            deviceData.profile_url || null,
+            existingDevice.id
+          );
+        } else {
+          // Créer un nouveau device
+          db.prepare(`
+            INSERT INTO user_devices (user_id, device_brand, expo_push_token, profile_url)
+            VALUES (?, ?, ?, ?)
+          `).run(
+            userId,
+            deviceData.device_brand || null,
+            deviceData.expo_push_token || null,
+            deviceData.profile_url || null
+          );
+        }
+      }
+    } catch (error) {
+      logger.error('Erreur upsertDevice:', error);
+      // Ne pas faire échouer la création/modification de l'utilisateur si le device échoue
+    }
+  }
+
+  /**
    * Crée un nouvel utilisateur
+   * Gère automatiquement l'erreur UNIQUE constraint sur username en faisant un UPDATE si l'utilisateur existe déjà
    */
   async create(userData) {
     const db = getDb();
     try {
       const passwordHash = await bcrypt.hash(userData.password, 10);
 
+      // Utiliser la date de création fournie ou la date actuelle
+      const createdAt = userData.created_at || new Date().toISOString();
+      
+      // Générer un UUID si non fourni
+      const userUuid = userData.uuid || generateUUID();
+
       const stmt = db.prepare(`
-        INSERT INTO users (username, password_hash, phone, is_active, is_admin)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO users (uuid, username, password_hash, phone, is_active, is_admin, is_vendeur, is_gerant_stock, can_manage_products, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
 
       const result = stmt.run(
+        userUuid,
         userData.username,
         passwordHash,
         userData.phone || null,
         userData.is_active !== undefined ? userData.is_active : 1,
-        userData.is_admin !== undefined ? userData.is_admin : 0
+        userData.is_admin !== undefined ? userData.is_admin : 0,
+        userData.is_vendeur !== undefined ? userData.is_vendeur : 1,
+        userData.is_gerant_stock !== undefined ? userData.is_gerant_stock : 0,
+        userData.can_manage_products !== undefined ? userData.can_manage_products : 0,
+        createdAt
       );
 
-      return this.findById(result.lastInsertRowid);
+      const userId = result.lastInsertRowid;
+
+      // Créer un device si les informations sont fournies
+      if (userData.device_brand || userData.profile_url) {
+        this.upsertDevice(userId, {
+          device_brand: userData.device_brand,
+          profile_url: userData.profile_url,
+          expo_push_token: userData.expo_push_token,
+        });
+      }
+
+      return this.findById(userId);
     } catch (error) {
-      logger.error('Erreur create user:', error);
+      // Gérer l'erreur UNIQUE constraint sur username : faire un UPDATE au lieu d'échouer
+      const isUsernameUnique = error?.code === 'SQLITE_CONSTRAINT_UNIQUE' 
+        && String(error.message || '').includes('users.username');
+      
+      if (isUsernameUnique) {
+        logger.info(`💡 [UsersRepo] UNIQUE constraint sur username, tentative UPDATE pour: ${userData.username}`);
+        const existing = this.findByUsername(userData.username);
+        if (existing) {
+          // Mettre à jour l'utilisateur existant avec les nouvelles données
+          const updateData = {
+            uuid: userData.uuid || existing.uuid, // Préserver UUID si fourni
+            phone: userData.phone !== undefined ? userData.phone : existing.phone,
+            is_active: userData.is_active !== undefined ? userData.is_active : existing.is_active,
+            is_admin: userData.is_admin !== undefined ? userData.is_admin : existing.is_admin,
+            is_vendeur: userData.is_vendeur !== undefined ? userData.is_vendeur : (existing.is_vendeur !== undefined ? existing.is_vendeur : 1),
+            is_gerant_stock: userData.is_gerant_stock !== undefined ? userData.is_gerant_stock : (existing.is_gerant_stock || 0),
+            can_manage_products: userData.can_manage_products !== undefined ? userData.can_manage_products : (existing.can_manage_products || 0),
+            device_brand: userData.device_brand || existing.device_brand || '',
+            profile_url: userData.profile_url || existing.profile_url || '',
+            expo_push_token: userData.expo_push_token || existing.expo_push_token || '',
+          };
+          
+          // Mettre à jour UUID si fourni et différent
+          if (userData.uuid && userData.uuid !== existing.uuid) {
+            this.setUuid(existing.id, userData.uuid);
+          }
+          
+          await this.update(existing.id, updateData);
+          
+          // Mettre à jour le device si nécessaire
+          if (userData.device_brand || userData.profile_url) {
+            this.upsertDevice(existing.id, {
+              device_brand: userData.device_brand,
+              profile_url: userData.profile_url,
+              expo_push_token: userData.expo_push_token,
+            });
+          }
+          
+          logger.info(`✅ [UsersRepo] Utilisateur mis à jour (fallback après UNIQUE constraint): ${userData.username}`);
+          return this.findById(existing.id);
+        }
+      }
+      
+      // Re-throw les autres erreurs
+      logger.error('Erreur create user:', {
+        username: userData.username,
+        message: String(error?.message || error || 'Erreur inconnue'),
+        code: error?.code || 'UNKNOWN',
+        stack: error?.stack || ''
+      });
       throw error;
     }
   }
 
   /**
-   * Trouve un utilisateur par ID
+   * Crée ou met à jour un utilisateur par UUID (upsert)
+   */
+  async upsertByUuid(userData) {
+    const db = getDb();
+    try {
+      if (!userData.uuid || userData.uuid.trim() === '') {
+        throw new Error('UUID requis pour upsertByUuid');
+      }
+
+      const existing = this.findByUuid(userData.uuid);
+      
+      if (existing) {
+        // Mise à jour
+        return await this.update(existing.id, {
+          username: userData.username,
+          phone: userData.phone,
+          is_active: userData.is_active,
+          is_admin: userData.is_admin,
+          device_brand: userData.device_brand,
+          profile_url: userData.profile_url,
+          expo_push_token: userData.expo_push_token,
+        });
+      } else {
+        // Création avec UUID
+        const defaultPassword = 'changeme123';
+        return await this.create({
+          uuid: userData.uuid,
+          username: userData.username,
+          password: defaultPassword,
+          phone: userData.phone,
+          is_active: userData.is_active,
+          is_admin: userData.is_admin,
+          created_at: userData.created_at,
+          device_brand: userData.device_brand,
+          profile_url: userData.profile_url,
+          expo_push_token: userData.expo_push_token,
+        });
+      }
+    } catch (error) {
+      logger.error('Erreur upsertByUuid:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Trouve un utilisateur par ID avec ses devices
    */
   findById(id) {
     const db = getDb();
     try {
-      const user = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
-      if (user && user.password_hash) {
-        const { password_hash, ...userWithoutHash } = user;
-        return userWithoutHash;
-      }
-      return user;
+      const user = db.prepare(`
+        SELECT 
+          u.id,
+          u.uuid,
+          u.username,
+          u.phone,
+          u.is_active,
+          u.is_admin,
+          u.is_vendeur,
+          u.is_gerant_stock,
+          u.can_manage_products,
+          u.created_at,
+          u.updated_at,
+          GROUP_CONCAT(
+            json_object(
+              'id', ud.id,
+              'device_brand', ud.device_brand,
+              'expo_push_token', ud.expo_push_token,
+              'profile_url', ud.profile_url,
+              'created_at', ud.created_at
+            )
+          ) as devices
+        FROM users u
+        LEFT JOIN user_devices ud ON u.id = ud.user_id
+        WHERE u.id = ?
+        GROUP BY u.id
+      `).get(id);
+      
+      if (!user) return null;
+      
+      const { password_hash, ...userWithoutHash } = user;
+      return {
+        ...userWithoutHash,
+        devices: user.devices ? JSON.parse(`[${user.devices}]`) : [],
+      };
     } catch (error) {
       logger.error('Erreur findById user:', error);
       throw error;
@@ -90,12 +345,41 @@ export class UsersRepository {
   }
 
   /**
-   * Liste tous les utilisateurs
+   * Liste tous les utilisateurs avec leurs devices
    */
   findAll() {
     const db = getDb();
     try {
-      const users = db.prepare('SELECT id, username, phone, is_active, is_admin, created_at FROM users ORDER BY username').all();
+      const users = db.prepare(`
+        SELECT 
+          u.id, 
+          u.uuid,
+          u.username, 
+          u.phone, 
+          u.is_active, 
+          u.is_admin,
+          u.is_vendeur,
+          u.is_gerant_stock,
+          u.can_manage_products,
+          u.created_at,
+          u.updated_at,
+          GROUP_CONCAT(
+            json_object(
+              'id', ud.id,
+              'device_brand', ud.device_brand,
+              'expo_push_token', ud.expo_push_token,
+              'profile_url', ud.profile_url,
+              'created_at', ud.created_at
+            )
+          ) as devices
+        FROM users u
+        LEFT JOIN user_devices ud ON u.id = ud.user_id
+        GROUP BY u.id
+        ORDER BY u.username
+      `).all().map((row) => ({
+        ...row,
+        devices: row.devices ? JSON.parse(`[${row.devices}]`) : [],
+      }));
       logger.info(`📊 [UsersRepo] findAll: ${users.length} utilisateur(s) trouvé(s) dans la base`);
       return users;
     } catch (error) {
@@ -155,6 +439,21 @@ export class UsersRepository {
         values.push(userData.is_active ? 1 : 0);
       }
 
+      if (userData.is_vendeur !== undefined) {
+        updates.push('is_vendeur = ?');
+        values.push(userData.is_vendeur ? 1 : 0);
+      }
+
+      if (userData.is_gerant_stock !== undefined) {
+        updates.push('is_gerant_stock = ?');
+        values.push(userData.is_gerant_stock ? 1 : 0);
+      }
+
+      if (userData.can_manage_products !== undefined) {
+        updates.push('can_manage_products = ?');
+        values.push(userData.can_manage_products ? 1 : 0);
+      }
+
       if (updates.length === 0) {
         return existing; // Aucune mise à jour
       }
@@ -167,6 +466,15 @@ export class UsersRepository {
 
       logger.info(`💾 [SQL] UPDATE users WHERE id=${id}`);
       logger.info(`   ✅ [SQL] Utilisateur mis à jour avec succès`);
+
+      // Mettre à jour le device si les informations sont fournies
+      if (userData.device_brand !== undefined || userData.profile_url !== undefined) {
+        this.upsertDevice(id, {
+          device_brand: userData.device_brand,
+          profile_url: userData.profile_url,
+          expo_push_token: userData.expo_push_token,
+        });
+      }
 
       return this.findById(id);
     } catch (error) {

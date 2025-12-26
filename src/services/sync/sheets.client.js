@@ -338,11 +338,29 @@ export class SheetsClient {
 
           if (done || !nextCursor) {
             syncLogger.info(`✅ [${entity.toUpperCase()}] Pull paginé terminé: ${allData.length} item(s) en ${pageCount} page(s)`);
-            return { success: true, data: allData };
+            return { 
+              success: true, 
+              data: allData,
+              last_cursor: null, // Fin de pagination
+              done: true
+            };
           }
 
           cursor = nextCursor;
           tries = 0; // Reset retry après succès
+          
+          // Pour les ventes, appliquer par batch au lieu d'attendre la fin complète
+          // Cela évite les timeouts et permet de traiter les données progressivement
+          if (entity === 'sales' && allData.length >= limit * 2) {
+            // Appliquer les données accumulées jusqu'ici et continuer avec le cursor
+            syncLogger.info(`   📦 [${entity.toUpperCase()}] Batch intermédiaire: ${allData.length} item(s) accumulé(s), application et continuation...`);
+            return {
+              success: true,
+              data: allData,
+              last_cursor: cursor, // Continuer avec ce cursor
+              done: false
+            };
+          }
         } else {
           const err = res?.data?.error || `HTTP ${res.status}`;
           throw new Error(err);
