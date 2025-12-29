@@ -260,6 +260,72 @@ export class SyncRepository {
       logger.error('Erreur resetAllCursors:', error);
     }
   }
+
+  /**
+   * Vérifie si un produit ou une unité est en pending (modifications locales non synchronisées)
+   * @param {string} productCode - Code du produit
+   * @param {string} unitLevel - Niveau d'unité (optionnel, pour vérifier une unité spécifique)
+   * @returns {boolean} true si le produit/unité est en pending
+   */
+  isProductPending(productCode, unitLevel = null) {
+    const db = getDb();
+    try {
+      if (unitLevel) {
+        // Vérifier si l'unité spécifique est en pending
+        const pending = db.prepare(`
+          SELECT COUNT(*) as count
+          FROM sync_outbox
+          WHERE status = 'pending'
+            AND (
+              (entity = 'products' AND entity_id = ?)
+              OR (entity = 'product_units' AND entity_id LIKE ?)
+            )
+        `).get(productCode, `${productCode}-${unitLevel}%`);
+        return pending.count > 0;
+      } else {
+        // Vérifier si le produit ou une de ses unités est en pending
+        const pending = db.prepare(`
+          SELECT COUNT(*) as count
+          FROM sync_outbox
+          WHERE status = 'pending'
+            AND (
+              (entity = 'products' AND entity_id = ?)
+              OR (entity = 'product_units' AND entity_id LIKE ?)
+            )
+        `).get(productCode, `${productCode}-%`);
+        return pending.count > 0;
+      }
+    } catch (error) {
+      logger.error('Erreur isProductPending:', error);
+      // En cas d'erreur, considérer comme non-pending pour éviter de bloquer la sync
+      return false;
+    }
+  }
+
+  /**
+   * Vérifie si une unité spécifique est en pending
+   * @param {string} productCode - Code du produit
+   * @param {string} unitLevel - Niveau d'unité
+   * @param {string} unitMark - Mark de l'unité (optionnel)
+   * @returns {boolean} true si l'unité est en pending
+   */
+  isUnitPending(productCode, unitLevel, unitMark = '') {
+    const db = getDb();
+    try {
+      const entityId = `${productCode}-${unitLevel}${unitMark ? `-${unitMark}` : ''}`;
+      const pending = db.prepare(`
+        SELECT COUNT(*) as count
+        FROM sync_outbox
+        WHERE status = 'pending'
+          AND entity = 'product_units'
+          AND entity_id LIKE ?
+      `).get(`${entityId}%`);
+      return pending.count > 0;
+    } catch (error) {
+      logger.error('Erreur isUnitPending:', error);
+      return false;
+    }
+  }
 }
 
 export const syncRepo = new SyncRepository();

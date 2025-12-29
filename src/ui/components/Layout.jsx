@@ -1,4 +1,5 @@
 import { Link, useLocation, useNavigate } from 'react-router-dom';
+import { useEffect } from 'react';
 import { motion } from 'framer-motion';
 import {
   LayoutDashboard,
@@ -6,6 +7,7 @@ import {
   Package,
   FileText,
   Users,
+  UserCircle,
   BarChart3,
   Settings,
   RefreshCw,
@@ -14,6 +16,9 @@ import {
   WifiOff,
 } from 'lucide-react';
 import { useStore } from '../store/useStore';
+import { decodeLocalToken } from '../utils/token';
+import { canAccessRoute, getUserRole, PERMISSIONS } from '../utils/permissions';
+import AILaGrace from './AILaGrace';
 
 const menuItems = [
   { path: '/dashboard', icon: LayoutDashboard, label: 'Accueil' },
@@ -30,17 +35,80 @@ const menuItems = [
 const Layout = ({ children }) => {
   const location = useLocation();
   const navigate = useNavigate();
-  const { logout, user, isOnline, socketConnected } = useStore();
+  const { logout, user, isOnline, socketConnected, token, checkConnection, isLicensed } = useStore();
+  
+  // Vérifier la connexion au montage du composant et périodiquement
+  // NOTE: Le statut de connexion est informatif seulement, n'affecte pas l'accès aux fonctionnalités
+  useEffect(() => {
+    // Vérifier la connexion après un court délai au démarrage
+    const initialTimer = setTimeout(() => {
+      checkConnection();
+    }, 1000);
+    
+    // Vérifier périodiquement la connexion (toutes les 30 secondes)
+    const interval = setInterval(() => {
+      if (navigator.onLine) {
+        checkConnection();
+      }
+    }, 30000);
+    
+    return () => {
+      clearTimeout(initialTimer);
+      clearInterval(interval);
+    };
+  }, [checkConnection]);
+  
+  // Obtenir le rôle actuel depuis le token ou depuis l'utilisateur
+  const tokenData = decodeLocalToken(token);
+  let currentRole = tokenData?.role;
+  
+  // Si pas de rôle dans le token, déterminer depuis l'utilisateur avec la licence
+  if (!currentRole) {
+    currentRole = getUserRole(user, isLicensed);
+  }
+  
+  currentRole = currentRole || 'LICENSE_ONLY';
+  
+  // Filtrer les menus selon les permissions
+  const visibleMenuItems = menuItems.filter(item => {
+    return canAccessRoute(currentRole, item.path);
+  });
   
   const handleLogout = () => {
     logout();
-    // Nettoyer localStorage
+    // Nettoyer complètement localStorage
     localStorage.removeItem('token');
     localStorage.removeItem('glowflix-store');
-    // Rediriger vers la page de login
-    navigate('/login', { replace: true });
+    localStorage.removeItem('glowflix-license');
+    localStorage.removeItem('glowflix-device-id');
+    // Rediriger vers la page de licence (qui permettra de réactiver ou se connecter)
+    navigate('/license', { replace: true });
     // Recharger la page pour réinitialiser complètement l'état
-    window.location.reload();
+    setTimeout(() => {
+      window.location.reload();
+    }, 100);
+  };
+  
+  // Obtenir le label du rôle pour l'affichage
+  const getRoleLabel = () => {
+    switch (currentRole) {
+      case 'ADMIN':
+        return 'Administrateur';
+      case 'VENDEUR_PRODUITS':
+        return 'Vendeur + Produits';
+      case 'VENDEUR_STOCK':
+        return 'Vendeur + Stock';
+      case 'VENDEUR_SEULEMENT':
+        return 'Vendeur';
+      case 'GERANT_STOCK':
+        return 'Gérant Stock';
+      case 'PRODUITS_SEULEMENT':
+        return 'Produits';
+      case 'LICENSE_ONLY':
+        return 'Licence';
+      default:
+        return 'Utilisateur';
+    }
   };
 
   return (
@@ -68,7 +136,7 @@ const Layout = ({ children }) => {
 
         {/* Menu */}
         <nav className="flex-1 p-4 space-y-2">
-          {menuItems.map((item, index) => {
+          {visibleMenuItems.map((item, index) => {
             const Icon = item.icon;
             const isActive = location.pathname === item.path;
             return (
@@ -112,32 +180,48 @@ const Layout = ({ children }) => {
 
         {/* Status & User */}
         <div className="p-4 border-t border-white/10 space-y-4">
-          {/* Status connexion */}
+          {/* Status connexion backend - Uniquement pour synchronisation automatique en arrière-plan */}
+          {/* Le logiciel de ventes fonctionne toujours en mode offline-first */}
           <div className="flex items-center justify-between p-3 glass rounded-lg">
             <div className="flex items-center gap-2">
-              {isOnline && socketConnected ? (
+              {isOnline ? (
                 <>
                   <Wifi className="w-4 h-4 text-green-400" />
-                  <span className="text-xs text-gray-300">En ligne</span>
+                  <span className="text-xs text-gray-300">
+                    {socketConnected ? 'Sync auto active' : 'Sync...'}
+                  </span>
                 </>
               ) : (
                 <>
                   <WifiOff className="w-4 h-4 text-yellow-400" />
-                  <span className="text-xs text-gray-300">Hors ligne</span>
+                  <span className="text-xs text-gray-300">Sync auto en pause</span>
                 </>
               )}
             </div>
+            {/* Bouton pour forcer la vérification de connexion backend */}
+            <button
+              onClick={() => {
+                useStore.getState().checkConnection();
+              }}
+              className="text-xs text-gray-400 hover:text-gray-200 transition-colors"
+              title="Vérifier la connexion backend pour synchronisation automatique"
+            >
+              🔄
+            </button>
           </div>
 
           {/* User */}
-          <div className="p-3 glass rounded-lg">
-            <p className="text-sm font-medium text-gray-200">
-              {user?.username || 'Utilisateur'}
-            </p>
-            <p className="text-xs text-gray-400">
-              {user?.is_admin ? 'Administrateur' : 'Vendeur'}
-            </p>
-          </div>
+          <Link to="/profile">
+            <div className="p-3 glass rounded-lg hover:bg-white/5 transition-all cursor-pointer">
+              <p className="text-sm font-medium text-gray-200 flex items-center gap-2">
+                <UserCircle className="w-4 h-4" />
+                {user?.username || 'Utilisateur'}
+              </p>
+              <p className="text-xs text-gray-400">
+                {getRoleLabel()}
+              </p>
+            </div>
+          </Link>
 
           {/* Logout */}
           <button
@@ -154,6 +238,9 @@ const Layout = ({ children }) => {
       <main className="flex-1 overflow-auto">
         <div className="p-6">{children}</div>
       </main>
+
+      {/* AI LaGrace - Assistant vocal */}
+      <AILaGrace />
     </div>
   );
 };

@@ -11,11 +11,14 @@ import SalesDetail from './pages/SalesDetail';
 import ProductsPage from './pages/ProductsPage';
 import DebtsPage from './pages/DebtsPage';
 import UsersPage from './pages/UsersPage';
+import ProfilePage from './pages/ProfilePage';
 import AnalyticsPage from './pages/AnalyticsPage';
 import SettingsPage from './pages/SettingsPage';
 import SyncPage from './pages/SyncPage';
+import UnauthorizedPage from './pages/UnauthorizedPage';
 import Layout from './components/Layout';
 import PageTransition from './components/PageTransition';
+import ProtectedRoute from './components/ProtectedRoute';
 
 function App() {
   const { isLicensed, isAuthenticated, isLoading } = useStore();
@@ -27,17 +30,22 @@ function App() {
     return <SplashScreen />;
   }
 
-  // Si pas de licence et pas authentifié, rediriger vers la page de licence ou login
-  if (!isLicensed && !isAuthenticated) {
+  // Routes publiques toujours accessibles (licence et login)
+  // Ces routes doivent être disponibles même après déconnexion
+  if (location.pathname === '/login' || location.pathname === '/license') {
     return (
       <AnimatePresence mode="wait">
         <Routes location={location} key={location.pathname}>
           <Route path="/license" element={<LicensePage />} />
           <Route path="/login" element={<LoginPage />} />
-          <Route path="*" element={<Navigate to="/license" replace />} />
         </Routes>
       </AnimatePresence>
     );
+  }
+
+  // Si pas de licence et pas authentifié, rediriger vers la page de licence
+  if (!isLicensed && !isAuthenticated) {
+    return <Navigate to="/license" replace />;
   }
 
   return (
@@ -48,80 +56,118 @@ function App() {
           <Route 
             path="/dashboard" 
             element={
-              <PageTransition>
-                <Dashboard />
-              </PageTransition>
+              <ProtectedRoute>
+                <PageTransition>
+                  <Dashboard />
+                </PageTransition>
+              </ProtectedRoute>
             } 
           />
           <Route 
             path="/sales" 
             element={
-              <PageTransition>
-                <SalesPOS />
-              </PageTransition>
+              <ProtectedRoute>
+                <PageTransition>
+                  <SalesPOS />
+                </PageTransition>
+              </ProtectedRoute>
             } 
           />
           <Route 
             path="/sales/history" 
             element={
-              <PageTransition>
-                <SalesHistory />
-              </PageTransition>
+              <ProtectedRoute>
+                <PageTransition>
+                  <SalesHistory />
+                </PageTransition>
+              </ProtectedRoute>
             } 
           />
           <Route 
             path="/sales/:invoice" 
             element={
-              <PageTransition>
-                <SalesDetail />
-              </PageTransition>
+              <ProtectedRoute>
+                <PageTransition>
+                  <SalesDetail />
+                </PageTransition>
+              </ProtectedRoute>
             } 
           />
           <Route 
             path="/products" 
             element={
-              <PageTransition>
-                <ProductsPage />
-              </PageTransition>
+              <ProtectedRoute>
+                <PageTransition>
+                  <ProductsPage />
+                </PageTransition>
+              </ProtectedRoute>
             } 
           />
           <Route 
             path="/debts" 
             element={
-              <PageTransition>
-                <DebtsPage />
-              </PageTransition>
+              <ProtectedRoute>
+                <PageTransition>
+                  <DebtsPage />
+                </PageTransition>
+              </ProtectedRoute>
             } 
           />
           <Route 
             path="/users" 
             element={
-              <PageTransition>
-                <UsersPage />
-              </PageTransition>
+              <ProtectedRoute>
+                <PageTransition>
+                  <UsersPage />
+                </PageTransition>
+              </ProtectedRoute>
+            } 
+          />
+          <Route 
+            path="/profile" 
+            element={
+              <ProtectedRoute>
+                <PageTransition>
+                  <ProfilePage />
+                </PageTransition>
+              </ProtectedRoute>
             } 
           />
           <Route 
             path="/analytics" 
             element={
-              <PageTransition>
-                <AnalyticsPage />
-              </PageTransition>
+              <ProtectedRoute>
+                <PageTransition>
+                  <AnalyticsPage />
+                </PageTransition>
+              </ProtectedRoute>
             } 
           />
           <Route 
             path="/settings" 
             element={
-              <PageTransition>
-                <SettingsPage />
-              </PageTransition>
+              <ProtectedRoute>
+                <PageTransition>
+                  <SettingsPage />
+                </PageTransition>
+              </ProtectedRoute>
             } 
           />
           <Route 
             path="/sync" 
             element={
+              <ProtectedRoute>
+                <PageTransition>
+                  <SyncPage />
+                </PageTransition>
+              </ProtectedRoute>
+            } 
+          />
+          <Route 
+            path="/unauthorized" 
+            element={
               <PageTransition>
-                <SyncPage />
+                <UnauthorizedPage />
               </PageTransition>
             } 
           />

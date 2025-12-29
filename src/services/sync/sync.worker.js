@@ -1,4 +1,5 @@
 import { syncRepo } from '../../db/repositories/sync.repo.js';
+import { outboxRepo } from '../../db/repositories/outbox.repo.js';
 import { sheetsClient } from './sheets.client.js';
 import { productsRepo } from '../../db/repositories/products.repo.js';
 import { salesRepo } from '../../db/repositories/sales.repo.js';
@@ -7,10 +8,11 @@ import { ratesRepo } from '../../db/repositories/rates.repo.js';
 import { usersRepo } from '../../db/repositories/users.repo.js';
 import { syncLogger } from '../../core/logger.js';
 import { generateUUID } from '../../core/crypto.js';
+import { getDb } from '../../db/sqlite.js';
 import bcrypt from 'bcrypt';
 
 // Intervalle de synchronisation (augmenté pour réduire la charge)
-const SYNC_INTERVAL_MS = parseInt(process.env.SYNC_INTERVAL_MS) || 30000; // 30 secondes par défaut (au lieu de 10s)
+const SYNC_INTERVAL_MS = parseInt(process.env.SYNC_INTERVAL_MS) || 10000; // 10 secondes par défaut
 
 let syncInterval = null;
 let isSyncing = false;
@@ -20,6 +22,8 @@ let _loopTimeout = null; // Timeout de la boucle
 let isOnline = true; // État de connexion Internet
 let _salesSyncRunning = false; // Mutex pour la synchronisation des ventes
 let _salesLoopTimeout = null; // Timeout de la boucle de synchronisation des ventes
+let _pushSyncRunning = false; // Mutex pour le push des opérations pending
+let _lastPushTime = 0; // Dernier push réussi
 
 /**
  * Normalise l'unité depuis Sheets vers le format SQLite
@@ -156,6 +160,434 @@ export class SyncWorker {
     
     // Démarrer la synchronisation dédiée des ventes (immédiate + toutes les 10 secondes)
     this.startSalesSyncLoop();
+    
+    // Démarrer la synchronisation des opérations pending (push vers Sheets)
+    // IMPORTANT: Les modifications locales (prix, stock, etc.) sont pushées automatiquement
+    this.startPushSyncLoop();
+  }
+  
+  /**
+   * Boucle de push des opérations pending vers Google Sheets
+   * Gère automatiquement les modifications locales quand la connexion revient
+   * 
+   * Fonctionnalités:
+   * - Push automatique des PRODUCT_PATCH (modifications prix/nom)
+   * - Push automatique des UNIT_PATCH (modifications unités)
+   * - Push automatique des STOCK_MOVE (mouvements de stock)
+   * - Déduplication automatique (last-write-wins pour les patches)
+   * - Idempotence via op_id (pas de doublons côté Sheets)
+   */
+  async startPushSyncLoop() {
+    const PUSH_SYNC_INTERVAL_MS = 15000; // 15 secondes
+    
+    syncLogger.info(`📤 [PUSH-SYNC] Démarrage de la synchronisation des modifications locales`);
+    syncLogger.info(`   ⚡ [PUSH-SYNC] Mode: AUTO-PUSH toutes les ${PUSH_SYNC_INTERVAL_MS / 1000} secondes`);
+    syncLogger.info(`   📦 [PUSH-SYNC] Types: PRODUCT_PATCH, UNIT_PATCH, STOCK_MOVE`);
+    syncLogger.info(`   🔄 [PUSH-SYNC] Idempotence via op_id (pas de doublons)`);
+    
+    const pushLoop = async () => {
+      if (!_started) return;
+      
+      if (_pushSyncRunning) {
+        syncLogger.debug(`⏭️ [PUSH-SYNC] Push déjà en cours, skip`);
+        setTimeout(pushLoop, PUSH_SYNC_INTERVAL_MS);
+        return;
+      }
+      
+      if (!isOnline) {
+        syncLogger.debug(`⏸️ [PUSH-SYNC] Pas de connexion Internet, opérations en attente`);
+        // Afficher le nombre d'opérations en attente
+        try {
+          const stats = outboxRepo.getStats();
+          if (stats.totalPending > 0) {
+            syncLogger.info(`   📊 [PUSH-SYNC] ${stats.totalPending} opération(s) en attente de connexion`);
+          }
+        } catch (e) {}
+        setTimeout(pushLoop, PUSH_SYNC_INTERVAL_MS);
+        return;
+      }
+      
+      _pushSyncRunning = true;
+      const pushStartTime = Date.now();
+      
+      try {
+        await this.pushPendingOperations();
+      } catch (error) {
+        syncLogger.error(`❌ [PUSH-SYNC] Erreur lors du push: ${error.message}`);
+      } finally {
+        _pushSyncRunning = false;
+        const elapsed = Date.now() - pushStartTime;
+        const wait = Math.max(5000, PUSH_SYNC_INTERVAL_MS - elapsed);
+        
+        if (_started) {
+          setTimeout(pushLoop, wait);
+        }
+      }
+    };
+    
+    // Démarrer après un délai initial (laisser le temps au pull de se faire d'abord)
+    setTimeout(pushLoop, 10000);
+  }
+  
+  /**
+   * Push les opérations pending vers Google Sheets
+   * Gère les patches produits, patches unités et mouvements de stock
+   */
+  async pushPendingOperations() {
+    try {
+      // Récupérer les statistiques
+      const stats = outboxRepo.getStats();
+      
+      if (stats.totalPending === 0 && stats.stockMovesPending === 0) {
+        syncLogger.debug(`📤 [PUSH-SYNC] Aucune opération pending`);
+        return;
+      }
+      
+      syncLogger.info(`📤 [PUSH-SYNC] ==========================================`);
+      syncLogger.info(`📤 [PUSH-SYNC] PUSH DES MODIFICATIONS LOCALES`);
+      syncLogger.info(`📤 [PUSH-SYNC] ==========================================`);
+      syncLogger.info(`   📊 Pending: ${JSON.stringify(stats.pendingByType)}`);
+      syncLogger.info(`   📊 Stock moves pending: ${stats.stockMovesPending}`);
+      
+      // 1. Push des patches produits (PRODUCT_PATCH)
+      const productPatches = outboxRepo.getPendingOperations('PRODUCT_PATCH', 50);
+      if (productPatches.length > 0) {
+        syncLogger.info(`   📦 [PRODUCT_PATCH] ${productPatches.length} patch(es) à envoyer`);
+        await this.pushProductPatches(productPatches);
+      }
+      
+      // 2. Push des patches unités (UNIT_PATCH) - inclut les prix
+      const unitPatches = outboxRepo.getPendingOperations('UNIT_PATCH', 50);
+      if (unitPatches.length > 0) {
+        syncLogger.info(`   💰 [UNIT_PATCH] ${unitPatches.length} patch(es) à envoyer (prix, etc.)`);
+        await this.pushUnitPatches(unitPatches);
+      }
+      
+      // 3. Push des mouvements de stock (STOCK_MOVE)
+      const stockMoves = outboxRepo.getPendingOperations('STOCK_MOVE', 50);
+      if (stockMoves.length > 0) {
+        syncLogger.info(`   📊 [STOCK_MOVE] ${stockMoves.length} mouvement(s) à envoyer`);
+        await this.pushStockMoves(stockMoves);
+      }
+      
+      // Réessayer les opérations en erreur (max 3 tentatives)
+      outboxRepo.retryErrorOperations();
+      
+      _lastPushTime = Date.now();
+      
+      // CRITIQUE: Après un push réussi, déclencher un pull pour recevoir les mises à jour depuis Sheets
+      // Cela libère les produits pour accepter les modifications venant de Sheets
+      const pushedCount = (productPatches.length || 0) + (unitPatches.length || 0) + (stockMoves.length || 0);
+      if (pushedCount > 0) {
+        syncLogger.info(`   🔄 [PUSH-SYNC] ${pushedCount} opération(s) envoyée(s), déclenchement pull pour recevoir les mises à jour depuis Sheets...`);
+        
+        // Déclencher un pull après un court délai pour laisser Sheets se mettre à jour
+        // CRITIQUE: Cela libère les produits pour recevoir les mises à jour depuis Sheets
+        setTimeout(async () => {
+          try {
+            syncLogger.info(`   📥 [PUSH-SYNC] Pull déclenché après push réussi pour libérer les produits`);
+            await this.syncProductsFromSheets();
+          } catch (pullError) {
+            syncLogger.warn(`   ⚠️ [PUSH-SYNC] Erreur pull après push: ${pullError.message}`);
+          }
+        }, 2000); // 2 secondes de délai pour laisser Sheets se mettre à jour
+      }
+      
+      syncLogger.info(`📤 [PUSH-SYNC] ==========================================`);
+      
+    } catch (error) {
+      syncLogger.error(`❌ [PUSH-SYNC] Erreur pushPendingOperations: ${error.message}`);
+    }
+  }
+  
+  /**
+   * Push les patches produits vers Sheets
+   * Utilise batchPush pour être compatible avec le Code.gs (handleBatchPush)
+   */
+  async pushProductPatches(patches) {
+    if (!patches || patches.length === 0) return;
+    
+    const ackedOpIds = [];
+    
+    // Préparer les opérations pour batchPush
+    const ops = patches.map(op => ({
+      op_id: op.op_id,
+      entity: 'products',
+      op: 'upsert',
+      payload: {
+        code: op.entity_code,
+        ...op.payload
+      }
+    }));
+    
+    try {
+      syncLogger.info(`      📤 Push ${patches.length} patch(es) produit via batchPush`);
+      
+      // Utiliser pushBatch qui supporte le mode batch via Code.gs
+      const result = await sheetsClient.pushBatch(ops);
+      
+      if (result.success) {
+        // Marquer les opérations appliquées comme confirmées
+        for (const applied of (result.applied || [])) {
+          if (applied.op_id) {
+            ackedOpIds.push(applied.op_id);
+          }
+        }
+        
+        // Marquer les conflits comme erreurs
+        for (const conflict of (result.conflicts || [])) {
+          if (conflict.op_id) {
+            outboxRepo.markAsError(conflict.op_id, conflict.reason || 'Conflit');
+          }
+        }
+        
+        syncLogger.info(`      ✅ ${ackedOpIds.length}/${patches.length} patch(es) produit confirmé(s)`);
+      } else {
+        for (const op of patches) {
+          outboxRepo.markAsError(op.op_id, result.error || 'Erreur push');
+        }
+        syncLogger.warn(`      ⚠️ Erreur patches produits: ${result.error}`);
+      }
+    } catch (error) {
+      for (const op of patches) {
+        outboxRepo.markAsError(op.op_id, error.message);
+      }
+      syncLogger.error(`      ❌ Erreur push produits: ${error.message}`);
+    }
+    
+    if (ackedOpIds.length > 0) {
+      outboxRepo.markAsAcked(ackedOpIds);
+    }
+  }
+  
+  /**
+   * Push les patches unités vers Sheets (prix, stock, etc.)
+   * CRITIQUE: Inclut sale_price_fc et stock_current pour TOUTES les unités (CARTON, MILLIER, PIECE)
+   * Utilise batchPush pour être compatible avec le Code.gs (handleBatchPush → handleProductUpsert)
+   */
+  async pushUnitPatches(patches) {
+    if (!patches || patches.length === 0) return;
+    
+    const ackedOpIds = [];
+    
+    // Préparer les opérations pour batchPush
+    // IMPORTANT: Chaque patch d'unité doit inclure:
+    // - code (product_code)
+    // - unit_level (CARTON, MILLIER, PIECE)
+    // - sale_price_fc (pour TOUTES les feuilles: Carton, Milliers, Piece)
+    // - sale_price_usd
+    // - stock_current/stock_initial
+    // - auto_stock_factor
+    const ops = patches.map(op => {
+      const payload = op.payload || {};
+      
+      // CRITIQUE: Construire le payload complet pour handleProductUpsert dans Code.gs
+      return {
+        op_id: op.op_id,
+        entity: 'product_units',
+        op: 'upsert',
+        payload: {
+          code: payload.product_code || op.entity_code,
+          name: payload.name || '',
+          unit_level: payload.unit_level,
+          unit_mark: payload.unit_mark || '',
+          // CRITIQUE: Inclure les deux prix pour Sheets
+          sale_price_usd: payload.sale_price_usd || 0,
+          sale_price_fc: payload.sale_price_fc || 0,
+          purchase_price_usd: payload.purchase_price_usd || 0,
+          // CRITIQUE: Inclure le stock
+          stock_initial: payload.stock_initial || payload.stock_current || 0,
+          stock_current: payload.stock_current || payload.stock_initial || 0,
+          // Automatisation stock
+          auto_stock_factor: payload.auto_stock_factor || 1,
+          qty_step: payload.qty_step || 1,
+          // Métadonnées
+          uuid: payload.product_uuid,
+          last_update: new Date().toISOString()
+        }
+      };
+    });
+    
+    try {
+      syncLogger.info(`      📤 Push ${patches.length} patch(es) unité via batchPush`);
+      
+      // Log détaillé pour debug
+      for (const op of ops.slice(0, 3)) {
+        syncLogger.info(`         📦 ${op.payload.code}/${op.payload.unit_level}: FC=${op.payload.sale_price_fc}, USD=${op.payload.sale_price_usd}, Stock=${op.payload.stock_current}`);
+      }
+      if (ops.length > 3) {
+        syncLogger.info(`         ... et ${ops.length - 3} autre(s)`);
+      }
+      
+      // Utiliser pushBatch qui supporte le mode batch via Code.gs
+      const result = await sheetsClient.pushBatch(ops);
+      
+      if (result.success) {
+        // Marquer les opérations appliquées comme confirmées
+        for (const applied of (result.applied || [])) {
+          if (applied.op_id) {
+            ackedOpIds.push(applied.op_id);
+          }
+        }
+        
+        // Marquer les conflits comme erreurs
+        for (const conflict of (result.conflicts || [])) {
+          if (conflict.op_id) {
+            outboxRepo.markAsError(conflict.op_id, conflict.reason || 'Conflit');
+            syncLogger.warn(`         ⚠️ Conflit unité (op_id: ${conflict.op_id}): ${conflict.reason}`);
+          }
+        }
+        
+        syncLogger.info(`      ✅ ${ackedOpIds.length}/${patches.length} patch(es) unité confirmé(s)`);
+      } else {
+        for (const op of patches) {
+          outboxRepo.markAsError(op.op_id, result.error || 'Erreur push');
+        }
+        syncLogger.warn(`      ⚠️ Erreur patches unités: ${result.error}`);
+      }
+    } catch (error) {
+      for (const op of patches) {
+        outboxRepo.markAsError(op.op_id, error.message);
+      }
+      syncLogger.error(`      ❌ Erreur push unités: ${error.message}`);
+    }
+    
+    if (ackedOpIds.length > 0) {
+      outboxRepo.markAsAcked(ackedOpIds);
+    }
+  }
+  
+  /**
+   * Push les mouvements de stock vers Sheets
+   * IMPORTANT: On envoie des DELTAS, pas des valeurs absolues
+   */
+  async pushStockMoves(moves) {
+    const ackedOpIds = [];
+    const ackedMoveIds = [];
+    
+    // Grouper par produit/unité pour batch
+    const movesByUnit = {};
+    for (const op of moves) {
+      const payload = op.payload;
+      const key = `${payload.product_code}-${payload.unit_level}-${payload.unit_mark || ''}`;
+      if (!movesByUnit[key]) {
+        movesByUnit[key] = {
+          product_code: payload.product_code,
+          unit_level: payload.unit_level,
+          unit_mark: payload.unit_mark || '',
+          moves: []
+        };
+      }
+      movesByUnit[key].moves.push({ op, payload });
+    }
+    
+    for (const key in movesByUnit) {
+      const unitMoves = movesByUnit[key];
+      
+      try {
+        // Calculer le delta total pour cette unité
+        const totalDelta = unitMoves.moves.reduce((sum, m) => sum + m.payload.delta, 0);
+        
+        syncLogger.info(`      📤 Push mouvement stock: ${unitMoves.product_code}/${unitMoves.unit_level} delta=${totalDelta > 0 ? '+' : ''}${totalDelta}`);
+        
+        // Préparer les données pour Sheets
+        const moveData = {
+          product_code: unitMoves.product_code,
+          unit_level: unitMoves.unit_level,
+          unit_mark: unitMoves.unit_mark,
+          delta: totalDelta,
+          move_ids: unitMoves.moves.map(m => m.payload.move_id),
+          op_ids: unitMoves.moves.map(m => m.op.op_id)
+        };
+        
+        // Appeler l'API Sheets pour appliquer le delta de stock
+        const result = await sheetsClient.push('stock_moves', [moveData]);
+        
+        if (result.success) {
+          for (const m of unitMoves.moves) {
+            ackedOpIds.push(m.op.op_id);
+            if (m.payload.move_id) {
+              ackedMoveIds.push(m.payload.move_id);
+            }
+          }
+          syncLogger.info(`      ✅ Mouvement stock confirmé: ${unitMoves.product_code}/${unitMoves.unit_level}`);
+        } else {
+          for (const m of unitMoves.moves) {
+            outboxRepo.markAsError(m.op.op_id, result.error || 'Erreur push');
+          }
+          syncLogger.warn(`      ⚠️ Erreur mouvement stock: ${result.error}`);
+        }
+      } catch (error) {
+        for (const m of unitMoves.moves) {
+          outboxRepo.markAsError(m.op.op_id, error.message);
+        }
+        syncLogger.error(`      ❌ Erreur push stock ${key}: ${error.message}`);
+      }
+    }
+    
+    if (ackedOpIds.length > 0) {
+      outboxRepo.markAsAcked(ackedOpIds);
+    }
+    if (ackedMoveIds.length > 0) {
+      outboxRepo.markStockMovesSynced(ackedMoveIds);
+    }
+  }
+  
+  /**
+   * Synchronise uniquement les produits depuis Sheets (pull)
+   * Utilisé après un push réussi pour libérer les produits et recevoir les mises à jour depuis Sheets
+   * CRITIQUE: Les produits avec des opérations "acked" ne sont plus bloqués et peuvent recevoir les mises à jour
+   */
+  async syncProductsFromSheets() {
+    try {
+      syncLogger.info(`📥 [PRODUCTS-PULL] Synchronisation produits depuis Sheets (après push réussi)`);
+      
+      // Récupérer la date de dernière synchronisation
+      const sinceDate = syncRepo.getLastPullDate('products');
+      const since = sinceDate ? new Date(sinceDate) : new Date(0);
+      
+      // Pull paginé par unit_level (CARTON, MILLIER, PIECE)
+      const productUnitLevels = ['CARTON', 'MILLIER', 'PIECE'];
+      const allProducts = [];
+      
+      for (const unitLevel of productUnitLevels) {
+        try {
+          syncLogger.info(`   📄 [PRODUCTS-PULL] Feuille: ${unitLevel}`);
+          
+          const result = await sheetsClient.pullAllPaged('products', since, {
+            full: false, // Mode incrémental seulement
+            unitLevel: unitLevel,
+            maxRetries: 3,
+            timeout: 30000,
+            limit: 300
+          });
+          
+          if (result.success && result.data.length > 0) {
+            allProducts.push(...result.data);
+            syncLogger.info(`   ✅ [PRODUCTS-PULL/${unitLevel}] ${result.data.length} produit(s) récupéré(s)`);
+          } else if (result.success) {
+            syncLogger.debug(`   📭 [PRODUCTS-PULL/${unitLevel}] Aucune mise à jour`);
+          } else {
+            syncLogger.warn(`   ⚠️ [PRODUCTS-PULL/${unitLevel}] Erreur: ${result.error}`);
+          }
+        } catch (error) {
+          syncLogger.error(`   ❌ [PRODUCTS-PULL/${unitLevel}] Erreur: ${error.message}`);
+        }
+      }
+      
+      // Appliquer les mises à jour si des produits ont été récupérés
+      if (allProducts.length > 0) {
+        syncLogger.info(`   📦 [PRODUCTS-PULL] Total: ${allProducts.length} produit(s) à appliquer`);
+        await this.applyProductUpdates(allProducts);
+        syncRepo.setLastPullDate('products', new Date().toISOString());
+        syncLogger.info(`   ✅ [PRODUCTS-PULL] Synchronisation terminée: ${allProducts.length} produit(s) mis à jour`);
+      } else {
+        syncLogger.info(`   ✅ [PRODUCTS-PULL] Aucune mise à jour disponible depuis Sheets`);
+      }
+    } catch (error) {
+      syncLogger.error(`   ❌ [PRODUCTS-PULL] Erreur synchronisation produits: ${error.message}`);
+      throw error;
+    }
   }
   
   /**
@@ -477,9 +909,12 @@ export class SyncWorker {
       
       // Nettoyage : Supprimer les ventes locales qui n'existent plus dans Sheets (sauf pending)
       // IMPORTANT: Vérifier la connexion Internet avant le nettoyage
+      // IMPORTANT: Appeler le nettoyage APRÈS chaque synchronisation pour supprimer les ventes supprimées dans Sheets
       if (isOnline) {
         try {
+          syncLogger.info(`   🧹 [SALES-SYNC] Démarrage nettoyage des ventes supprimées dans Sheets...`);
           await this.cleanupLocalSalesNotInSheets();
+          syncLogger.info(`   ✅ [SALES-SYNC] Nettoyage terminé`);
         } catch (cleanupError) {
           syncLogger.warn(`   ⚠️ [SALES-SYNC] Erreur nettoyage ventes locales: ${cleanupError.message}`);
           // Ne pas bloquer si erreur nettoyage
@@ -639,12 +1074,13 @@ export class SyncWorker {
       const { getDb } = await import('../../db/sqlite.js');
       const db = getDb();
       
-      // Récupérer TOUTES les ventes locales (pas seulement 50, pas seulement synchronisées)
+      // Récupérer TOUTES les ventes locales (y compris celles avec status='pending')
       // IMPORTANT: Pousser toutes les ventes locales vers Sheets pour synchronisation complète
+      // Les ventes avec status='pending' seront synchronisées et leur statut sera mis à jour à 'paid'
       const localSales = db.prepare(`
         SELECT s.*
         FROM sales s
-        WHERE s.origin = 'LOCAL' AND s.status != 'pending'
+        WHERE s.origin = 'LOCAL'
         ORDER BY s.sold_at DESC
       `).all();
       
@@ -653,8 +1089,14 @@ export class SyncWorker {
         return;
       }
       
+      // Séparer les ventes pending des autres
+      const pendingSales = localSales.filter(s => s.status === 'pending');
+      const otherSales = localSales.filter(s => s.status !== 'pending');
+      
       syncLogger.info(`   📦 [LOCAL-SALES-PUSH] ${localSales.length} vente(s) locale(s) à synchroniser vers Sheets`);
-      syncLogger.info(`   💡 [LOCAL-SALES-PUSH] Toutes les ventes locales seront poussées vers Sheets (même celles déjà synchronisées)`);
+      syncLogger.info(`      ⏳ ${pendingSales.length} vente(s) avec status='pending' (seront synchronisées et passées à 'paid')`);
+      syncLogger.info(`      ✅ ${otherSales.length} vente(s) déjà synchronisées (seront mises à jour)`);
+      syncLogger.info(`   💡 [LOCAL-SALES-PUSH] Toutes les ventes locales seront poussées vers Sheets`);
       
       // Préparer les opérations pour batchPush (plus efficace)
       const opsToPush = [];
@@ -671,6 +1113,10 @@ export class SyncWorker {
           const items = db.prepare('SELECT * FROM sale_items WHERE sale_id = ?').all(sale.id);
           
           // Préparer le payload pour Sheets
+          // IMPORTANT: Envoyer 'paid' à Sheets même si localement c'est 'pending'
+          // Car une fois synchronisée, la vente sera considérée comme payée
+          const statusForSheets = sale.status === 'pending' ? 'paid' : sale.status;
+          
           const payload = {
             uuid: sale.uuid,
             invoice_number: sale.invoice_number,
@@ -684,7 +1130,7 @@ export class SyncWorker {
             payment_mode: sale.payment_mode || 'cash',
             paid_fc: sale.paid_fc || 0,
             paid_usd: sale.paid_usd || 0,
-            status: sale.status,
+            status: statusForSheets, // IMPORTANT: Toujours envoyer 'paid' à Sheets (même si localement 'pending')
             origin: sale.origin,
             source_device: sale.source_device,
             items: items.map(item => ({
@@ -727,13 +1173,71 @@ export class SyncWorker {
       let errors = 0;
       
       if (pushResult && pushResult.success) {
-        // Mettre à jour synced_at pour les ventes qui ont été appliquées avec succès
+        // Mettre à jour synced_at ET status pour les ventes qui ont été appliquées avec succès
+        // IMPORTANT: Si la vente avait status='pending', la passer à 'paid' après synchronisation réussie
+        syncLogger.info(`   📊 [LOCAL-SALES-PUSH] ${pushResult.applied?.length || 0} vente(s) appliquée(s) avec succès dans Sheets`);
+        
+        const syncedInvoiceNumbers = new Set();
+        const now = new Date().toISOString();
+        
+        // Marquer comme synchronisées les ventes qui sont dans 'applied'
         for (const appliedOp of pushResult.applied || []) {
           const saleToUpdate = localSales.find(s => s.uuid === appliedOp.uuid || s.invoice_number === appliedOp.invoice_number);
           if (saleToUpdate) {
-            db.prepare('UPDATE sales SET synced_at = ? WHERE id = ?').run(new Date().toISOString(), saleToUpdate.id);
+            const wasPending = saleToUpdate.status === 'pending';
+            
+            // Mettre à jour synced_at et status (de 'pending' à 'paid' si nécessaire)
+            if (wasPending) {
+              db.prepare('UPDATE sales SET synced_at = ?, status = ? WHERE id = ?').run(now, 'paid', saleToUpdate.id);
+              syncLogger.info(`   ✅ [LOCAL-SALES-PUSH] Vente ${saleToUpdate.invoice_number} (ID: ${saleToUpdate.id}) synchronisée: status 'pending' → 'paid', synced_at = ${now}`);
+            } else {
+              db.prepare('UPDATE sales SET synced_at = ? WHERE id = ?').run(now, saleToUpdate.id);
+              syncLogger.info(`   ✅ [LOCAL-SALES-PUSH] Vente ${saleToUpdate.invoice_number} (ID: ${saleToUpdate.id}, Status: ${saleToUpdate.status}) synchronisée vers Sheets, synced_at = ${now}`);
+            }
+            syncedInvoiceNumbers.add(saleToUpdate.invoice_number);
             pushed++;
-            syncLogger.debug(`   ✅ [LOCAL-SALES-PUSH] Vente ${saleToUpdate.invoice_number} synchronisée vers Sheets`);
+          } else {
+            syncLogger.warn(`   ⚠️ [LOCAL-SALES-PUSH] Vente appliquée dans Sheets mais non trouvée localement: ${appliedOp.invoice_number || appliedOp.uuid}`);
+          }
+        }
+        
+        // IMPORTANT: Si le push a réussi mais qu'une vente locale n'est pas dans 'applied',
+        // cela peut signifier qu'elle existe déjà dans Sheets (mise à jour plutôt qu'insertion)
+        // Dans ce cas, on la marque quand même comme synchronisée si elle était dans les opérations envoyées
+        const sentInvoiceNumbers = new Set(opsToPush.map(op => op.invoice_number));
+        const notInAppliedButSent = localSales.filter(s => 
+          sentInvoiceNumbers.has(s.invoice_number) && 
+          !syncedInvoiceNumbers.has(s.invoice_number) &&
+          !s.synced_at // Ne marquer que si pas déjà synchronisée
+        );
+        
+        if (notInAppliedButSent.length > 0) {
+          syncLogger.info(`   💡 [LOCAL-SALES-PUSH] ${notInAppliedButSent.length} vente(s) locale(s) envoyée(s) mais non dans 'applied' (probablement déjà dans Sheets):`);
+          for (const sale of notInAppliedButSent) {
+            const wasPending = sale.status === 'pending';
+            if (wasPending) {
+              db.prepare('UPDATE sales SET synced_at = ?, status = ? WHERE id = ?').run(now, 'paid', sale.id);
+              syncLogger.info(`   ✅ [LOCAL-SALES-PUSH] Vente ${sale.invoice_number} (ID: ${sale.id}) marquée comme synchronisée: status 'pending' → 'paid', synced_at = ${now}`);
+            } else {
+              db.prepare('UPDATE sales SET synced_at = ? WHERE id = ?').run(now, sale.id);
+              syncLogger.info(`   ✅ [LOCAL-SALES-PUSH] Vente ${sale.invoice_number} (ID: ${sale.id}) marquée comme synchronisée, synced_at = ${now}`);
+            }
+            syncedInvoiceNumbers.add(sale.invoice_number);
+            if (!syncedInvoiceNumbers.has(sale.invoice_number)) {
+              pushed++;
+            }
+          }
+        }
+        
+        // Log des ventes locales qui n'ont vraiment pas été synchronisées
+        const trulyNotSyncedSales = localSales.filter(s => 
+          !syncedInvoiceNumbers.has(s.invoice_number) && 
+          !sentInvoiceNumbers.has(s.invoice_number)
+        );
+        if (trulyNotSyncedSales.length > 0) {
+          syncLogger.warn(`   ⚠️ [LOCAL-SALES-PUSH] ${trulyNotSyncedSales.length} vente(s) locale(s) n'ont PAS été envoyées ni synchronisées:`);
+          for (const sale of trulyNotSyncedSales.slice(0, 5)) {
+            syncLogger.warn(`      - ${sale.invoice_number} (ID: ${sale.id}, Status: ${sale.status}, Synced: ${sale.synced_at || 'null'})`);
           }
         }
         
@@ -861,16 +1365,17 @@ export class SyncWorker {
       
       syncLogger.info(`   📊 [CLEANUP-SALES] ${sheetsInvoices.size} facture(s) unique(s) trouvée(s) dans Sheets (${totalSheetsRows} lignes)`);
       
-      // IMPORTANT: Récupérer TOUTES les ventes (LOCAL et SHEETS) sauf pending pour comparaison
+      // IMPORTANT: Récupérer TOUTES les ventes synchronisées (LOCAL et SHEETS) pour comparaison
       // On supprimera celles qui ne sont plus dans Sheets
+      // IMPORTANT: Inclure les ventes avec status='pending' MAIS seulement si elles sont synchronisées (synced_at != null)
+      // Les ventes pending non synchronisées seront conservées car elles n'ont pas encore été envoyées à Sheets
       const allSales = db.prepare(`
         SELECT id, invoice_number, status, sold_at, synced_at, origin
         FROM sales
-        WHERE status != 'pending'
         ORDER BY sold_at DESC
       `).all();
       
-      syncLogger.info(`   📊 [CLEANUP-SALES] ${allSales.length} vente(s) totale(s) à vérifier (LOCAL + SHEETS)`);
+      syncLogger.info(`   📊 [CLEANUP-SALES] ${allSales.length} vente(s) totale(s) dans la base de données`);
       
       // Séparer par origine
       const localSales = allSales.filter(s => s.origin === 'LOCAL');
@@ -878,30 +1383,53 @@ export class SyncWorker {
       
       syncLogger.info(`   📊 [CLEANUP-SALES] ${localSales.length} vente(s) locale(s), ${sheetsSales.length} vente(s) depuis Sheets`);
       
-      // Pour les ventes LOCALES : ne supprimer que celles synchronisées
+      // Pour les ventes LOCALES : ne supprimer que celles synchronisées (synced_at != null)
+      // Les ventes LOCALES non synchronisées (même avec status='pending') sont conservées car elles n'ont pas encore été envoyées à Sheets
       const syncedLocalSales = localSales.filter(s => s.synced_at !== null);
       const notSyncedLocalSales = localSales.filter(s => s.synced_at === null);
       
       // Pour les ventes SHEETS : toutes peuvent être supprimées si absentes de Sheets
+      // Car si une vente SHEETS n'existe plus dans Sheets, elle a été supprimée et doit être supprimée localement aussi
       syncLogger.info(`   💡 [CLEANUP-SALES] Les ventes SHEETS absentes de Sheets seront supprimées`);
-      syncLogger.info(`   💡 [CLEANUP-SALES] Les ventes LOCALES non synchronisées seront conservées`);
-      syncLogger.info(`   💡 [CLEANUP-SALES] Les ventes en attente (status='pending') ne seront PAS supprimées`);
+      syncLogger.info(`   💡 [CLEANUP-SALES] Les ventes LOCALES synchronisées (synced_at != null) absentes de Sheets seront supprimées`);
+      syncLogger.info(`   💡 [CLEANUP-SALES] Les ventes LOCALES non synchronisées (synced_at = null) seront conservées (même si status='pending')`);
+      syncLogger.info(`   📊 [CLEANUP-SALES] ${syncedLocalSales.length} vente(s) LOCALE(s) synchronisée(s) à vérifier`);
+      syncLogger.info(`   📊 [CLEANUP-SALES] ${notSyncedLocalSales.length} vente(s) LOCALE(s) non synchronisée(s) conservée(s)`);
       
       let deletedLocal = 0;
       let deletedSheets = 0;
       let keptLocal = 0;
       let keptSheets = 0;
       
-      // Nettoyer les ventes LOCALES synchronisées
+      // Nettoyer les ventes LOCALES synchronisées qui ne sont plus dans Sheets
+      // Si une vente LOCALE a été synchronisée (synced_at != null) mais n'existe plus dans Sheets,
+      // cela signifie qu'elle a été supprimée dans Sheets et doit être supprimée localement aussi
+      syncLogger.info(`   🔍 [CLEANUP-SALES] Vérification de ${syncedLocalSales.length} vente(s) LOCALE(s) synchronisée(s)...`);
       for (const sale of syncedLocalSales) {
-        if (!sheetsInvoices.has(sale.invoice_number)) {
+        const isInSheets = sheetsInvoices.has(sale.invoice_number);
+        syncLogger.debug(`   🔍 [CLEANUP-SALES] Vente LOCALE ${sale.invoice_number} (ID: ${sale.id}, Status: ${sale.status}, Synced: ${sale.synced_at}): ${isInSheets ? '✅ Présente dans Sheets' : '❌ ABSENTE de Sheets → SUPPRESSION'}`);
+        
+        if (!isInSheets) {
           try {
-            db.prepare('DELETE FROM sale_items WHERE sale_id = ?').run(sale.id);
+            // IMPORTANT: Supprimer dans l'ordre pour respecter les contraintes de clés étrangères
+            // 1. Supprimer les jobs d'impression associés (print_jobs référence invoice_number)
+            const printJobsDeleted = db.prepare('DELETE FROM print_jobs WHERE invoice_number = ?').run(sale.invoice_number);
+            // 2. Supprimer les paiements de dettes associés (si existent)
+            const debtPaymentsDeleted = db.prepare('DELETE FROM debt_payments WHERE debt_id IN (SELECT id FROM debts WHERE sale_id = ?)').run(sale.id);
+            // 3. Supprimer les dettes associées (FOREIGN KEY sans CASCADE)
+            const debtsDeleted = db.prepare('DELETE FROM debts WHERE sale_id = ?').run(sale.id);
+            // 4. Supprimer les annulations de vente (sale_voids) - devrait être CASCADE mais on le fait explicitement
+            const voidsDeleted = db.prepare('DELETE FROM sale_voids WHERE sale_id = ?').run(sale.id);
+            // 5. Supprimer les items de vente (CASCADE devrait le faire, mais on le fait explicitement)
+            const itemsDeleted = db.prepare('DELETE FROM sale_items WHERE sale_id = ?').run(sale.id);
+            // 6. Enfin, supprimer la vente elle-même
             db.prepare('DELETE FROM sales WHERE id = ?').run(sale.id);
             deletedLocal++;
-            syncLogger.info(`   🗑️ [CLEANUP-SALES] Vente LOCALE ${sale.invoice_number} supprimée (absente de Sheets)`);
+            syncLogger.info(`   🗑️ [CLEANUP-SALES] ✅ Vente LOCALE synchronisée ${sale.invoice_number} (ID: ${sale.id}) supprimée (absente de Sheets)`);
+            syncLogger.info(`      📋 ${itemsDeleted.changes || 0} item(s), ${debtsDeleted.changes || 0} dette(s), ${debtPaymentsDeleted.changes || 0} paiement(s) de dette, ${voidsDeleted.changes || 0} annulation(s), ${printJobsDeleted.changes || 0} job(s) d'impression supprimé(s)`);
           } catch (deleteError) {
-            syncLogger.warn(`   ⚠️ [CLEANUP-SALES] Erreur suppression vente LOCALE ${sale.invoice_number}: ${deleteError.message}`);
+            syncLogger.warn(`   ⚠️ [CLEANUP-SALES] Erreur suppression vente LOCALE ${sale.invoice_number} (ID: ${sale.id}): ${deleteError.message}`);
+            syncLogger.warn(`      📋 Stack: ${deleteError.stack?.substring(0, 300)}`);
           }
         } else {
           keptLocal++;
@@ -909,15 +1437,33 @@ export class SyncWorker {
       }
       
       // Nettoyer les ventes SHEETS absentes de Sheets
+      // Si une vente SHEETS n'existe plus dans Sheets, elle a été supprimée et doit être supprimée localement
+      syncLogger.info(`   🔍 [CLEANUP-SALES] Vérification de ${sheetsSales.length} vente(s) SHEETS...`);
       for (const sale of sheetsSales) {
-        if (!sheetsInvoices.has(sale.invoice_number)) {
+        const isInSheets = sheetsInvoices.has(sale.invoice_number);
+        syncLogger.debug(`   🔍 [CLEANUP-SALES] Vente SHEETS ${sale.invoice_number} (ID: ${sale.id}): ${isInSheets ? '✅ Présente dans Sheets' : '❌ ABSENTE de Sheets → SUPPRESSION'}`);
+        
+        if (!isInSheets) {
           try {
-            db.prepare('DELETE FROM sale_items WHERE sale_id = ?').run(sale.id);
+            // IMPORTANT: Supprimer dans l'ordre pour respecter les contraintes de clés étrangères
+            // 1. Supprimer les jobs d'impression associés (print_jobs référence invoice_number)
+            const printJobsDeleted = db.prepare('DELETE FROM print_jobs WHERE invoice_number = ?').run(sale.invoice_number);
+            // 2. Supprimer les paiements de dettes associés (si existent)
+            const debtPaymentsDeleted = db.prepare('DELETE FROM debt_payments WHERE debt_id IN (SELECT id FROM debts WHERE sale_id = ?)').run(sale.id);
+            // 3. Supprimer les dettes associées (FOREIGN KEY sans CASCADE)
+            const debtsDeleted = db.prepare('DELETE FROM debts WHERE sale_id = ?').run(sale.id);
+            // 4. Supprimer les annulations de vente (sale_voids) - devrait être CASCADE mais on le fait explicitement
+            const voidsDeleted = db.prepare('DELETE FROM sale_voids WHERE sale_id = ?').run(sale.id);
+            // 5. Supprimer les items de vente (CASCADE devrait le faire, mais on le fait explicitement)
+            const itemsDeleted = db.prepare('DELETE FROM sale_items WHERE sale_id = ?').run(sale.id);
+            // 6. Enfin, supprimer la vente elle-même
             db.prepare('DELETE FROM sales WHERE id = ?').run(sale.id);
             deletedSheets++;
-            syncLogger.info(`   🗑️ [CLEANUP-SALES] Vente SHEETS ${sale.invoice_number} supprimée (absente de Sheets)`);
+            syncLogger.info(`   🗑️ [CLEANUP-SALES] ✅ Vente SHEETS ${sale.invoice_number} (ID: ${sale.id}) supprimée (absente de Sheets)`);
+            syncLogger.info(`      📋 ${itemsDeleted.changes || 0} item(s), ${debtsDeleted.changes || 0} dette(s), ${debtPaymentsDeleted.changes || 0} paiement(s) de dette, ${voidsDeleted.changes || 0} annulation(s), ${printJobsDeleted.changes || 0} job(s) d'impression supprimé(s)`);
           } catch (deleteError) {
-            syncLogger.warn(`   ⚠️ [CLEANUP-SALES] Erreur suppression vente SHEETS ${sale.invoice_number}: ${deleteError.message}`);
+            syncLogger.warn(`   ⚠️ [CLEANUP-SALES] Erreur suppression vente SHEETS ${sale.invoice_number} (ID: ${sale.id}): ${deleteError.message}`);
+            syncLogger.warn(`      📋 Stack: ${deleteError.stack?.substring(0, 300)}`);
           }
         } else {
           keptSheets++;
@@ -925,11 +1471,21 @@ export class SyncWorker {
       }
       
       syncLogger.info(`   ✅ [CLEANUP-SALES] Nettoyage terminé:`);
-      syncLogger.info(`      🗑️ ${deletedLocal} vente(s) LOCALE(s) supprimée(s) (absentes de Sheets)`);
+      syncLogger.info(`      🗑️ ${deletedLocal} vente(s) LOCALE(s) synchronisée(s) supprimée(s) (absentes de Sheets)`);
       syncLogger.info(`      🗑️ ${deletedSheets} vente(s) SHEETS supprimée(s) (absentes de Sheets)`);
-      syncLogger.info(`      ✅ ${keptLocal} vente(s) LOCALE(s) conservée(s) (présentes dans Sheets)`);
+      syncLogger.info(`      ✅ ${keptLocal} vente(s) LOCALE(s) synchronisée(s) conservée(s) (présentes dans Sheets)`);
       syncLogger.info(`      ✅ ${keptSheets} vente(s) SHEETS conservée(s) (présentes dans Sheets)`);
-      syncLogger.info(`      ⏭️ ${notSyncedLocalSales.length} vente(s) LOCALE(s) non synchronisée(s) conservée(s)`);
+      syncLogger.info(`      ⏭️ ${notSyncedLocalSales.length} vente(s) LOCALE(s) non synchronisée(s) conservée(s) (seront synchronisées plus tard)`);
+      
+      // Vérification finale : compter les ventes restantes
+      const remainingSales = db.prepare('SELECT COUNT(*) as count FROM sales WHERE status != ?').get('pending');
+      syncLogger.info(`      📊 Total ventes restantes (hors pending): ${remainingSales.count}`);
+      
+      if (deletedLocal > 0 || deletedSheets > 0) {
+        syncLogger.info(`   🎉 [CLEANUP-SALES] ✅ Nettoyage réussi: ${deletedLocal + deletedSheets} vente(s) supprimée(s) qui n'existent plus dans Sheets`);
+        syncLogger.info(`   💡 [CLEANUP-SALES] Ces ventes ne seront plus affichées dans la page "Historique des ventes"`);
+      }
+      
       syncLogger.info(`🧹 [CLEANUP-SALES] ==========================================`);
     } catch (error) {
       syncLogger.warn(`   ⚠️ [CLEANUP-SALES] Erreur globale: ${error.message}`);
@@ -1156,6 +1712,7 @@ export class SyncWorker {
   async pushPending() {
     // Ne pas push si pas de connexion
     if (!isOnline) {
+      syncLogger.debug(`⏸️  [PUSH] Pas de connexion Internet, push annulé`);
       return;
     }
 
@@ -1163,10 +1720,31 @@ export class SyncWorker {
       const pending = syncRepo.getPending(200); // Max 200 par batch
 
       if (pending.length === 0) {
+        syncLogger.debug(`📭 [PUSH] Aucune opération en attente`);
         return;
       }
 
-      syncLogger.info(`📤 [PUSH] Push de ${pending.length} opération(s)...`);
+      syncLogger.info(`📤 [PUSH] ==========================================`);
+      syncLogger.info(`📤 [PUSH] PUSH DE ${pending.length} OPÉRATION(S) VERS SHEETS`);
+      syncLogger.info(`📤 [PUSH] ==========================================`);
+      
+      // LOG: Détails des opérations update_stock
+      const stockUpdates = pending.filter(op => op.op === 'update_stock');
+      if (stockUpdates.length > 0) {
+        syncLogger.info(`📦 [PUSH] ${stockUpdates.length} opération(s) update_stock trouvée(s):`);
+        stockUpdates.forEach((op, idx) => {
+          const payload = JSON.parse(op.payload_json || JSON.stringify(op.payload || {}));
+          syncLogger.info(`   [${idx + 1}] Produit: ${payload.product_code}`);
+          syncLogger.info(`       Unité: ${payload.unit_level}, Mark: ${payload.unit_mark || '(vide)'}`);
+          if (payload.stock_absolute !== undefined) {
+            syncLogger.info(`       Stock ABSOLU: ${payload.stock_absolute} (écrasera colonne C dans Sheets)`);
+          }
+          if (payload.stock_change !== undefined) {
+            syncLogger.info(`       Stock change (relatif): ${payload.stock_change}`);
+          }
+          syncLogger.info(`       Invoice: ${payload.invoice_number || '(vide)'}`);
+        });
+      }
 
       // Préparer les ops pour batch
       const ops = pending.map(op => ({
@@ -1177,11 +1755,30 @@ export class SyncWorker {
         payload: JSON.parse(op.payload_json || JSON.stringify(op.payload || {}))
       }));
 
+      syncLogger.info(`📤 [PUSH] Envoi du batch vers Google Sheets...`);
+      
       // Essayer batch d'abord, sinon fallback en concurrence limitée
       const batchResult = await sheetsClient.pushBatch(ops, { timeout: 9000 });
 
       // Traiter les résultats
+      syncLogger.info(`📤 [PUSH] Résultat du batch:`);
+      syncLogger.info(`   Success: ${batchResult.success}`);
+      syncLogger.info(`   Applied: ${batchResult.applied?.length || 0} opération(s)`);
+      syncLogger.info(`   Conflicts: ${batchResult.conflicts?.length || 0} conflit(s)`);
+      if (batchResult.error) {
+        syncLogger.error(`   Erreur: ${batchResult.error}`);
+      }
+      
       if (batchResult.applied) {
+        const appliedStockUpdates = batchResult.applied.filter(applied => {
+          const op = ops.find(o => o.op_id === applied.op_id);
+          return op && op.op === 'update_stock';
+        });
+        
+        if (appliedStockUpdates.length > 0) {
+          syncLogger.info(`✅ [PUSH] ${appliedStockUpdates.length} opération(s) update_stock appliquée(s) avec succès dans Sheets`);
+        }
+        
         for (const applied of batchResult.applied) {
           syncRepo.markAsSent(applied.op_id);
         }
@@ -1928,6 +2525,7 @@ export class SyncWorker {
         }
         
         // Ajouter toutes les unités du produit
+        // IMPORTANT: Ignorer sale_price_fc venant de Sheets, utiliser seulement sale_price_usd
         for (const unit of item.units) {
           productsByCode[code].units.push({
             uuid: unit.uuid,
@@ -1936,7 +2534,7 @@ export class SyncWorker {
             stock_initial: unit.stock_initial || unit.stock_current || 0,
             stock_current: unit.stock_current || unit.stock_initial || 0,
             purchase_price_usd: unit.purchase_price_usd || 0,
-            sale_price_fc: unit.sale_price_fc || 0,
+            // sale_price_fc sera calculé automatiquement depuis sale_price_usd dans products.repo.js
             sale_price_usd: unit.sale_price_usd || 0,
             auto_stock_factor: unit.auto_stock_factor || 1,
             qty_step: unit.qty_step || 1,
@@ -1961,7 +2559,7 @@ export class SyncWorker {
           stock_initial: item.stock_initial || item.stock_current || 0,
           stock_current: item.stock_current || item.stock_initial || 0,
           purchase_price_usd: item.purchase_price_usd || 0,
-          sale_price_fc: item.sale_price_fc || 0,
+          // sale_price_fc sera calculé automatiquement depuis sale_price_usd dans products.repo.js
           sale_price_usd: item.sale_price_usd || 0,
           auto_stock_factor: item.auto_stock_factor || 1,
           qty_step: item.qty_step || 1,
@@ -1988,7 +2586,7 @@ export class SyncWorker {
           stock_initial: item.stock_initial || item.stock_current || 0,
           stock_current: item.stock_current || item.stock_initial || 0,
           purchase_price_usd: item.purchase_price_usd || 0,
-          sale_price_fc: item.sale_price_fc || 0,
+          // sale_price_fc sera calculé automatiquement depuis sale_price_usd dans products.repo.js
           sale_price_usd: item.sale_price_usd || 0,
           auto_stock_factor: item.auto_stock_factor || 1,
           qty_step: item.qty_step || 1,
@@ -2008,6 +2606,7 @@ export class SyncWorker {
     // Insérer ou mettre à jour chaque produit
     let insertedCount = 0;
     let updatedCount = 0;
+    let skippedPendingCount = 0;
     let errorCount = 0;
     const upsertStartTime = Date.now();
     
@@ -2020,9 +2619,89 @@ export class SyncWorker {
         const existing = productsRepo.findByCode(code);
         const isNew = !existing;
         
+        // RÈGLE CRITIQUE: Ne pas écraser un produit/unité en pending (modifications locales non synchronisées)
+        // Utiliser le nouveau système d'outbox pour vérifier les opérations pending
+        const hasProductPending = outboxRepo.hasProductPending(code);
+        
+        if (hasProductPending && !isNew) {
+          // Le produit existe et a des modifications locales en pending
+          // Ne pas écraser les modifications locales
+          skippedPendingCount++;
+          syncLogger.warn(`      ⏸️  Produit "${code}" IGNORÉ (modifications locales en pending)`);
+          syncLogger.warn(`         💡 Les modifications locales seront synchronisées vers Sheets avant d'accepter les mises à jour depuis Sheets`);
+          continue;
+        }
+        
+        // Pour chaque unité, vérifier si elle a des mouvements de stock pending
+        // Si des mouvements pending existent, on doit préserver le stock local
+        // et appliquer les deltas pending sur le stock Sheets
+        const unitsToUpsert = [];
+        for (const unit of product.units) {
+          // Vérifier si l'unité a des mouvements de stock pending
+          const hasStockPending = outboxRepo.hasStockMovePending(code, unit.unit_level, unit.unit_mark);
+          
+          if (hasStockPending && !isNew) {
+            // RÈGLE IMPORTANTE: Stock ne doit jamais être écrasé si des mouvements pending existent
+            // On doit recalculer le stock correct en appliquant les deltas pending sur le stock Sheets
+            const existingUnit = existing?.units?.find(
+              u => u.unit_level === unit.unit_level && u.unit_mark === unit.unit_mark
+            );
+            
+            if (existingUnit) {
+              // Récupérer le total des deltas pending
+              const pendingDelta = outboxRepo.getPendingStockDelta(code, unit.unit_level, unit.unit_mark);
+              
+              // Le stock correct = stock Sheets + deltas pending locaux
+              // Car les deltas locaux n'ont pas encore été appliqués côté Sheets
+              const correctedStock = (unit.stock_current || 0) + pendingDelta;
+              
+              syncLogger.warn(`      ⏸️  Unité "${unit.unit_level}/${unit.unit_mark}" a des mouvements stock pending`);
+              syncLogger.warn(`         📊 Stock Sheets: ${unit.stock_current}, Deltas pending: ${pendingDelta > 0 ? '+' : ''}${pendingDelta}`);
+              syncLogger.warn(`         📊 Stock corrigé: ${correctedStock} (sera utilisé)`);
+              
+              unitsToUpsert.push({
+                ...unit,
+                stock_current: correctedStock,
+                stock_initial: correctedStock
+              });
+            } else {
+              // Unité nouvelle, utiliser les données de Sheets
+              unitsToUpsert.push(unit);
+            }
+          } else {
+            // Vérifier aussi les patches d'unité en pending (prix, etc.)
+            const hasUnitPatchPending = syncRepo.isUnitPending(code, unit.unit_level, unit.unit_mark);
+            
+            if (hasUnitPatchPending && !isNew) {
+              const existingUnit = existing?.units?.find(
+                u => u.unit_level === unit.unit_level && u.unit_mark === unit.unit_mark
+              );
+              
+              if (existingUnit) {
+                // Préserver les prix locaux si en pending
+                syncLogger.warn(`      ⏸️  Unité "${unit.unit_level}/${unit.unit_mark}" a des modifications pending`);
+                syncLogger.warn(`         💰 Prix local préservé: ${existingUnit.sale_price_usd} USD`);
+                unitsToUpsert.push({
+                  ...unit,
+                  sale_price_usd: existingUnit.sale_price_usd, // Préserver le prix local
+                  purchase_price_usd: existingUnit.purchase_price_usd,
+                  stock_current: existingUnit.stock_current, // Préserver le stock local aussi
+                  stock_initial: existingUnit.stock_initial || existingUnit.stock_current
+                });
+              } else {
+                unitsToUpsert.push(unit);
+              }
+            } else {
+              // Aucune opération pending, utiliser les données de Sheets normalement
+              unitsToUpsert.push(unit);
+            }
+          }
+        }
+        
         const upsertItemStart = Date.now();
         productsRepo.upsert({
           ...product,
+          units: unitsToUpsert,
           is_active: 1,
           _origin: 'SHEETS'
         });
@@ -2048,6 +2727,9 @@ export class SyncWorker {
     syncLogger.info(`   📊 [SQL] Résumé SQL:`);
     syncLogger.info(`      ✅ ${insertedCount} produit(s) INSÉRÉ(S) (INSERT INTO products + product_units)`);
     syncLogger.info(`      ✅ ${updatedCount} produit(s) MIS À JOUR (UPDATE products + product_units)`);
+    if (skippedPendingCount > 0) {
+      syncLogger.info(`      ⏸️  ${skippedPendingCount} produit(s) IGNORÉ(S) (modifications locales en pending)`);
+    }
     syncLogger.info(`      ❌ ${errorCount} produit(s) EN ERREUR`);
     syncLogger.info(`   ⏱️  [SQL] Temps moyen par produit: ${(insertedCount + updatedCount) > 0 ? Math.round(totalDuration / (insertedCount + updatedCount)) : 0}ms`);
     
@@ -2056,7 +2738,7 @@ export class SyncWorker {
       syncLogger.info(`   📊 [SQL] Vérification: SELECT COUNT(*) FROM products WHERE is_active = 1; devrait retourner au moins ${insertedCount + updatedCount} ligne(s)`);
     }
     
-    return { inserted: insertedCount, updated: updatedCount, skipped: 0 };
+    return { inserted: insertedCount, updated: updatedCount, skipped: skippedPendingCount };
   }
 
   /**
@@ -2264,9 +2946,17 @@ export class SyncWorker {
       
       syncLogger.debug(`   📝 [SALES] Item final: produit=${item.product_code}, unité="${unitLevel}", mark="${unitMark}", qty=${qty}`);
       
+      // IMPORTANT: S'assurer que product_id est défini avant d'ajouter l'item
+      // Si le produit n'existe pas, on ne peut pas créer l'item (erreur de validation)
+      if (!product?.id) {
+        syncLogger.warn(`   ⚠️ [SALES] Produit non trouvé pour code "${item.product_code}" (facture: ${invoiceNumber}) - item ignoré`);
+        skippedLinesCount++;
+        continue; // Ignorer cet item
+      }
+      
       salesByInvoice[invoiceNumber].items.push({
         uuid: item.uuid || null, // UUID de l'item de vente (sale_items)
-        product_id: product?.id || null,
+        product_id: product.id, // IMPORTANT: Toujours défini (vérifié ci-dessus)
         product_code: item.product_code || '',
         product_name: productName,
         unit_level: unitLevel, // IMPORTANT: Utiliser l'unité de Sheets (préservée)
@@ -2988,6 +3678,7 @@ export class SyncWorker {
       syncLogger.info(`   📋 UUID: ${data[0].uuid || data[0]._uuid || 'N/A (VIDE)'}`);
       syncLogger.info(`   📋 Username: ${data[0].username || data[0].nom || 'N/A'}`);
       syncLogger.info(`   📋 Phone: ${data[0].phone || data[0].numero || 'N/A'}`);
+      syncLogger.info(`   📋 Password: ${data[0].password ? '*** (présent)' : 'N/A (VIDE)'}`);
       syncLogger.info(`   📋 Is Active: ${data[0].is_active}`);
       syncLogger.info(`   📋 Is Admin: ${data[0].is_admin}`);
     }
@@ -3034,7 +3725,43 @@ export class SyncWorker {
               expo_push_token: userData.expo_push_token || existing.expo_push_token || '',
             };
             
-            await usersRepo.update(existing.id, updateData);
+            // CRITIQUE: Toujours mettre à jour le mot de passe depuis Sheets (même si l'utilisateur existe déjà)
+            // Cela garantit que les mots de passe sont synchronisés même pour les utilisateurs existants
+            syncLogger.debug(`   🔑 [USERS] Vérification mot de passe pour: ${username}, password dans Sheets: ${userData.password ? '*** (présent)' : 'VIDE'}`);
+            
+            if (userData.password && userData.password.trim() !== '') {
+              updateData.password = userData.password;
+              syncLogger.info(`   🔑 [USERS] ✅ Mise à jour du mot de passe depuis Sheets pour: ${username}`);
+            } else {
+              // Si pas de mot de passe dans Sheets, vérifier si l'utilisateur existe sans password_hash
+              const db = getDb();
+              const userWithHash = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(existing.id);
+              syncLogger.debug(`   🔑 [USERS] Vérification password_hash pour: ${username}, has_hash: ${!!userWithHash?.password_hash}`);
+              
+              if (!userWithHash || !userWithHash.password_hash || userWithHash.password_hash.trim() === '') {
+                // Utiliser le mot de passe par défaut si l'utilisateur n'a pas de password_hash
+                updateData.password = 'changeme123';
+                syncLogger.info(`   🔑 [USERS] ✅ Pas de mot de passe dans Sheets, utilisation défaut pour: ${username} (utilisateur sans password_hash)`);
+              } else {
+                syncLogger.debug(`   🔑 [USERS] ⏭️  Pas de mot de passe dans Sheets mais utilisateur a déjà un password_hash, conservation pour: ${username}`);
+              }
+            }
+            
+            // Log pour debug: vérifier que password est bien dans updateData
+            if (updateData.password) {
+              syncLogger.debug(`   🔑 [USERS] ✅ updateData.password est défini pour: ${username}, sera hashé lors de l'update`);
+            } else {
+              syncLogger.debug(`   🔑 [USERS] ⚠️  updateData.password est VIDE pour: ${username}`);
+            }
+            
+            syncLogger.debug(`   🔑 [USERS] Appel usersRepo.update() pour: ${username}, updateData contient password: ${!!updateData.password}`);
+            const updatedUser = await usersRepo.update(existing.id, updateData);
+            
+            // Vérifier que le password_hash a bien été mis à jour
+            const db = getDb();
+            const verifyHash = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(existing.id);
+            syncLogger.info(`   🔑 [USERS] Après update - password_hash pour ${username}: ${verifyHash?.password_hash ? '✅ HASHÉ' : '❌ VIDE'}`);
+            
             updated++;
             syncLogger.info(`   ✅ [USERS] Utilisateur mis à jour par UUID: ${username}`);
           } else {
@@ -3067,6 +3794,20 @@ export class SyncWorker {
                 expo_push_token: userData.expo_push_token || existingByUsername.expo_push_token || '',
               };
               
+              // CRITIQUE: Toujours mettre à jour le mot de passe depuis Sheets
+              if (userData.password && userData.password.trim() !== '') {
+                updateData.password = userData.password;
+                syncLogger.info(`   🔑 [USERS] Mise à jour du mot de passe avec réparation UUID pour: ${username}`);
+              } else {
+                // Si pas de mot de passe dans Sheets mais utilisateur existe sans password_hash, utiliser défaut
+                const db = getDb();
+                const userWithHash = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(existingByUsername.id);
+                if (!userWithHash || !userWithHash.password_hash || userWithHash.password_hash.trim() === '') {
+                  updateData.password = 'changeme123';
+                  syncLogger.info(`   🔑 [USERS] Pas de mot de passe dans Sheets, utilisation défaut avec réparation UUID pour: ${username}`);
+                }
+              }
+              
               await usersRepo.update(existingByUsername.id, updateData);
               updated++;
               syncLogger.info(`   ✅ [USERS] Utilisateur mis à jour avec réparation UUID: ${username} (UUID=${remoteUuid})`);
@@ -3077,7 +3818,7 @@ export class SyncWorker {
               const createData = {
                 uuid: remoteUuid,
                 username: username.trim(),
-                password: 'changeme123',
+                password: userData.password || 'changeme123', // Utiliser le mot de passe depuis Sheets
                 phone: userData.phone || userData.numero || '',
                 is_active: userData.is_active !== undefined ? (userData.is_active ? 1 : 0) : 1,
                 is_admin: userData.is_admin !== undefined ? (userData.is_admin ? 1 : 0) : 0,
@@ -3115,6 +3856,21 @@ export class SyncWorker {
                       profile_url: userData.profile_url || existingByUsernameFallback.profile_url || '',
                       expo_push_token: userData.expo_push_token || existingByUsernameFallback.expo_push_token || '',
                     };
+                    
+                    // CRITIQUE: Toujours mettre à jour le mot de passe depuis Sheets
+                    if (userData.password && userData.password.trim() !== '') {
+                      updateDataFallback.password = userData.password;
+                      syncLogger.info(`   🔑 [USERS] Mise à jour du mot de passe (fallback après erreur UNIQUE) pour: ${username}`);
+                    } else {
+                      // Si pas de mot de passe dans Sheets mais utilisateur existe sans password_hash, utiliser défaut
+                      const db = getDb();
+                      const userWithHash = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(existingByUsernameFallback.id);
+                      if (!userWithHash || !userWithHash.password_hash || userWithHash.password_hash.trim() === '') {
+                        updateDataFallback.password = 'changeme123';
+                        syncLogger.info(`   🔑 [USERS] Pas de mot de passe dans Sheets, utilisation défaut (fallback) pour: ${username}`);
+                      }
+                    }
+                    
                     await usersRepo.update(existingByUsernameFallback.id, updateDataFallback);
                     updated++;
                     repaired++;
@@ -3177,6 +3933,20 @@ export class SyncWorker {
             expo_push_token: userData.expo_push_token || existing.expo_push_token || '',
           };
           
+          // CRITIQUE: Toujours mettre à jour le mot de passe depuis Sheets
+          if (userData.password && userData.password.trim() !== '') {
+            updateData.password = userData.password;
+            syncLogger.info(`   🔑 [USERS] Mise à jour du mot de passe (username match) pour: ${username}`);
+          } else {
+            // Si pas de mot de passe dans Sheets mais utilisateur existe sans password_hash, utiliser défaut
+            const db = getDb();
+            const userWithHash = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(existing.id);
+            if (!userWithHash || !userWithHash.password_hash || userWithHash.password_hash.trim() === '') {
+              updateData.password = 'changeme123';
+              syncLogger.info(`   🔑 [USERS] Pas de mot de passe dans Sheets, utilisation défaut (username match) pour: ${username}`);
+            }
+          }
+          
           await usersRepo.update(existing.id, updateData);
           updated++;
           syncLogger.info(`   ✅ [USERS] Utilisateur mis à jour (username match): ${username}`);
@@ -3188,7 +3958,7 @@ export class SyncWorker {
           const createData = {
             uuid: newUuid,
             username: username.trim(),
-            password: 'changeme123',
+            password: userData.password || 'changeme123', // Utiliser le mot de passe depuis Sheets
             phone: userData.phone || userData.numero || '',
             is_active: userData.is_active !== undefined ? (userData.is_active ? 1 : 0) : 1,
             is_admin: userData.is_admin !== undefined ? (userData.is_admin ? 1 : 0) : 0,
@@ -3240,6 +4010,59 @@ export class SyncWorker {
     syncLogger.info(`👥 [USERS] ==========================================`);
     syncLogger.info(`✅ [USERS] Synchronisation terminée: ${inserted} créé(s), ${updated} mis à jour, ${repaired} UUID réparé(s), ${skipped} ignoré(s)`);
     syncLogger.info(`👥 [USERS] ==========================================`);
+
+    // Vérifier la validité de tous les utilisateurs connectés après sync
+    await this.checkConnectedUsersValidity();
+  }
+
+  /**
+   * Vérifie que tous les utilisateurs actuellement connectés sont toujours valides
+   * Déconnecte automatiquement ceux qui sont devenus invalides
+   */
+  async checkConnectedUsersValidity() {
+    try {
+      syncLogger.info(`🔍 [USERS-VALIDITY] Vérification de la validité des utilisateurs connectés...`);
+      
+      // Obtenir l'instance Socket.IO pour notifier les clients
+      const { getSocketIO } = await import('../../api/socket.js');
+      const io = getSocketIO();
+      
+      if (!io) {
+        syncLogger.warn(`   ⚠️ [USERS-VALIDITY] Socket.IO non disponible, impossible de notifier les clients`);
+        return;
+      }
+
+      // Récupérer tous les utilisateurs de la base
+      const allUsers = usersRepo.findAll();
+      const invalidUsers = [];
+
+      // Vérifier chaque utilisateur
+      for (const user of allUsers) {
+        // Si l'utilisateur est inactif, notifier tous les clients connectés avec cet user_id
+        if (!user.is_active || user.is_active === 0) {
+          syncLogger.warn(`   ⚠️ [USERS-VALIDITY] Utilisateur inactif détecté: ${user.username} (ID: ${user.id}, Phone: ${user.phone})`);
+          invalidUsers.push(user);
+          
+          // Notifier via socket que cet utilisateur doit être déconnecté
+          io.emit('user:deactivated', {
+            user_id: user.id,
+            username: user.username,
+            phone: user.phone,
+            reason: 'Compte désactivé lors de la synchronisation'
+          });
+          
+          syncLogger.info(`   📢 [USERS-VALIDITY] Notification envoyée pour déconnexion: ${user.username}`);
+        }
+      }
+
+      if (invalidUsers.length > 0) {
+        syncLogger.warn(`   ⚠️ [USERS-VALIDITY] ${invalidUsers.length} utilisateur(s) inactif(s) détecté(s) et notifié(s)`);
+      } else {
+        syncLogger.info(`   ✅ [USERS-VALIDITY] Tous les utilisateurs sont valides`);
+      }
+    } catch (error) {
+      syncLogger.error(`   ❌ [USERS-VALIDITY] Erreur lors de la vérification de validité:`, error);
+    }
   }
 
   /**
@@ -3258,4 +4081,5 @@ export class SyncWorker {
 }
 
 export const syncWorker = new SyncWorker();
+
 

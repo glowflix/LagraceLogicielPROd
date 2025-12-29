@@ -1,10 +1,12 @@
 import { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { Settings as SettingsIcon, DollarSign, RefreshCw, Save, CheckCircle2, XCircle } from 'lucide-react';
+import { Settings as SettingsIcon, DollarSign, RefreshCw, Save, CheckCircle2, XCircle, Wifi, Server } from 'lucide-react';
 import axios from 'axios';
 import { useStore } from '../store/useStore';
+import { getApiUrl, setApiUrl, testApiConnection } from '../utils/apiConfig';
+import { updateApiUrl } from '../store/useStore';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3030';
+const API_URL = getApiUrl();
 
 const SettingsPage = () => {
   const { currentRate: storeRate, loadCurrentRate, updateCurrentRate } = useStore();
@@ -164,7 +166,7 @@ const SettingsPage = () => {
         </div>
       </motion.div>
 
-      {/* Autres paramètres */}
+      {/* Configuration serveur (pour Android) */}
       <motion.div
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
@@ -172,11 +174,138 @@ const SettingsPage = () => {
         className="glass-strong rounded-xl p-6"
       >
         <h2 className="text-xl font-bold text-gray-100 mb-4 flex items-center gap-2">
-          <SettingsIcon className="w-6 h-6 text-primary-400" />
-          Autres paramètres
+          <Server className="w-6 h-6 text-primary-400" />
+          Configuration serveur
         </h2>
-        <p className="text-gray-400">Autres paramètres à venir...</p>
+        
+        <ServerConfigSection />
       </motion.div>
+    </div>
+  );
+};
+
+// Composant pour la configuration du serveur
+const ServerConfigSection = () => {
+  const [serverUrl, setServerUrl] = useState(getApiUrl());
+  const [testing, setTesting] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState(null);
+  const [message, setMessage] = useState({ type: '', text: '' });
+
+  const handleTestConnection = async () => {
+    setTesting(true);
+    setMessage({ type: '', text: '' });
+    
+    const isValid = await testApiConnection(serverUrl);
+    setConnectionStatus(isValid);
+    
+    if (isValid) {
+      setMessage({ type: 'success', text: 'Connexion réussie !' });
+    } else {
+      setMessage({ type: 'error', text: 'Impossible de se connecter au serveur' });
+    }
+    
+    setTesting(false);
+  };
+
+  const handleSaveServerUrl = () => {
+    if (setApiUrl(serverUrl)) {
+      updateApiUrl(serverUrl);
+      setMessage({ type: 'success', text: 'URL serveur sauvegardée. Rechargez la page pour appliquer les changements.' });
+      setTimeout(() => {
+        window.location.reload();
+      }, 2000);
+    } else {
+      setMessage({ type: 'error', text: 'URL invalide. Format attendu: http://IP:PORT' });
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <label className="block text-sm font-medium text-gray-300 mb-2">
+          URL du serveur
+        </label>
+        <p className="text-xs text-gray-500 mb-3">
+          Pour Android, entrez l'adresse IP du serveur (ex: http://192.168.1.100:3030)
+        </p>
+        <div className="flex gap-2">
+          <input
+            type="text"
+            value={serverUrl}
+            onChange={(e) => {
+              setServerUrl(e.target.value);
+              setConnectionStatus(null);
+              setMessage({ type: '', text: '' });
+            }}
+            placeholder="http://192.168.1.100:3030"
+            className="input-field flex-1"
+          />
+          <button
+            onClick={handleTestConnection}
+            disabled={testing || !serverUrl}
+            className="btn-secondary flex items-center gap-2 disabled:opacity-50"
+          >
+            {testing ? (
+              <motion.div
+                animate={{ rotate: 360 }}
+                transition={{ duration: 1, repeat: Infinity, ease: 'linear' }}
+              >
+                <RefreshCw className="w-5 h-5" />
+              </motion.div>
+            ) : (
+              <Wifi className="w-5 h-5" />
+            )}
+            Tester
+          </button>
+        </div>
+        
+        {connectionStatus !== null && (
+          <div className={`mt-2 flex items-center gap-2 text-sm ${
+            connectionStatus ? 'text-green-400' : 'text-red-400'
+          }`}>
+            {connectionStatus ? (
+              <CheckCircle2 className="w-4 h-4" />
+            ) : (
+              <XCircle className="w-4 h-4" />
+            )}
+            {connectionStatus ? 'Serveur accessible' : 'Serveur inaccessible'}
+          </div>
+        )}
+      </div>
+
+      <button
+        onClick={handleSaveServerUrl}
+        disabled={!serverUrl || connectionStatus === false}
+        className="btn-primary w-full flex items-center justify-center gap-2 disabled:opacity-50"
+      >
+        <Save className="w-5 h-5" />
+        Sauvegarder et recharger
+      </button>
+
+      {message.text && (
+        <motion.div
+          initial={{ opacity: 0, y: -10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className={`flex items-center gap-2 p-3 rounded-lg ${
+            message.type === 'success'
+              ? 'bg-green-500/20 border border-green-500/30'
+              : 'bg-red-500/20 border border-red-500/30'
+          }`}
+        >
+          {message.type === 'success' ? (
+            <CheckCircle2 className="w-5 h-5 text-green-400" />
+          ) : (
+            <XCircle className="w-5 h-5 text-red-400" />
+          )}
+          <span
+            className={`text-sm ${
+              message.type === 'success' ? 'text-green-300' : 'text-red-300'
+            }`}
+          >
+            {message.text}
+          </span>
+        </motion.div>
+      )}
     </div>
   );
 };

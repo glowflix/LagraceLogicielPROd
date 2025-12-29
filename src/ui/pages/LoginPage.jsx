@@ -78,7 +78,7 @@ const LoginPage = () => {
             transition={{ delay: 0.3 }}
           >
             <label className="block text-sm font-medium text-gray-300 mb-2">
-              Nom d'utilisateur
+              Numéro de téléphone
             </label>
             <div className="relative">
               <User className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5 text-gray-400" />
@@ -86,12 +86,15 @@ const LoginPage = () => {
                 type="text"
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
-                placeholder="Entrez votre nom d'utilisateur"
+                placeholder="Entrez votre numéro (ex: 243892310803)"
                 className="input-field pl-10"
                 required
                 autoFocus
               />
             </div>
+            <p className="text-xs text-gray-500 mt-1">
+              Vous pouvez aussi utiliser votre nom d'utilisateur
+            </p>
           </motion.div>
 
           <motion.div

@@ -1,0 +1,52 @@
+# AI LaGrace - Dépendances Python
+# ================================
+# Assistant vocal intelligent pour La Grâce POS
+# Fonctionne 100% OFFLINE (pas besoin d'Internet)
+
+# === CORE ===
+python-socketio[client]==5.10.0  # Communication avec Node.js
+aiohttp==3.9.1                    # Client HTTP async pour Socket.IO
+requests==2.31.0                  # Requêtes HTTP simples
+
+# === RECONNAISSANCE VOCALE (OFFLINE) ===
+vosk==0.3.45                      # Modèle de reconnaissance vocale offline
+sounddevice==0.4.6                # Capture audio microphone
+numpy==1.26.2                     # Traitement audio
+
+# === SYNTHÈSE VOCALE ULTRA NATURELLE (OFFLINE) ===
+# Option 1: Piper TTS - Voix neuronale TRÈS naturelle (recommandé)
+piper-tts>=1.2.0                  # Moteur TTS neuronal offline - voix humaine réaliste
+
+# Option 2: pyttsx3 - Fallback si Piper non disponible
+pyttsx3==2.90                     # Text-to-Speech système (fallback)
+
+# === AUDIO ===
+soundfile>=0.12.1                 # Lecture/écriture fichiers audio
+scipy>=1.11.0                     # Traitement signal audio
+
+# === DÉTECTION MOT-CLÉ ===
+# pvporcupine==3.0.0              # Wake word detection (optionnel, payant)
+webrtcvad==2.0.10                 # Voice Activity Detection
+
+# === UTILITAIRES ===
+python-dotenv==1.0.0              # Variables d'environnement
+colorama==0.4.6                   # Couleurs terminal Windows
+onnxruntime>=1.16.0               # Runtime pour modèles Piper ONNX
+
+# ============================================================================
+# INSTALLATION RAPIDE:
+# pip install -r requirements.txt
+#
+# POUR VOIX ULTRA NATURELLE PIPER:
+# 1. pip install piper-tts
+# 2. Le modèle français sera téléchargé automatiquement au premier lancement
+#
+# MODÈLES FRANÇAIS PIPER RECOMMANDÉS:
+# - fr_FR-siwis-medium  : Voix féminine, très naturelle (recommandé)
+# - fr_FR-upmc-medium   : Voix masculine, professionnelle
+# - fr_FR-mls-medium    : Multi-speaker, bonne qualité
+#
+# NOTES:
+# - Piper TTS = voix neuronale ultra naturelle (comme humain)
+# - pyttsx3 = fallback avec voix Windows (moins naturelle mais marche partout)
+# ============================================================================

@@ -31,16 +31,17 @@ const TOP_NUDGE_MM       = Math.min(Math.max(0, TOP_NUDGE_MM_ENV), SAFE_NUDGE_MA
 const ROTATE_180         = (process.env.PRINT_ROTATE_180 ?? "0") !== "0";
 
 /* ========= Front (deep-link dettes) ========= */
-const FRONT_BASE = (process.env.DETTEs_FRONT_BASE || process.env.APP_BASE_URL || "http://localhost:3000").trim();
+const FRONT_BASE = (process.env.DETTEs_FRONT_BASE || process.env.APP_BASE_URL || "http://localhost:3030").trim();
 const COMP_PATH  = (process.env.COMP_PATH || "/comp.html").trim();
 const DEEPLINK_DELAY_MS       = Number(process.env.DETTEs_DEEPLINK_DELAY_MS || 3000);
 const DEEPLINK_EXTRA_WAIT_MS  = Number(process.env.DETTEs_DEEPLINK_EXTRA_WAIT_MS || 3500);
 const USE_PS_FALLBACK         = (process.env.DEEPLINK_PS_FALLBACK ?? "1") !== "0";
 
 /* ========= Stock API (MARK lookup + contrôle unité CARTON) ========= */
-const STOCK_API_URL = (process.env.STOCK_API_URL || "http://localhost:3000/api/stock").trim();
+const STOCK_API_URL = (process.env.STOCK_API_URL || "http://localhost:3030/api/stock").trim();
 const STOCK_API_TIMEOUT_MS = Number(process.env.STOCK_API_TIMEOUT_MS || 2000);
 const LOOKUP_MARK_FROM_STOCK = (process.env.LOOKUP_MARK_FROM_STOCK ?? "1") !== "0";
+const CARTON_CHECK_STRICT = (process.env.CARTON_CHECK_STRICT ?? "0") !== "0"; // Par défaut non-bloquant (OFFLINE-FIRST)
 const NBSP = "\u202f";
 const HAIRSP = "\u200a";
 const MAX_MONEY_CHARS = Number(process.env.PRINT_MAX_MONEY_CHARS || 18);
@@ -979,12 +980,18 @@ async function normalizeData(job) {
       nomIn = stripped || stripPieceSuffix(codeIn) || nomIn;
     }
 
-    // Contrôle CARTON (ignoré si unite 'piece')
+    // Contrôle CARTON (ignoré si unite 'piece', non-bloquant en mode OFFLINE-FIRST)
     const check = await assertCartonIfRequired({ nom: nomIn, code: codeIn, unite });
-    if (!check.ok) {
+    if (!check.ok && CARTON_CHECK_STRICT) {
+      // Mode strict activé : bloquer l'impression
       const err = new Error(check.error || "Contrôle CARTON échoué");
       err.cartonAssert = false;
       throw err;
+    }
+    // En mode non-strict (OFFLINE-FIRST), continuer même si la vérification échoue
+    if (check.warning) {
+      // Log un avertissement mais continue l'impression
+      console.warn(`[PRINT] ⚠️  Article '${nomIn || codeIn || "?"}' non vérifié dans le stock (mode OFFLINE-FIRST)`);
     }
 
     // ===== Résolution du mark
@@ -1102,10 +1109,23 @@ async function normalizeData(job) {
   };
 }
 
-/* ========= Pré-contrôle CARTON ========= */
+/* ========= Pré-contrôle CARTON (non-bloquant par défaut pour OFFLINE-FIRST) ========= */
 async function assertCartonIfRequired(line) {
   const unit = canonUnit(line.unite);
   if (unit !== "carton") return { ok: true, reason: "not-carton" };
+  
+  // En mode OFFLINE-FIRST, la vérification est optionnelle
+  if (!CARTON_CHECK_STRICT) {
+    // Essayer de récupérer le mark depuis le stock si disponible, mais ne pas bloquer
+    const api = await lookupFromStock({ nom: line.nom, code: line.code });
+    if (api && api.unite === "carton") {
+      return { ok: true, mark: api.mark, warning: false };
+    }
+    // Si l'API n'est pas disponible ou l'article non trouvé, continuer quand même
+    return { ok: true, reason: "check-skipped-offline", warning: true };
+  }
+  
+  // Mode strict : bloquer si non trouvé
   const api = await lookupFromStock({ nom: line.nom, code: line.code });
   if (!api || api.unite !== "carton") {
     return { ok: false, error: `Article '${line.nom || line.code || "?"}' introuvable comme CARTON dans le stock.` };
@@ -1413,6 +1433,16 @@ export function createPrinterModule({
     const msg = `[PRINT] ${stage} ${meta?.file || ""} ${meta?.extra || ""}`.trim();
     log.info(clr("cyan", msg));
     io?.emit?.("print:progress", { stage, ...meta });
+    
+    // Émettre print:started pour AI LaGrace quand on commence
+    if (stage === "queue:start" || stage === "spool") {
+      io?.emit?.("print:started", { 
+        file: meta?.file || "", 
+        factureNum: meta?.factureNum || null,
+        stage: stage,
+        timestamp: new Date().toISOString()
+      });
+    }
   }
 
   async function processPdfFile(pdfPath) {

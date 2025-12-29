@@ -89,6 +89,19 @@
   @apply bg-dark-500;
 }
 
+/* Scrollbar masquée pour la section produits */
+.hide-scrollbar {
+  scrollbar-width: none; /* Firefox */
+  -ms-overflow-style: none; /* IE and Edge */
+}
+
+.hide-scrollbar::-webkit-scrollbar {
+  display: none; /* Chrome, Safari, Opera */
+  width: 0;
+  height: 0;
+  background: transparent;
+}
+
 /* Animations personnalisées */
 @keyframes shimmer {
   0% {

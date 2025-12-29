@@ -1,15 +1,63 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { Key, CheckCircle2, XCircle, WifiOff, LogIn } from 'lucide-react';
+import { Key, CheckCircle2, XCircle, WifiOff, LogIn, FileText } from 'lucide-react';
 import { useStore } from '../store/useStore';
+import axios from 'axios';
+
+// En mode proxy Vite, utiliser des chemins relatifs pour compatibilité LAN
+const API_URL = import.meta.env.DEV ? '' : (import.meta.env.VITE_API_URL || '');
 
 const LicensePage = () => {
   const navigate = useNavigate();
   const { activateLicense } = useStore();
-  const [key, setKey] = useState('0987654321'); // Clé par défaut pré-remplie
+  const [key, setKey] = useState(''); // Clé vide par défaut, sera remplie depuis le fichier
+  const [maskedKey, setMaskedKey] = useState(''); // Clé masquée pour l'affichage
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [checkingFile, setCheckingFile] = useState(true);
+  const [fileFound, setFileFound] = useState(false);
+
+  // Lire automatiquement le fichier linkcodeelagrace.Jeariss au chargement
+  useEffect(() => {
+    const checkLicenseFile = async () => {
+      try {
+        setCheckingFile(true);
+        const response = await axios.get(`${API_URL}/api/license/check-file`);
+        
+        if (response.data.success && response.data.valid) {
+          // Licence valide trouvée dans le fichier
+          setKey(response.data.licenseKey);
+          setMaskedKey('•'.repeat(response.data.licenseKey.length)); // Masquer avec des points
+          setFileFound(true);
+          
+          // Activer automatiquement la licence
+          const success = activateLicense(response.data.licenseKey);
+          if (success) {
+            setTimeout(() => {
+              navigate('/dashboard');
+            }, 1000);
+          }
+        } else if (response.data.found && !response.data.valid) {
+          // Fichier trouvé mais licence invalide
+          setError('Licence non valide');
+          setFileFound(true);
+        } else {
+          // Fichier non trouvé
+          setError('Fichier de licence non trouvé');
+          setFileFound(false);
+        }
+      } catch (error) {
+        console.error('Erreur lors de la lecture du fichier de licence:', error);
+        setError('Impossible de lire le fichier de licence');
+        setFileFound(false);
+      } finally {
+        setCheckingFile(false);
+      }
+    };
+
+    checkLicenseFile();
+  }, [activateLicense, navigate]);
 
   const handleActivate = async () => {
     setError('');
@@ -21,6 +69,8 @@ const LicensePage = () => {
     const success = activateLicense(key.trim());
 
     if (success) {
+      // Le token est généré automatiquement dans activateLicense
+      // Rediriger vers le dashboard après activation
       setTimeout(() => {
         navigate('/dashboard');
       }, 500);
@@ -28,6 +78,11 @@ const LicensePage = () => {
       setError('Clé de licence invalide');
       setLoading(false);
     }
+  };
+
+  // Fonction pour masquer la clé avec des points
+  const maskKey = (value) => {
+    return '•'.repeat(value.length);
   };
 
   return (
@@ -110,18 +165,52 @@ const LicensePage = () => {
             <label className="block text-sm font-medium text-gray-300 mb-2">
               Clé de licence
             </label>
-            <input
-              type="text"
-              value={key}
-              onChange={(e) => setKey(e.target.value)}
-              onKeyPress={(e) => e.key === 'Enter' && handleActivate()}
-              placeholder="Entrez votre clé de licence"
-              className="input-field text-center text-lg tracking-widest font-mono"
-              autoFocus
-            />
-            <p className="text-xs text-gray-500 mt-2 text-center">
-              Clé de démonstration : <span className="font-mono text-primary-400">0987654321</span>
-            </p>
+            {checkingFile ? (
+              <div className="input-field text-center text-lg tracking-widest font-mono flex items-center justify-center gap-2">
+                <motion.div
+                  animate={{ rotate: 360 }}
+                  transition={{ duration: 1, repeat: Infinity, ease: 'linear' }}
+                >
+                  <FileText className="w-5 h-5 text-primary-400" />
+                </motion.div>
+                <span className="text-gray-400">Lecture du fichier...</span>
+              </div>
+            ) : (
+              <>
+                <input
+                  type={fileFound && key ? 'password' : 'text'}
+                  value={fileFound && key ? maskedKey : key}
+                  onChange={(e) => {
+                    const newValue = e.target.value;
+                    setKey(newValue);
+                    if (fileFound && key) {
+                      // Si le fichier a été trouvé et qu'on a déjà une clé, masquer
+                      setMaskedKey(maskKey(newValue));
+                    } else {
+                      // Sinon, permettre la saisie normale
+                      setMaskedKey('');
+                    }
+                  }}
+                  onKeyPress={(e) => e.key === 'Enter' && !fileFound && handleActivate()}
+                  placeholder="Entrez votre clé de licence"
+                  className="input-field text-center text-lg tracking-widest font-mono"
+                  autoFocus={!fileFound}
+                  disabled={fileFound && key}
+                  readOnly={fileFound && key}
+                />
+                {fileFound && key && (
+                  <p className="text-xs text-green-400 mt-2 text-center flex items-center justify-center gap-1">
+                    <CheckCircle2 className="w-3 h-3" />
+                    Licence détectée depuis linkcodeelagrace.Jeariss
+                  </p>
+                )}
+                {!fileFound && (
+                  <p className="text-xs text-gray-500 mt-2 text-center">
+                    Fichier linkcodeelagrace.Jeariss non trouvé. Entrez manuellement la clé.
+                  </p>
+                )}
+              </>
+            )}
           </div>
 
           {error && (

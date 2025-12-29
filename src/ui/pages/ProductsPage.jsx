@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { 
   Search,
   Package,
@@ -10,14 +11,80 @@ import {
   XCircle,
   AlertCircle,
   ChevronDown,
-  ArrowUp
+  ArrowUp,
+  Upload,
+  Loader2
 } from 'lucide-react';
 import { useStore } from '../store/useStore';
 import axios from 'axios';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3030';
+// En mode proxy Vite, utiliser des chemins relatifs pour compatibilité LAN
+const API_URL = import.meta.env.DEV ? '' : (import.meta.env.VITE_API_URL || '');
 const PRINT_API_URL = `${API_URL}/api/print`;
 const IS_DEV = import.meta.env.DEV;
+
+// Composant pour animer les valeurs numériques (compteur animé)
+const AnimatedCounter = ({ value, duration = 500, formatter = (v) => v, className = '' }) => {
+  const [displayValue, setDisplayValue] = useState(value);
+  const [isAnimating, setIsAnimating] = useState(false);
+  const animationRef = useRef(null);
+  const startValueRef = useRef(value);
+  const startTimeRef = useRef(null);
+
+  useEffect(() => {
+    if (value === displayValue) return;
+
+    const startValue = displayValue;
+    const endValue = value;
+    const difference = endValue - startValue;
+    
+    if (Math.abs(difference) < 0.01) {
+      setDisplayValue(value);
+      return;
+    }
+
+    setIsAnimating(true);
+    startValueRef.current = startValue;
+    startTimeRef.current = performance.now();
+
+    const animate = (currentTime) => {
+      if (!startTimeRef.current) {
+        startTimeRef.current = currentTime;
+      }
+
+      const elapsed = currentTime - startTimeRef.current;
+      const progress = Math.min(elapsed / duration, 1);
+      
+      // Easing function (ease-out)
+      const easeOut = 1 - Math.pow(1 - progress, 3);
+      
+      const currentValue = startValueRef.current + (difference * easeOut);
+      setDisplayValue(currentValue);
+
+      if (progress < 1) {
+        animationRef.current = requestAnimationFrame(animate);
+      } else {
+        setDisplayValue(endValue);
+        setIsAnimating(false);
+        startTimeRef.current = null;
+      }
+    };
+
+    animationRef.current = requestAnimationFrame(animate);
+
+    return () => {
+      if (animationRef.current) {
+        cancelAnimationFrame(animationRef.current);
+      }
+    };
+  }, [value, duration]);
+
+  return (
+    <span className={`${className} ${isAnimating ? 'transition-all duration-75' : ''}`}>
+      {formatter(displayValue)}
+    </span>
+  );
+};
 
 // Modal WhatsApp-like
 const ConfirmModal = ({ isOpen, onClose, onConfirm, title, message, productName, onCustomName }) => {
@@ -94,7 +161,51 @@ const ConfirmModal = ({ isOpen, onClose, onConfirm, title, message, productName,
 };
 
 const ProductsPage = () => {
-  const { products, loadProducts, currentRate, loadCurrentRate } = useStore();
+  const { products, loadProducts, currentRate, loadCurrentRate, token: storeToken, isAuthenticated } = useStore();
+  const navigate = useNavigate();
+  
+  // Constante pour le token offline
+  const OFFLINE_BEARER = 'offline-token';
+  
+  // Ref pour éviter les warnings répétés
+  const warnedRef = useRef({ missingToken: false });
+  
+  // Fonction pure pour lire le token persisté Zustand
+  const readPersistedToken = useCallback(() => {
+    try {
+      const stored = localStorage.getItem('glowflix-store');
+      if (!stored) return null;
+      const parsed = JSON.parse(stored);
+      return parsed?.state?.token || null;
+    } catch {
+      return null;
+    }
+  }, []);
+  
+  // State token "stabilisé" - priorité : storeToken -> zustand persisted -> localStorage token direct
+  const [authToken, setAuthToken] = useState(null);
+  
+  useEffect(() => {
+    const t = storeToken || readPersistedToken() || localStorage.getItem('token');
+    setAuthToken(t || null);
+    
+    // Vérifier la connexion et rediriger si nécessaire
+    if (!t && !isAuthenticated) {
+      // Pas de token et pas authentifié → rediriger vers login après un délai
+      // (pour éviter les redirections pendant le chargement initial)
+      const timeoutId = setTimeout(() => {
+        if (!localStorage.getItem('glowflix-store') || !readPersistedToken()) {
+          if (IS_DEV) {
+            console.warn('⚠️ [ProductsPage] Aucun token trouvé, redirection vers login');
+          }
+          navigate('/login', { replace: true });
+        }
+      }, 2000);
+      
+      return () => clearTimeout(timeoutId);
+    }
+  }, [storeToken, isAuthenticated, readPersistedToken, navigate]);
+  
   const [searchQuery, setSearchQuery] = useState('');
   const [activeFilter, setActiveFilter] = useState('TOUS');
   const [editingCell, setEditingCell] = useState(null);
@@ -106,9 +217,24 @@ const ProductsPage = () => {
   const [focusedField, setFocusedField] = useState(null);
   const [initialLoading, setInitialLoading] = useState(true);
   
-  // Refs pour debounce
-  const saveTimeoutRef = useRef(null);
+  // État pour garder les valeurs modifiées visuellement même après sauvegarde
+  // Ces valeurs restent affichées pendant 3-4 secondes après la sauvegarde
+  const [visualValues, setVisualValues] = useState({}); // Map<rowId, {field: value}>
+  const visualValuesTimeoutsRef = useRef(new Map()); // Map<rowId, timeoutId>
+  
+  // Refs pour debounce - un timeout par rowId pour éviter les conflits
+  const saveTimeoutsRef = useRef(new Map()); // Map<rowId, timeoutId>
   const pendingSavesRef = useRef(new Map());
+  const savingLoopRef = useRef(false); // ✅ Boucle de sauvegarde au lieu d'un lock simple
+  
+  // ✅ Ref pour éviter les closures stale dans les callbacks
+  const editingValuesRef = useRef({});
+  useEffect(() => {
+    editingValuesRef.current = editingValues;
+  }, [editingValues]);
+  
+  // ✅ Ref pour tracker le dernier champ prix édité (USD ou FC)
+  const lastPriceEditedRef = useRef(new Map()); // Map<rowId, 'sale_price_usd' | 'sale_price_fc'>
   
   // Note: Pas de hover state nécessaire - utilisation de CSS hover uniquement (comme DebtsPage)
   // Les variables handleTableMouseLeave, hoveredRowIndex, isHovered ne sont pas utilisées
@@ -116,6 +242,10 @@ const ProductsPage = () => {
   useEffect(() => {
     const init = async () => {
       try {
+        // Log du token une seule fois au démarrage
+        if (IS_DEV && authToken) {
+          console.log('🔐 [ProductsPage] Token chargé:', authToken.substring(0, 20) + '...');
+        }
         await Promise.all([loadProducts(), loadCurrentRate()]);
       } catch (error) {
         // En mode Electron, éviter les console.error qui peuvent causer des problèmes
@@ -127,7 +257,35 @@ const ProductsPage = () => {
       }
     };
     init();
-  }, [loadProducts, loadCurrentRate]);
+    
+    // Nettoyer les timeouts au démontage du composant
+    return () => {
+      saveTimeoutsRef.current.forEach((timeoutId) => {
+        clearTimeout(timeoutId);
+      });
+      saveTimeoutsRef.current.clear();
+      
+      // Nettoyer aussi les timeouts des valeurs visuelles
+      visualValuesTimeoutsRef.current.forEach((timeoutId) => {
+        clearTimeout(timeoutId);
+      });
+      visualValuesTimeoutsRef.current.clear();
+    };
+  }, [loadProducts, loadCurrentRate, authToken]);
+
+  // Fonction helper pour obtenir les headers d'authentification (optimisée)
+  const getAuthHeaders = useCallback(() => {
+    if (!authToken) {
+      // Warning une seule fois
+      if (IS_DEV && !warnedRef.current.missingToken) {
+        console.warn('⚠️ [ProductsPage] Aucun token → mode offline (offline-token)');
+        warnedRef.current.missingToken = true;
+      }
+      return { headers: { Authorization: `Bearer ${OFFLINE_BEARER}` } };
+    }
+    
+    return { headers: { Authorization: `Bearer ${authToken}` } };
+  }, [authToken]);
 
   // Calculer FC depuis USD
   const calculateFC = useCallback((usd) => {
@@ -178,6 +336,8 @@ const ProductsPage = () => {
                 sale_price_usd: salePriceUSD,
                 sale_price_fc: calculatedFC,
                 purchase_price_usd: Number(unit.purchase_price_usd) || 0,
+                // NOUVEAU: Automatisation Stock (seuil d'alerte stock)
+                auto_stock_factor: Number(unit.auto_stock_factor) || 1,
               });
             } catch (err) {
               if (IS_DEV) {
@@ -205,6 +365,7 @@ const ProductsPage = () => {
           sale_price_usd: 0,
           sale_price_fc: 0,
           purchase_price_usd: 0,
+          auto_stock_factor: 1,
         });
       }
       
@@ -453,12 +614,36 @@ const ProductsPage = () => {
   }, [filteredData]);
 
   // Créer un produit
+  // IMPORTANT: USD est toujours la source de vérité, FC est calculé côté backend
   const handleCreateProduct = useCallback(async (row, edits) => {
     const unitLevel = row.unit_level || edits?.unit_level || 'CARTON';
     const productName = (edits?.product_name || row.product_name || '').trim();
     
     if (!productName) {
       throw new Error('Le nom du produit est requis');
+    }
+    
+    // Calculer USD depuis les edits (si FC modifié, convertir en USD)
+    // ✅ Convertir en string d'abord pour s'assurer qu'on parse la valeur complète
+    let salePriceUSD = 0;
+    if (edits?.sale_price_usd !== undefined) {
+      const usdStr = String(edits.sale_price_usd || '').trim();
+      if (usdStr !== '') {
+        const parsed = parseFloat(usdStr);
+        if (!isNaN(parsed) && isFinite(parsed)) {
+          salePriceUSD = parsed;
+        }
+      }
+    }
+    if (!salePriceUSD && edits?.sale_price_fc !== undefined) {
+      // Si seulement FC est fourni, calculer USD depuis FC
+      const fcStr = String(edits.sale_price_fc || '').trim();
+      if (fcStr !== '') {
+        const parsed = parseFloat(fcStr);
+        if (!isNaN(parsed) && isFinite(parsed)) {
+          salePriceUSD = calculateUSD(parsed);
+        }
+      }
     }
     
     // Pour MILLIER et PIECE, vérifier si existe en CARTON
@@ -482,20 +667,26 @@ const ProductsPage = () => {
         
         // Ajouter la nouvelle unité au produit existant
         const existingUnits = existingCarton.units || [];
+        // ✅ Parser correctement les valeurs numériques
+        const stockStr = String(edits?.stock_current || '').trim();
+        const stockValue = stockStr !== '' ? (parseFloat(stockStr) || 0) : 0;
+        const purchaseStr = String(edits?.purchase_price_usd || '').trim();
+        const purchaseValue = purchaseStr !== '' ? (parseFloat(purchaseStr) || 0) : 0;
+        
         const newUnit = {
           unit_level: unitLevel,
           unit_mark: edits?.unit_mark || '',
-          stock_current: parseFloat(edits?.stock_current) || 0,
-          sale_price_usd: parseFloat(edits?.sale_price_usd) || 0,
-          sale_price_fc: parseFloat(edits?.sale_price_fc) || calculateFC(parseFloat(edits?.sale_price_usd) || 0),
-          purchase_price_usd: parseFloat(edits?.purchase_price_usd) || 0,
+          stock_current: stockValue,
+          sale_price_usd: salePriceUSD, // USD comme source de vérité
+          // Ne pas envoyer sale_price_fc, le backend le calculera depuis USD
+          purchase_price_usd: purchaseValue,
         };
         
         await axios.post(`${API_URL}/api/products`, {
           code,
           name,
           units: [...existingUnits, newUnit]
-        });
+        }, getAuthHeaders());
       } else {
         // Demander confirmation via modal
         return new Promise((resolve, reject) => {
@@ -509,19 +700,25 @@ const ProductsPage = () => {
               onConfirm: async () => {
                 try {
                   // Générer un code unique
-                  const code = `PROD-${Date.now()}`;
+                  const code = edits?.product_code || `PROD-${Date.now()}`;
+                  // ✅ Parser correctement les valeurs numériques
+                  const stockStr = String(edits?.stock_current || '').trim();
+                  const stockValue = stockStr !== '' ? (parseFloat(stockStr) || 0) : 0;
+                  const purchaseStr = String(edits?.purchase_price_usd || '').trim();
+                  const purchaseValue = purchaseStr !== '' ? (parseFloat(purchaseStr) || 0) : 0;
+                  
                   await axios.post(`${API_URL}/api/products`, {
                     code,
                     name: productName,
                     units: [{
                       unit_level: unitLevel,
                       unit_mark: edits?.unit_mark || '',
-                      stock_current: parseFloat(edits?.stock_current) || 0,
-                      sale_price_usd: parseFloat(edits?.sale_price_usd) || 0,
-                      sale_price_fc: parseFloat(edits?.sale_price_fc) || calculateFC(parseFloat(edits?.sale_price_usd) || 0),
-                      purchase_price_usd: parseFloat(edits?.purchase_price_usd) || 0,
+                      stock_current: stockValue,
+                      sale_price_usd: salePriceUSD, // USD comme source de vérité
+                      // Ne pas envoyer sale_price_fc, le backend le calculera depuis USD
+                      purchase_price_usd: purchaseValue,
                     }]
-                  });
+                  }, getAuthHeaders());
                   setModalState({ isOpen: false, type: '', data: null });
                   resolve();
                 } catch (error) {
@@ -530,19 +727,25 @@ const ProductsPage = () => {
               },
               onCustomName: async (customName) => {
                 try {
-                  const code = `PROD-${Date.now()}`;
+                  const code = edits?.product_code || `PROD-${Date.now()}`;
+                  // ✅ Parser correctement les valeurs numériques
+                  const stockStr = String(edits?.stock_current || '').trim();
+                  const stockValue = stockStr !== '' ? (parseFloat(stockStr) || 0) : 0;
+                  const purchaseStr = String(edits?.purchase_price_usd || '').trim();
+                  const purchaseValue = purchaseStr !== '' ? (parseFloat(purchaseStr) || 0) : 0;
+                  
                   await axios.post(`${API_URL}/api/products`, {
                     code,
                     name: customName,
                     units: [{
                       unit_level: unitLevel,
                       unit_mark: edits?.unit_mark || '',
-                      stock_current: parseFloat(edits?.stock_current) || 0,
-                      sale_price_usd: parseFloat(edits?.sale_price_usd) || 0,
-                      sale_price_fc: parseFloat(edits?.sale_price_fc) || calculateFC(parseFloat(edits?.sale_price_usd) || 0),
-                      purchase_price_usd: parseFloat(edits?.purchase_price_usd) || 0,
+                      stock_current: stockValue,
+                      sale_price_usd: salePriceUSD, // USD comme source de vérité
+                      // Ne pas envoyer sale_price_fc, le backend le calculera depuis USD
+                      purchase_price_usd: purchaseValue,
                     }]
-                  });
+                  }, getAuthHeaders());
                   setModalState({ isOpen: false, type: '', data: null });
                   resolve();
                 } catch (error) {
@@ -559,107 +762,247 @@ const ProductsPage = () => {
       }
     } else {
       // CARTON peut être créé directement
-      const code = `PROD-${Date.now()}`;
+      const code = edits?.product_code || `PROD-${Date.now()}`;
+      // ✅ Parser correctement les valeurs numériques
+      const stockStr = String(edits?.stock_current || '').trim();
+      const stockValue = stockStr !== '' ? (parseFloat(stockStr) || 0) : 0;
+      const purchaseStr = String(edits?.purchase_price_usd || '').trim();
+      const purchaseValue = purchaseStr !== '' ? (parseFloat(purchaseStr) || 0) : 0;
+      
       await axios.post(`${API_URL}/api/products`, {
         code,
         name: productName,
         units: [{
           unit_level: 'CARTON',
           unit_mark: edits?.unit_mark || '',
-          stock_current: parseFloat(edits?.stock_current) || 0,
-          sale_price_usd: parseFloat(edits?.sale_price_usd) || 0,
-          sale_price_fc: parseFloat(edits?.sale_price_fc) || calculateFC(parseFloat(edits?.sale_price_usd) || 0),
-          purchase_price_usd: parseFloat(edits?.purchase_price_usd) || 0,
+          stock_current: stockValue,
+          sale_price_usd: salePriceUSD, // USD comme source de vérité
+          // Ne pas envoyer sale_price_fc, le backend le calculera depuis USD
+          purchase_price_usd: purchaseValue,
         }]
-      });
+      }, getAuthHeaders());
     }
-  }, [products, calculateFC]);
+  }, [products, calculateFC, calculateUSD, getAuthHeaders]);
 
   // Mettre à jour un produit
+  // IMPORTANT: USD est toujours la source de vérité, FC est calculé côté backend
   const handleUpdateProduct = useCallback(async (row, edits) => {
     if (row.is_empty) return;
     
     const unitUpdates = {};
     let productNameUpdate;
     
-    if (edits.sale_price_usd !== undefined) {
-      unitUpdates.sale_price_usd = parseFloat(edits.sale_price_usd) || 0;
-      unitUpdates.sale_price_fc = calculateFC(unitUpdates.sale_price_usd);
-    }
+    // Règle: USD = source de vérité, FC = calculé automatiquement
+    // Si l'utilisateur modifie FC, on calcule USD et on envoie USD au backend
+    // Si l'utilisateur modifie USD, on envoie USD au backend (le backend recalculera FC)
+    // IMPORTANT: Vérifier FC en premier car si FC est modifié, USD est recalculé automatiquement
     if (edits.sale_price_fc !== undefined) {
-      unitUpdates.sale_price_fc = parseFloat(edits.sale_price_fc) || 0;
-      unitUpdates.sale_price_usd = calculateUSD(unitUpdates.sale_price_fc);
+      // Modification de FC → calculer USD depuis FC et utiliser USD comme source
+      // ✅ Convertir en string d'abord pour s'assurer qu'on parse la valeur complète
+      const fcStr = String(edits.sale_price_fc || '').trim();
+      const fc = fcStr !== '' ? parseFloat(fcStr) : 0;
+      if (isNaN(fc) || !isFinite(fc)) {
+        if (IS_DEV) {
+          console.warn(`⚠️ [ProductsPage] Valeur FC invalide: "${edits.sale_price_fc}", utilisation de 0`);
+        }
+        return; // Ne pas sauvegarder si la valeur est invalide
+      }
+      const calculatedUSD = calculateUSD(fc);
+      unitUpdates.sale_price_usd = calculatedUSD;
+      if (IS_DEV) {
+        console.log(`💰 [ProductsPage] Conversion FC → USD: ${fc} FC → ${calculatedUSD} USD (valeur originale: "${edits.sale_price_fc}")`);
+      }
+      // Ne pas envoyer sale_price_fc, le backend le calculera depuis USD
+    } else if (edits.sale_price_usd !== undefined) {
+      // Modification directe de USD → utiliser USD comme source
+      // ✅ Convertir en string d'abord pour s'assurer qu'on parse la valeur complète
+      const usdStr = String(edits.sale_price_usd || '').trim();
+      const usd = usdStr !== '' ? parseFloat(usdStr) : 0;
+      if (isNaN(usd) || !isFinite(usd)) {
+        if (IS_DEV) {
+          console.warn(`⚠️ [ProductsPage] Valeur USD invalide: "${edits.sale_price_usd}", utilisation de 0`);
+        }
+        return; // Ne pas sauvegarder si la valeur est invalide
+      }
+      unitUpdates.sale_price_usd = usd;
+      if (IS_DEV) {
+        console.log(`💰 [ProductsPage] Modification directe USD: ${usd} USD (valeur originale: "${edits.sale_price_usd}")`);
+      }
+      // Ne pas envoyer sale_price_fc, le backend le calculera depuis USD
     }
-    if (edits.stock_current !== undefined) unitUpdates.stock_current = parseFloat(edits.stock_current) || 0;
+    
+    // ✅ Parser correctement stock_current pour préserver la valeur complète
+    if (edits.stock_current !== undefined) {
+      const stockStr = String(edits.stock_current || '').trim();
+      const stock = stockStr !== '' ? parseFloat(stockStr) : 0;
+      if (!isNaN(stock) && isFinite(stock)) {
+        unitUpdates.stock_current = stock;
+      } else {
+        if (IS_DEV) {
+          console.warn(`⚠️ [ProductsPage] Valeur stock invalide: "${edits.stock_current}", utilisation de 0`);
+        }
+        unitUpdates.stock_current = 0;
+      }
+    }
+    
+    // ✅ Parser correctement purchase_price_usd pour préserver la valeur complète
+    if (edits.purchase_price_usd !== undefined) {
+      const purchaseStr = String(edits.purchase_price_usd || '').trim();
+      const purchase = purchaseStr !== '' ? parseFloat(purchaseStr) : 0;
+      if (!isNaN(purchase) && isFinite(purchase)) {
+        unitUpdates.purchase_price_usd = purchase;
+      } else {
+        if (IS_DEV) {
+          console.warn(`⚠️ [ProductsPage] Valeur purchase_price_usd invalide: "${edits.purchase_price_usd}", utilisation de 0`);
+        }
+        unitUpdates.purchase_price_usd = 0;
+      }
+    }
+    
     if (edits.unit_mark !== undefined) unitUpdates.unit_mark = edits.unit_mark;
     if (edits.product_name !== undefined) productNameUpdate = edits.product_name;
     
     // Récupérer le produit actuel pour préserver les autres unités
     try {
-      const productResponse = await axios.get(`${API_URL}/api/products/${row.product_code}`);
+      // Calculer les headers une seule fois et réutiliser
+      const auth = getAuthHeaders();
+      const productResponse = await axios.get(`${API_URL}/api/products/${row.product_code}`, auth);
       const currentProduct = productResponse.data;
       
       // Mettre à jour l'unité spécifique
+      // IMPORTANT: Ne pas inclure sale_price_fc dans les unitUpdates envoyés au backend
+      // Le backend calculera toujours FC depuis USD
       const updatedUnits = (currentProduct.units || []).map(u => {
         if (u.id === row.unit_id) {
-          return { ...u, ...unitUpdates };
+          // Créer un nouvel objet sans sale_price_fc pour forcer le backend à le recalculer
+          const { sale_price_fc, ...unitWithoutFC } = { ...u, ...unitUpdates };
+          return unitWithoutFC;
         }
         return u;
       });
       
       // Mettre à jour via l'API - séparer product name des unit updates
-      await axios.put(`${API_URL}/api/products/${row.product_code}`, {
+      const updatePayload = {
         name: productNameUpdate ?? currentProduct.name,
         units: updatedUnits
-      });
+      };
+      
+      // Log de la requête pour débogage réseau
+      if (IS_DEV) {
+        console.log(`📤 [ProductsPage] PUT /api/products/${row.product_code}`);
+        console.log('   Payload:', JSON.stringify(updatePayload, null, 2));
+        console.log('   Headers:', auth);
+      }
+      
+      const response = await axios.put(`${API_URL}/api/products/${row.product_code}`, updatePayload, auth);
+      
+      if (IS_DEV) {
+        console.log(`✅ [ProductsPage] Produit mis à jour:`, response.data);
+      }
     } catch (error) {
       if (IS_DEV) {
-        console.error('Erreur mise à jour produit:', error);
+        console.error('❌ [ProductsPage] Erreur mise à jour produit:', error);
+        console.error('   Code:', error.response?.status);
+        console.error('   Message:', error.response?.data?.error || error.message);
+        console.error('   Token présent:', !!authToken);
+        console.error('   Headers envoyés:', auth);
       }
       throw error;
     }
-  }, [calculateFC, calculateUSD]);
+  }, [calculateFC, calculateUSD, getAuthHeaders]);
 
-  // Sauvegarder les changements en attente (défini avant scheduleSave)
+  // Sauvegarder les changements en attente avec boucle (défini avant scheduleSave)
+  // ✅ Utilise une boucle au lieu d'un lock pour éviter de perdre les modifications pendant la sauvegarde
   const savePendingChanges = useCallback(async () => {
-    const toSave = Array.from(pendingSavesRef.current.keys());
-    if (toSave.length === 0) return;
+    // Empêcher la ré-entrée
+    if (savingLoopRef.current) {
+      if (IS_DEV) {
+        console.log('⏸️ [ProductsPage] Boucle de sauvegarde déjà en cours');
+      }
+      return;
+    }
     
+    savingLoopRef.current = true;
     setSaving(true);
     setSaveMessage({ type: 'info', text: 'Sauvegarde en cours...' });
     
     try {
-      const promises = toSave.map(rowId => {
-        const row = tableData.find(r => r.id === rowId);
-        const edits = editingValues[rowId];
-        if (!row || !edits) return Promise.resolve();
+      // ✅ Boucle pour traiter tous les changements, même ceux qui arrivent pendant la sauvegarde
+      while (pendingSavesRef.current.size > 0) {
+        // Prendre un snapshot puis vider immédiatement (les nouveaux edits peuvent être ajoutés pendant la requête)
+        const batch = Array.from(pendingSavesRef.current.keys());
+        pendingSavesRef.current.clear();
         
-        // Si c'est une ligne vide, créer le produit
-        if (row.is_empty) {
-          return handleCreateProduct(row, edits).catch(err => {
+        if (IS_DEV) {
+          console.log(`💾 [ProductsPage] Sauvegarde de ${batch.length} produit(s) dans cette itération`);
+        }
+        
+        const promises = batch.map(async (rowId) => {
+          const row = tableData.find(r => r.id === rowId);
+          // ✅ Utiliser editingValuesRef pour éviter les closures stale
+          const editsRaw = editingValuesRef.current[rowId];
+          if (!row || !editsRaw) return;
+          
+          // ✅ Corriger le bug USD/FC : utiliser le dernier champ prix édité
+          const edits = { ...editsRaw };
+          const lastPriceField = lastPriceEditedRef.current.get(rowId);
+          
+          // Supprimer le champ dérivé pour ne garder que la source de vérité
+          if (lastPriceField === 'sale_price_usd') {
+            delete edits.sale_price_fc; // USD est la source, FC est dérivé
+          } else if (lastPriceField === 'sale_price_fc') {
+            delete edits.sale_price_usd; // FC est la source, USD sera calculé
+          }
+          
+          if (IS_DEV) {
+            console.log(`   📦 ${rowId}:`, {
+              produit: row?.product_code || 'Nouveau',
+              'dernier champ prix': lastPriceField,
+              edits: edits,
+              'sale_price_fc (raw)': edits?.sale_price_fc,
+              'sale_price_usd (raw)': edits?.sale_price_usd,
+            });
+          }
+          
+          // Si c'est une ligne vide, créer le produit
+          if (row.is_empty) {
+            return handleCreateProduct(row, edits).catch(err => {
+              if (IS_DEV) {
+                console.error(`❌ [ProductsPage] Erreur création produit ${rowId}:`, err);
+                console.error('   Code:', err.response?.status);
+                console.error('   Message:', err.response?.data?.error || err.message);
+              }
+              throw err;
+            });
+          }
+          
+          // Sinon, mettre à jour
+          return handleUpdateProduct(row, edits).catch(err => {
             if (IS_DEV) {
-              console.error(`Erreur création produit ${rowId}:`, err);
+              console.error(`❌ [ProductsPage] Erreur mise à jour produit ${rowId}:`, err);
+              console.error('   Code:', err.response?.status);
+              console.error('   Message:', err.response?.data?.error || err.message);
+              console.error('   Produit:', row?.product_code);
+              console.error('   Token présent:', !!authToken);
             }
             throw err;
           });
-        }
-        
-        // Sinon, mettre à jour
-        return handleUpdateProduct(row, edits).catch(err => {
-          if (IS_DEV) {
-            console.error(`Erreur mise à jour produit ${rowId}:`, err);
-          }
-          throw err;
         });
-      });
-      
-      await Promise.all(promises);
+        
+        await Promise.all(promises);
+        
+        // Si de nouveaux changements sont arrivés pendant la sauvegarde, on continue la boucle
+        if (IS_DEV && pendingSavesRef.current.size > 0) {
+          console.log(`   🔄 Nouveaux changements détectés (${pendingSavesRef.current.size}), nouvelle itération...`);
+        }
+      }
       
       setSaveMessage({ type: 'success', text: 'Sauvegarde réussie' });
-      pendingSavesRef.current.clear();
       
-      // Recharger les produits
-      await loadProducts();
+      // Recharger les produits après un court délai pour laisser le backend se mettre à jour
+      setTimeout(async () => {
+        await loadProducts();
+      }, 500);
       
       // Effacer le message après 2 secondes
       setTimeout(() => {
@@ -667,28 +1010,44 @@ const ProductsPage = () => {
       }, 2000);
     } catch (error) {
       if (IS_DEV) {
-        console.error('Erreur sauvegarde:', error);
+        console.error('❌ [ProductsPage] Erreur sauvegarde:', error);
+        console.error('   Code:', error.response?.status);
+        console.error('   Message:', error.response?.data?.error || error.message);
+            console.error('   Token présent:', !!authToken);
       }
-      setSaveMessage({ type: 'error', text: 'Erreur lors de la sauvegarde' });
+      const errorMessage = error.response?.status === 401 
+        ? 'Erreur d\'authentification. Veuillez vous reconnecter.'
+        : error.response?.data?.error || 'Erreur lors de la sauvegarde';
+      setSaveMessage({ type: 'error', text: errorMessage });
     } finally {
       setSaving(false);
+      savingLoopRef.current = false; // ✅ Utiliser savingLoopRef au lieu de savingInFlightRef
     }
-  }, [tableData, editingValues, loadProducts, handleCreateProduct, handleUpdateProduct]);
+  }, [tableData, loadProducts, handleCreateProduct, handleUpdateProduct, calculateFC, calculateUSD]);
 
-  // Programmer la sauvegarde avec debounce
+  // Programmer la sauvegarde avec debounce intelligent
+  // Sauvegarde seulement quand l'utilisateur arrête de taper pendant 2 secondes
   const scheduleSave = useCallback((rowId) => {
-    // Annuler le timeout précédent
-    if (saveTimeoutRef.current) {
-      clearTimeout(saveTimeoutRef.current);
+    // Annuler le timeout précédent pour ce rowId spécifique
+    const existingTimeout = saveTimeoutsRef.current.get(rowId);
+    if (existingTimeout) {
+      clearTimeout(existingTimeout);
     }
     
     // Marquer comme à sauvegarder
     pendingSavesRef.current.set(rowId, true);
     
-    // Programmer la sauvegarde après 3 secondes
-    saveTimeoutRef.current = setTimeout(() => {
+    // Programmer la sauvegarde après 2 secondes d'inactivité
+    // Si l'utilisateur continue à taper, ce timeout sera annulé et recréé
+    const timeoutId = setTimeout(() => {
+      if (IS_DEV) {
+        console.log(`💾 [ProductsPage] Auto-save déclenché pour ${rowId} après 2s d'inactivité`);
+      }
       savePendingChanges();
-    }, 3000);
+      saveTimeoutsRef.current.delete(rowId);
+    }, 2000); // 2 secondes au lieu de 3 pour être plus réactif
+    
+    saveTimeoutsRef.current.set(rowId, timeoutId);
   }, [savePendingChanges]);
 
   // Démarrer l'édition d'une cellule
@@ -698,11 +1057,20 @@ const ProductsPage = () => {
     try {
       setEditingCell({ rowId, field });
       setFocusedField(`${rowId}-${field}`);
+      
+      // ✅ Convertir les valeurs numériques en string pour préserver la valeur complète pendant la saisie
+      let initialValue = currentValue ?? '';
+      const numericFields = ['sale_price_usd', 'sale_price_fc', 'purchase_price_usd', 'stock_current'];
+      if (numericFields.includes(field) && (initialValue !== null && initialValue !== undefined && initialValue !== '')) {
+        // Convertir en string pour préserver la valeur exacte
+        initialValue = String(initialValue);
+      }
+      
       setEditingValues(prev => ({
         ...prev,
         [rowId]: {
           ...(prev[rowId] || {}),
-          [field]: currentValue ?? ''
+          [field]: initialValue
         }
       }));
     } catch (error) {
@@ -721,7 +1089,8 @@ const ProductsPage = () => {
     'sale_price_fc',
     'sale_price_usd',
     'purchase_price_usd',
-    'stock_current'
+    'stock_current',
+    'auto_stock_factor'
   ]);
 
   // Obtenir les suggestions de produits par nom - avec cache
@@ -799,7 +1168,7 @@ const ProductsPage = () => {
         ...prev,
         [rowId]: {
           ...(prev[rowId] || {}),
-          [field]: value
+          [field]: value // ✅ Préserver la valeur exacte saisie (string)
         }
       };
       
@@ -811,15 +1180,37 @@ const ProductsPage = () => {
         }
       }
       
-      // Si on modifie FC, calculer USD en temps réel
-      if (field === 'sale_price_fc') {
-        const fc = parseFloat(value) || 0;
-        newValues[rowId].sale_price_usd = calculateUSD(fc);
+      // Calculer l'autre valeur seulement si la valeur saisie est valide et complète
+      // ✅ Ne pas calculer si la valeur est vide ou invalide pour éviter les conversions prématurées
+      const valueStr = String(value || '').trim();
+      const isValidNumber = valueStr !== '' && !isNaN(parseFloat(valueStr)) && isFinite(parseFloat(valueStr));
+      
+      // ✅ Tracker le dernier champ prix édité (USD ou FC)
+      if (field === 'sale_price_fc' || field === 'sale_price_usd') {
+        lastPriceEditedRef.current.set(rowId, field);
       }
-      // Si on modifie USD, calculer FC en temps réel
-      else if (field === 'sale_price_usd') {
-        const usd = parseFloat(value) || 0;
-        newValues[rowId].sale_price_fc = calculateFC(usd);
+      
+      // Si on modifie FC, calculer USD en temps réel avec animation
+      if (field === 'sale_price_fc' && isValidNumber) {
+        const fc = parseFloat(valueStr);
+        if (!isNaN(fc) && isFinite(fc)) {
+          const calculatedUSD = calculateUSD(fc);
+          // ✅ Ne pas écraser si l'utilisateur est en train de modifier USD aussi
+          if (editingCell?.rowId !== rowId || editingCell?.field !== 'sale_price_usd') {
+            newValues[rowId].sale_price_usd = calculatedUSD;
+          }
+        }
+      }
+      // Si on modifie USD, calculer FC en temps réel avec animation
+      else if (field === 'sale_price_usd' && isValidNumber) {
+        const usd = parseFloat(valueStr);
+        if (!isNaN(usd) && isFinite(usd)) {
+          const calculatedFC = calculateFC(usd);
+          // ✅ Ne pas écraser si l'utilisateur est en train de modifier FC aussi
+          if (editingCell?.rowId !== rowId || editingCell?.field !== 'sale_price_fc') {
+            newValues[rowId].sale_price_fc = calculatedFC;
+          }
+        }
       }
       
       return newValues;
@@ -846,11 +1237,26 @@ const ProductsPage = () => {
   };
 
   // Obtenir la valeur d'édition ou la valeur actuelle
+  // Priorité: valeurs visuelles (après sauvegarde) > valeurs en édition > valeurs de la ligne
   const getCellValue = (row, field) => {
     if (!row) return '';
-    if (editingCell?.rowId === row.id && editingCell?.field === field) {
-      return editingValues[row.id]?.[field] ?? row[field] ?? '';
+    
+    // Si on est en train d'éditer ce champ, utiliser la valeur d'édition
+    // (qui peut inclure des valeurs calculées en temps réel)
+    if (editingCell?.rowId === row.id) {
+      const editValue = editingValues[row.id]?.[field];
+      if (editValue !== undefined) {
+        // ✅ Préserver la valeur exacte (string ou nombre) telle qu'elle est
+        return editValue;
+      }
     }
+    
+    // Sinon, utiliser la valeur visuelle si elle existe (après sauvegarde)
+    if (visualValues[row.id]?.[field] !== undefined) {
+      return visualValues[row.id][field];
+    }
+    
+    // Sinon, utiliser la valeur de la ligne
     return row[field] ?? '';
   };
 
@@ -925,7 +1331,7 @@ const ProductsPage = () => {
         };
         
         try {
-          await axios.post(`${PRINT_API_URL}/jobs`, job);
+          await axios.post(`${PRINT_API_URL}/jobs`, job, getAuthHeaders());
         } catch (error) {
           if (IS_DEV) {
             console.error(`Erreur impression produit ${row.product_code}:`, error);
@@ -994,7 +1400,7 @@ const ProductsPage = () => {
         }
       };
       
-      await axios.post(`${PRINT_API_URL}/jobs`, job);
+      await axios.post(`${PRINT_API_URL}/jobs`, job, getAuthHeaders());
       setSaveMessage({ type: 'success', text: 'Ticket envoyé à l\'impression' });
       setTimeout(() => setSaveMessage({ type: '', text: '' }), 2000);
     } catch (error) {
@@ -1047,9 +1453,33 @@ const ProductsPage = () => {
       {/* En-tête */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-3xl font-bold text-gray-100 mb-2">Produits</h1>
+          <h1 className="text-3xl font-bold text-gray-100 mb-2 flex items-center gap-3">
+            Produits
+            {/* Indicateur de synchronisation pending */}
+            {saving && (
+              <span className="inline-flex items-center gap-2 text-sm bg-blue-500/20 text-blue-300 px-3 py-1 rounded-full animate-pulse">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                Sync...
+              </span>
+            )}
+            {!saving && pendingSavesRef.current.size > 0 && (
+              <span 
+                className="inline-flex items-center gap-2 text-sm bg-orange-500/20 text-orange-300 px-3 py-1 rounded-full cursor-pointer hover:bg-orange-500/30"
+                onClick={() => savePendingChanges()}
+                title="Cliquer pour synchroniser maintenant"
+              >
+                <Upload className="w-4 h-4" />
+                {pendingSavesRef.current.size} en attente
+              </span>
+            )}
+          </h1>
           <p className="text-gray-400">
             {initialLoading ? 'Chargement...' : `${productCount} produit(s)`} • Taux: {currentRate || 2800} FC/USD
+            {activeFilter !== 'TOUS' && (
+              <span className="ml-2 text-primary-400">
+                • Filtre: {activeFilter === 'DETAIL' ? 'Détail (Milliers)' : activeFilter}
+              </span>
+            )}
           </p>
         </div>
         <div className="flex gap-2">
@@ -1170,6 +1600,9 @@ const ProductsPage = () => {
                   <th className="px-4 py-3 text-right text-xs font-bold text-gray-300 uppercase tracking-wider">
                     Stock
                   </th>
+                  <th className="px-4 py-3 text-right text-xs font-bold text-gray-300 uppercase tracking-wider" title="Seuil d'alerte stock (Automatisation)">
+                    Auto Stock
+                  </th>
                   <th className="px-4 py-3 text-center text-xs font-bold text-gray-300 uppercase tracking-wider">
                     Actions
                   </th>
@@ -1184,7 +1617,7 @@ const ProductsPage = () => {
                     if (firstEmptyIndex !== -1 && lastRealProductIndex !== -1) {
                     return (
                       <tr key="scroll-to-bottom-btn" data-navigation className="border-b border-white/10">
-                        <td colSpan={8} className="px-4 py-2">
+                        <td colSpan={9} className="px-4 py-2">
                           <button
                             onClick={scrollToBottom}
                             className="w-full px-4 py-2 bg-primary-500/20 hover:bg-primary-500/30 border border-primary-500/40 hover:border-primary-500/60 rounded-lg text-primary-300 hover:text-primary-200 text-sm font-semibold flex items-center justify-center gap-2 transition-colors"
@@ -1210,6 +1643,7 @@ const ProductsPage = () => {
                     
                     try {
                       const isEditingThisRow = editingCell?.rowId === row.id && !row.is_empty;
+                      const hasPendingChanges = pendingSavesRef.current.has(row.id);
                       
                       return (
                         <tr
@@ -1219,6 +1653,8 @@ const ProductsPage = () => {
                           } ${
                             isEditingThisRow
                               ? 'bg-primary-500/10 border-l-2 border-primary-500/50' 
+                              : hasPendingChanges
+                              ? 'bg-orange-500/5 border-l-2 border-orange-500/30'
                               : ''
                           } transition-colors`}
                         >
@@ -1472,18 +1908,51 @@ const ProductsPage = () => {
                       {editingCell?.rowId === row?.id && editingCell?.field === 'sale_price_fc' ? (
                         <input
                           type="number"
-                          value={getCellValue(row, 'sale_price_fc') || ''}
+                          value={String(getCellValue(row, 'sale_price_fc') || '')}
                           onChange={(e) => {
                             if (row?.id) {
-                              updateEditValue(row.id, 'sale_price_fc', e.target.value);
+                              const newValue = e.target.value; // ✅ Toujours une string depuis e.target.value
+                              if (IS_DEV) {
+                                console.log(`⌨️ [ProductsPage] Saisie: "${newValue}" (type: ${typeof newValue}) pour ${row.id}`);
+                              }
+                              // ✅ Préserver la valeur exacte saisie comme string
+                              updateEditValue(row.id, 'sale_price_fc', newValue);
                             }
                           }}
                           onBlur={() => {
+                            // Sauvegarder immédiatement quand l'utilisateur quitte le champ
+                            if (row?.id && pendingSavesRef.current.has(row.id)) {
+                              if (IS_DEV) {
+                                console.log(`💾 [ProductsPage] Blur détecté, sauvegarde immédiate pour ${row.id}`);
+                              }
+                              // Annuler le timeout en cours pour ce rowId
+                              const timeoutId = saveTimeoutsRef.current.get(row.id);
+                              if (timeoutId) {
+                                clearTimeout(timeoutId);
+                                saveTimeoutsRef.current.delete(row.id);
+                              }
+                              // Sauvegarder immédiatement
+                              savePendingChanges();
+                            }
                             setEditingCell(null);
                             setFocusedField(null);
                           }}
                           onKeyPress={(e) => {
                             if (e.key === 'Enter') {
+                              // Sauvegarder immédiatement quand l'utilisateur appuie sur Enter
+                              if (row?.id && pendingSavesRef.current.has(row.id)) {
+                                if (IS_DEV) {
+                                  console.log(`💾 [ProductsPage] Enter détecté, sauvegarde immédiate pour ${row.id}`);
+                                }
+                                // Annuler le timeout en cours pour ce rowId
+                                const timeoutId = saveTimeoutsRef.current.get(row.id);
+                                if (timeoutId) {
+                                  clearTimeout(timeoutId);
+                                  saveTimeoutsRef.current.delete(row.id);
+                                }
+                                // Sauvegarder immédiatement
+                                savePendingChanges();
+                              }
                               setEditingCell(null);
                               setFocusedField(null);
                             }
@@ -1500,7 +1969,12 @@ const ProductsPage = () => {
                           }}
                           className="cursor-pointer font-mono text-gray-200 group-hover:text-blue-300 group-hover:font-bold hover:text-blue-400"
                         >
-                          {(row?.sale_price_fc || 0).toLocaleString('fr-FR')} FC
+                          <AnimatedCounter
+                            value={parseFloat(getCellValue(row, 'sale_price_fc')) || 0}
+                            duration={600}
+                            formatter={(v) => Math.round(v).toLocaleString('fr-FR')}
+                            className="inline"
+                          /> FC
                         </span>
                       )}
                     </td>
@@ -1511,18 +1985,51 @@ const ProductsPage = () => {
                         <input
                           type="number"
                           step="0.01"
-                          value={getCellValue(row, 'sale_price_usd') || ''}
+                          value={String(getCellValue(row, 'sale_price_usd') || '')}
                           onChange={(e) => {
                             if (row?.id) {
-                              updateEditValue(row.id, 'sale_price_usd', e.target.value);
+                              const newValue = e.target.value; // ✅ Toujours une string depuis e.target.value
+                              if (IS_DEV) {
+                                console.log(`⌨️ [ProductsPage] Saisie: "${newValue}" (type: ${typeof newValue}) pour ${row.id}`);
+                              }
+                              // ✅ Préserver la valeur exacte saisie comme string
+                              updateEditValue(row.id, 'sale_price_usd', newValue);
                             }
                           }}
                           onBlur={() => {
+                            // Sauvegarder immédiatement quand l'utilisateur quitte le champ
+                            if (row?.id && pendingSavesRef.current.has(row.id)) {
+                              if (IS_DEV) {
+                                console.log(`💾 [ProductsPage] Blur détecté, sauvegarde immédiate pour ${row.id}`);
+                              }
+                              // Annuler le timeout en cours pour ce rowId
+                              const timeoutId = saveTimeoutsRef.current.get(row.id);
+                              if (timeoutId) {
+                                clearTimeout(timeoutId);
+                                saveTimeoutsRef.current.delete(row.id);
+                              }
+                              // Sauvegarder immédiatement
+                              savePendingChanges();
+                            }
                             setEditingCell(null);
                             setFocusedField(null);
                           }}
                           onKeyPress={(e) => {
                             if (e.key === 'Enter') {
+                              // Sauvegarder immédiatement quand l'utilisateur appuie sur Enter
+                              if (row?.id && pendingSavesRef.current.has(row.id)) {
+                                if (IS_DEV) {
+                                  console.log(`💾 [ProductsPage] Enter détecté, sauvegarde immédiate pour ${row.id}`);
+                                }
+                                // Annuler le timeout en cours pour ce rowId
+                                const timeoutId = saveTimeoutsRef.current.get(row.id);
+                                if (timeoutId) {
+                                  clearTimeout(timeoutId);
+                                  saveTimeoutsRef.current.delete(row.id);
+                                }
+                                // Sauvegarder immédiatement
+                                savePendingChanges();
+                              }
                               setEditingCell(null);
                               setFocusedField(null);
                             }
@@ -1539,7 +2046,12 @@ const ProductsPage = () => {
                           }}
                           className="cursor-pointer font-mono font-semibold text-primary-400 group-hover:text-primary-300 group-hover:font-bold group-hover:text-lg hover:text-primary-300"
                         >
-                          ${(row?.sale_price_usd || 0).toFixed(2)}
+                          $<AnimatedCounter
+                            value={parseFloat(getCellValue(row, 'sale_price_usd')) || 0}
+                            duration={600}
+                            formatter={(v) => v.toFixed(2)}
+                            className="inline"
+                          />
                         </span>
                       )}
                     </td>
@@ -1550,18 +2062,51 @@ const ProductsPage = () => {
                         <input
                           type="number"
                           step="0.01"
-                          value={getCellValue(row, 'purchase_price_usd') || ''}
+                          value={String(getCellValue(row, 'purchase_price_usd') || '')}
                           onChange={(e) => {
                             if (row?.id) {
-                              updateEditValue(row.id, 'purchase_price_usd', e.target.value);
+                              const newValue = e.target.value; // ✅ Toujours une string depuis e.target.value
+                              if (IS_DEV) {
+                                console.log(`⌨️ [ProductsPage] Saisie: "${newValue}" (type: ${typeof newValue}) pour ${row.id}`);
+                              }
+                              // ✅ Préserver la valeur exacte saisie comme string
+                              updateEditValue(row.id, 'purchase_price_usd', newValue);
                             }
                           }}
                           onBlur={() => {
+                            // Sauvegarder immédiatement quand l'utilisateur quitte le champ
+                            if (row?.id && pendingSavesRef.current.has(row.id)) {
+                              if (IS_DEV) {
+                                console.log(`💾 [ProductsPage] Blur détecté, sauvegarde immédiate pour ${row.id}`);
+                              }
+                              // Annuler le timeout en cours pour ce rowId
+                              const timeoutId = saveTimeoutsRef.current.get(row.id);
+                              if (timeoutId) {
+                                clearTimeout(timeoutId);
+                                saveTimeoutsRef.current.delete(row.id);
+                              }
+                              // Sauvegarder immédiatement
+                              savePendingChanges();
+                            }
                             setEditingCell(null);
                             setFocusedField(null);
                           }}
                           onKeyPress={(e) => {
                             if (e.key === 'Enter') {
+                              // Sauvegarder immédiatement quand l'utilisateur appuie sur Enter
+                              if (row?.id && pendingSavesRef.current.has(row.id)) {
+                                if (IS_DEV) {
+                                  console.log(`💾 [ProductsPage] Enter détecté, sauvegarde immédiate pour ${row.id}`);
+                                }
+                                // Annuler le timeout en cours pour ce rowId
+                                const timeoutId = saveTimeoutsRef.current.get(row.id);
+                                if (timeoutId) {
+                                  clearTimeout(timeoutId);
+                                  saveTimeoutsRef.current.delete(row.id);
+                                }
+                                // Sauvegarder immédiatement
+                                savePendingChanges();
+                              }
                               setEditingCell(null);
                               setFocusedField(null);
                             }
@@ -1588,18 +2133,51 @@ const ProductsPage = () => {
                       {editingCell?.rowId === row?.id && editingCell?.field === 'stock_current' ? (
                         <input
                           type="number"
-                          value={getCellValue(row, 'stock_current') || ''}
+                          value={String(getCellValue(row, 'stock_current') || '')}
                           onChange={(e) => {
                             if (row?.id) {
-                              updateEditValue(row.id, 'stock_current', e.target.value);
+                              const newValue = e.target.value; // ✅ Toujours une string depuis e.target.value
+                              if (IS_DEV) {
+                                console.log(`⌨️ [ProductsPage] Saisie: "${newValue}" (type: ${typeof newValue}) pour ${row.id}`);
+                              }
+                              // ✅ Préserver la valeur exacte saisie comme string
+                              updateEditValue(row.id, 'stock_current', newValue);
                             }
                           }}
                           onBlur={() => {
+                            // Sauvegarder immédiatement quand l'utilisateur quitte le champ
+                            if (row?.id && pendingSavesRef.current.has(row.id)) {
+                              if (IS_DEV) {
+                                console.log(`💾 [ProductsPage] Blur détecté, sauvegarde immédiate pour ${row.id}`);
+                              }
+                              // Annuler le timeout en cours pour ce rowId
+                              const timeoutId = saveTimeoutsRef.current.get(row.id);
+                              if (timeoutId) {
+                                clearTimeout(timeoutId);
+                                saveTimeoutsRef.current.delete(row.id);
+                              }
+                              // Sauvegarder immédiatement
+                              savePendingChanges();
+                            }
                             setEditingCell(null);
                             setFocusedField(null);
                           }}
                           onKeyPress={(e) => {
                             if (e.key === 'Enter') {
+                              // Sauvegarder immédiatement quand l'utilisateur appuie sur Enter
+                              if (row?.id && pendingSavesRef.current.has(row.id)) {
+                                if (IS_DEV) {
+                                  console.log(`💾 [ProductsPage] Enter détecté, sauvegarde immédiate pour ${row.id}`);
+                                }
+                                // Annuler le timeout en cours pour ce rowId
+                                const timeoutId = saveTimeoutsRef.current.get(row.id);
+                                if (timeoutId) {
+                                  clearTimeout(timeoutId);
+                                  saveTimeoutsRef.current.delete(row.id);
+                                }
+                                // Sauvegarder immédiatement
+                                savePendingChanges();
+                              }
                               setEditingCell(null);
                               setFocusedField(null);
                             }
@@ -1617,6 +2195,63 @@ const ProductsPage = () => {
                           className="cursor-pointer font-mono text-gray-200 group-hover:text-green-300 group-hover:font-bold hover:text-green-400"
                         >
                           {(row?.stock_current || 0).toLocaleString('fr-FR')}
+                        </span>
+                      )}
+                    </td>
+
+                    {/* Auto Stock (Automatisation Stock - seuil d'alerte) */}
+                    <td className="px-4 py-3 text-right">
+                      {editingCell?.rowId === row?.id && editingCell?.field === 'auto_stock_factor' ? (
+                        <input
+                          type="number"
+                          step="1"
+                          min="0"
+                          value={String(getCellValue(row, 'auto_stock_factor') || '')}
+                          onChange={(e) => {
+                            if (row?.id) {
+                              updateEditValue(row.id, 'auto_stock_factor', e.target.value);
+                            }
+                          }}
+                          onBlur={() => {
+                            if (row?.id && pendingSavesRef.current.has(row.id)) {
+                              const timeoutId = saveTimeoutsRef.current.get(row.id);
+                              if (timeoutId) {
+                                clearTimeout(timeoutId);
+                                saveTimeoutsRef.current.delete(row.id);
+                              }
+                              savePendingChanges();
+                            }
+                            setEditingCell(null);
+                            setFocusedField(null);
+                          }}
+                          onKeyPress={(e) => {
+                            if (e.key === 'Enter') {
+                              if (row?.id && pendingSavesRef.current.has(row.id)) {
+                                const timeoutId = saveTimeoutsRef.current.get(row.id);
+                                if (timeoutId) {
+                                  clearTimeout(timeoutId);
+                                  saveTimeoutsRef.current.delete(row.id);
+                                }
+                                savePendingChanges();
+                              }
+                              setEditingCell(null);
+                              setFocusedField(null);
+                            }
+                          }}
+                          className="input-field text-sm px-4 py-2.5 text-right bg-dark-800/50 border border-primary-500/60 focus:border-primary-500 rounded-lg min-w-[100px] relative z-10"
+                          autoFocus
+                        />
+                      ) : (
+                        <span
+                          onClick={() => {
+                            if (row?.id) {
+                              startEdit(row.id, 'auto_stock_factor', row?.auto_stock_factor || 1);
+                            }
+                          }}
+                          className="cursor-pointer font-mono text-gray-400 group-hover:text-orange-300 group-hover:font-bold hover:text-orange-400"
+                          title="Seuil d'alerte stock (cliquer pour modifier)"
+                        >
+                          {(row?.auto_stock_factor || 1).toLocaleString('fr-FR')}
                         </span>
                       )}
                     </td>
@@ -1649,7 +2284,7 @@ const ProductsPage = () => {
                       // Retourner une ligne vide au lieu de null pour éviter les problèmes de clés
                       return (
                         <tr key={row?.id || `error-${index}`} className="opacity-50">
-                          <td colSpan={8} className="px-4 py-2 text-center text-gray-500 text-sm">
+                          <td colSpan={9} className="px-4 py-2 text-center text-gray-500 text-sm">
                             Erreur de rendu
                           </td>
                         </tr>

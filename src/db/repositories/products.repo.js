@@ -1,6 +1,7 @@
 import { getDb } from '../sqlite.js';
 import { logger } from '../../core/logger.js';
 import { generateUUID } from '../../core/crypto.js';
+import { ratesRepo } from './rates.repo.js';
 
 /**
  * Repository pour la gestion des produits
@@ -22,10 +23,14 @@ export class ProductsRepository {
 
   /**
    * Récupère tous les produits actifs
+   * IMPORTANT: sale_price_fc est TOUJOURS calculé depuis sale_price_usd * taux
    */
   findAll() {
     const db = getDb();
     try {
+      // Récupérer le taux actuel pour calculer FC depuis USD
+      const currentRate = ratesRepo.getCurrent();
+      
       const products = db
         .prepare(`
           SELECT p.*, 
@@ -37,7 +42,6 @@ export class ProductsRepository {
                      'stock_initial', pu.stock_initial,
                      'stock_current', pu.stock_current,
                      'purchase_price_usd', pu.purchase_price_usd,
-                     'sale_price_fc', pu.sale_price_fc,
                      'sale_price_usd', pu.sale_price_usd,
                      'auto_stock_factor', pu.auto_stock_factor,
                      'qty_step', pu.qty_step
@@ -49,10 +53,18 @@ export class ProductsRepository {
           GROUP BY p.id
         `)
         .all()
-        .map((row) => ({
-          ...row,
-          units: row.units ? JSON.parse(`[${row.units}]`) : [],
-        }));
+        .map((row) => {
+          const units = row.units ? JSON.parse(`[${row.units}]`) : [];
+          // Calculer sale_price_fc depuis sale_price_usd pour chaque unité
+          const unitsWithCalculatedFC = units.map(unit => ({
+            ...unit,
+            sale_price_fc: unit.sale_price_usd ? Math.round(unit.sale_price_usd * currentRate) : 0
+          }));
+          return {
+            ...row,
+            units: unitsWithCalculatedFC,
+          };
+        });
       
       logger.info(`📊 findAll products: ${products.length} produit(s) trouvé(s) dans la base`);
       return products;
@@ -64,10 +76,14 @@ export class ProductsRepository {
 
   /**
    * Trouve un produit par code
+   * IMPORTANT: sale_price_fc est TOUJOURS calculé depuis sale_price_usd * taux
    */
   findByCode(code) {
     const db = getDb();
     try {
+      // Récupérer le taux actuel pour calculer FC depuis USD
+      const currentRate = ratesRepo.getCurrent();
+      
       const product = db
         .prepare('SELECT * FROM products WHERE code = ? AND is_active = 1')
         .get(code);
@@ -76,7 +92,12 @@ export class ProductsRepository {
 
       const units = db
         .prepare('SELECT * FROM product_units WHERE product_id = ?')
-        .all(product.id);
+        .all(product.id)
+        .map(unit => ({
+          ...unit,
+          // Calculer sale_price_fc depuis sale_price_usd
+          sale_price_fc: unit.sale_price_usd ? Math.round(unit.sale_price_usd * currentRate) : 0
+        }));
 
       return { ...product, units };
     } catch (error) {
@@ -126,8 +147,15 @@ export class ProductsRepository {
         logger.debug(`   ✓ Produit enregistré: id=${productId}`);
 
         // Upsert unités
+        // IMPORTANT: sale_price_fc est TOUJOURS calculé depuis sale_price_usd * taux
+        // On ignore sale_price_fc venant de Sheets ou de l'input
         if (productData.units && Array.isArray(productData.units)) {
           logger.debug(`   📦 Traitement de ${productData.units.length} unité(s)...`);
+          
+          // Récupérer le taux actuel pour calculer FC depuis USD
+          const currentRate = ratesRepo.getCurrent();
+          
+          // Préparer la requête avec le taux interpolé (SQLite ne supporte pas les paramètres dans ON CONFLICT)
           const unitStmt = db.prepare(`
             INSERT INTO product_units (
               uuid, product_id, unit_level, unit_mark, stock_initial, stock_current,
@@ -140,8 +168,8 @@ export class ProductsRepository {
               stock_initial = excluded.stock_initial,
               stock_current = excluded.stock_current,
               purchase_price_usd = excluded.purchase_price_usd,
-              sale_price_fc = excluded.sale_price_fc,
               sale_price_usd = excluded.sale_price_usd,
+              sale_price_fc = ROUND(excluded.sale_price_usd * ${currentRate}),
               auto_stock_factor = excluded.auto_stock_factor,
               qty_step = excluded.qty_step,
               extra1 = excluded.extra1,
@@ -160,7 +188,12 @@ export class ProductsRepository {
             
             const unitUuid = existingUnit?.uuid || unit.uuid || generateUUID();
             
-            logger.debug(`      ✓ Unité ${unitIndex}/${productData.units.length}: ${unit.unit_level || 'PIECE'}, Mark="${unit.unit_mark || ''}", Stock=${unit.stock_current || 0}, Prix=${unit.sale_price_fc || 0} FC`);
+            // Utiliser TOUJOURS sale_price_usd comme source de vérité
+            const salePriceUSD = unit.sale_price_usd || 0;
+            // Calculer sale_price_fc depuis USD (ignorer sale_price_fc venant de l'input)
+            const salePriceFC = salePriceUSD ? Math.round(salePriceUSD * currentRate) : 0;
+            
+            logger.debug(`      ✓ Unité ${unitIndex}/${productData.units.length}: ${unit.unit_level || 'PIECE'}, Mark="${unit.unit_mark || ''}", Stock=${unit.stock_current || 0}, Prix USD=${salePriceUSD}, Prix FC=${salePriceFC} (calculé)`);
             
             unitStmt.run(
               unitUuid,
@@ -170,8 +203,8 @@ export class ProductsRepository {
               unit.stock_initial || 0,
               unit.stock_current || 0,
               unit.purchase_price_usd || 0,
-              unit.sale_price_fc || 0,
-              unit.sale_price_usd || 0,
+              salePriceFC, // Calculé depuis USD, pas depuis l'input
+              salePriceUSD, // Source de vérité
               unit.auto_stock_factor || 1,
               unit.qty_step || 1,
               unit.extra1 || null,

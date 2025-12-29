@@ -422,4 +422,7 @@ export class SheetsClient {
   }
 }
 
+// Créer l'instance et ajouter l'alias batchPush pour compatibilité
 export const sheetsClient = new SheetsClient();
+// Alias: batchPush = pushBatch (pour compatibilité avec le code existant)
+sheetsClient.batchPush = sheetsClient.pushBatch.bind(sheetsClient);

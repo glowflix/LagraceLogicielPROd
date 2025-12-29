@@ -1,0 +1,604 @@
+Je garde aussi tout le reste : OFFLINE-FIRST, sync Sheets en arrière-plan, impression auto via print_job + watcher @module.js, devise + conversion USD→FC, queues + retry.
+
+1) But du système (vision métier et contraintes non négociables)
+1.1 OFFLINE-FIRST (règle d’or)
+
+Une vente ne se coupe jamais.
+
+Même si :
+
+Internet est absent,
+
+Google Sheets est lent ou indisponible,
+
+Apps Script échoue,
+
+le réseau “clignote” (micro-freezes),
+
+ou qu’il y a beaucoup de ventes.
+
+La vente doit être validée en local (SQL) et l’UI doit rester fluide.
+
+👉 La base de vérité immédiate = SQL local.
+Sheets = “copie synchronisée”, jamais la vérité instantanée.
+
+1.2 Sync Sheets uniquement en arrière-plan
+
+La synchronisation Google Sheets :
+
+est asynchrone,
+
+par lots (batch),
+
+avec retry,
+
+et ne doit jamais ralentir le POS.
+
+1.3 Impression automatique (séparée de la sync)
+
+À la finalisation :
+
+tu déposes un print_job
+
+un watcher dans @module.js imprime automatiquement
+
+L’impression est indépendante de la sync et d’Internet.
+
+2) Architecture technique globale : 3 pipelines indépendants (anti-lag / anti-plantage)
+
+Le système doit être pensé comme 3 processus séparés (même si c’est le même backend, la logique doit être séparée).
+
+2.1 Pipeline A — Vente (chemin critique POS : ultra rapide)
+
+Déclenché par Finaliser dans SalesPOS.jsx :
+
+Normaliser + appliquer règles quantité (UI temps réel + backend validation finale)
+
+Transaction SQL locale :
+
+enregistrer facture + lignes
+
+réduire stock local immédiatement
+
+déposer sync_queue (pending)
+
+déposer print_job (pending)
+
+Réponse UI immédiate : “OK vente”
+
+Interdit dans ce pipeline :
+
+appels Google Sheets
+
+appels externes HTTP
+
+lecture complète des feuilles
+
+boucles lourdes
+
+recalcul global
+
+2.2 Pipeline B — Sync Sheets (worker backend toutes les ~10 sec)
+
+Toutes les ~10 secondes :
+
+détecter Internet (léger)
+
+lire sync_queue pending (et éligibles selon next_retry_at)
+
+pousser en batch :
+
+Ventes (append lignes)
+
+Stock (update dans la feuille unité correspondante)
+
+Stock de prix effectué (append journal)
+
+marquer synced si succès
+
+sinon error + backoff + retry
+
+2.3 Pipeline C — Impression auto (watcher @module.js toutes les 1–2 sec)
+
+Toutes les 1–2 secondes :
+
+lire print_jobs pending
+
+passer processing
+
+imprimer (80mm / 80hbs)
+
+marquer printed si succès
+
+sinon error + retry local
+
+3) Règles quantité (cœur de ton besoin) — version finale verrouillée
+3.1 Normalisation unité (avant toute règle)
+
+Transformer tout en :
+
+carton
+
+milliers
+
+piece
+
+Exemples :
+
+“Carton”, “CARTON”, “box” → carton
+
+“Millier”, “Milliers”, “mille” → milliers
+
+“Piece”, “Pièce”, “pcs” → piece
+
+3.2 Normalisation MARK (tolérance DZ)
+
+Créer markNorm :
+
+si mark ∈ {dz, Dz, DZ, DZN, douzain, douzaine, dizaine}
+⇒ markNorm = "DZ"
+
+sinon
+⇒ markNorm = mark.trim().toUpperCase()
+(ex: paque→PAQUE, bt→BT, pqt→PQT, jute→JUTE)
+
+3.3 Règles finales quantité (définitives)
+A) Unité = carton
+
+Décimal autorisé
+
+0.25, 0.5, 0,5, 1.75, etc.
+
+MARK ne joue aucun rôle
+
+B) Unité = milliers
+Si markNorm = "DZ"
+
+Décimal autorisé
+
+Exemples acceptés :
+
+0.5, 0,5, 0.25, 0,25, 0,50, 1, 2, 3, etc.
+
+Donc 0,50 est accepté (c’est 0.5).
+
+Si markNorm ≠ "DZ" (PAQUE / BT / PQT / JUTE / autre)
+
+Décimal interdit
+
+Quantité ENTIER OBLIGATOIRE et ≥ 1
+
+Donc l’utilisateur doit saisir : 1, 2, 3, …
+
+➡️ C’est ici que tu “bloques immédiatement à 1” :
+
+pas de 0.5
+
+pas de 0.25
+
+pas de 0.x
+
+pas de 0
+
+minimum = 1
+
+C) Unité = piece
+
+Décimal interdit
+
+Quantité ENTIER ≥ 1
+
+4) Comportement UI “temps réel” (sans message d’erreur, seulement une logique de saisie)
+
+Tu as demandé : pas d’erreur bloquante, juste la logique.
+
+4.1 Politique de saisie (qtyPolicy) par ligne
+
+Pour chaque ligne, calculer :
+
+allowDecimal (true/false)
+
+minQty
+
+step
+
+integerOnly (true/false)
+
+Tableau final (celui qui doit piloter l’input)
+unit	condition	allowDecimal	minQty	step
+carton	(peu importe mark)	true	0.01 (ou 0.25)	0.25 / 0.5
+milliers	markNorm = DZ	true	0.01 (ou 0.25)	0.25 / 0.5
+milliers	markNorm ≠ DZ	false	1	1
+piece	(peu importe mark)	false	1	1
+4.2 “Bloquer à 1” (définition exacte)
+
+Quand unit=milliers et markNorm≠DZ :
+
+l’input passe en mode entier
+
+l’UI refuse . et ,
+
+si l’utilisateur colle/écrit 0,5 ou 0.5 :
+
+l’UI corrige immédiatement vers 1
+
+si l’utilisateur met 0 :
+
+l’UI corrige vers 1
+
+➡️ Résultat : l’utilisateur n’est pas stoppé par un message, mais il ne peut pas rester sur une valeur illégale.
+
+4.3 Changement de MARK ou unité : correction instantanée
+
+Exemple :
+
+unit=milliers, mark=DZ, qty=0.5 (OK)
+
+l’utilisateur change mark → PAQUE
+
+allowDecimal devient false
+
+qty doit devenir entier ≥ 1
+
+UI corrige 0.5 → 1 immédiatement
+
+5) Validation backend (obligatoire même si l’UI est parfaite)
+
+Pourquoi : appels API, bugs UI, valeurs “injectées” ou import.
+
+5.1 Règles backend à refaire systématiquement
+
+Si unit === "milliers" et markNorm !== "DZ" :
+
+qty doit être entière
+
+qty ≥ 1
+
+Si unit === "piece" :
+
+qty entière
+
+qty ≥ 1
+
+Si unit === "carton" :
+
+qty > 0
+
+décimal autorisé
+
+6) Vente : transaction SQL locale (le cœur OFFLINE-FIRST)
+6.1 Numéro facture
+
+Générer invoice_no = YYYYMMDDHHmmss (heure locale PC)
+
+Générer date_iso = new Date().toISOString()
+
+Toutes les lignes d’une facture partagent :
+
+le même invoice_no
+
+le même date_iso
+
+6.2 Stock local : réduction immédiate
+
+À la finalisation :
+
+réduire le stock local pour (product_code, unit) :
+
+stock_qty = stock_qty - qty
+
+accepter décimales pour carton et milliers + DZ
+
+refuser décimales pour piece et milliers + non-DZ
+
+6.3 Enregistrement ventes (local)
+
+Chaque ligne doit contenir au minimum :
+
+date_iso
+
+invoice_no
+
+product_code
+
+client
+
+qty
+
+mark_raw + mark_norm
+
+unit
+
+unit_price_fc_final (toujours)
+
+colonnes tel : vides si vente PC
+
+_uuid (unique stable)
+
+_updated_at
+
+_device_id
+
+seller
+
+7) Impression automatique : print_job + watcher @module.js
+7.1 À la finalisation : créer un print_job
+
+Créer print_job :
+
+invoice_no
+
+template (ex: 80hbs)
+
+payload_json (facture + lignes + devise active + totaux)
+
+status = pending
+
+attempts = 0
+
+created_at
+
+7.2 Watcher dans @module.js
+
+Toutes les 1–2 sec :
+
+prendre pending
+
+passer processing
+
+imprimer
+
+si OK : printed
+
+si KO : error, attempts++, next_retry_at
+
+Important :
+
+l’impression ne doit jamais bloquer la vente
+
+offline → impression OK (si imprimante OK)
+
+8) Sync Google Sheets : queue + worker (batch + retry + idempotence)
+8.1 Tout passe par sync_queue
+
+À la finalisation, déposer au minimum :
+
+sales_append (append lignes facture dans feuille Ventes)
+
+stock_update (mise à jour stock dans feuille unité)
+
+price_history_append (journal prix effectué)
+
+8.2 Batch par facture
+
+Le worker doit regrouper :
+
+par invoice_no
+
+et envoyer un lot cohérent
+
+8.3 Retry + backoff intelligent
+
+si pas Internet : ne rien supprimer, garder pending
+
+si erreur Sheets/Script : attempts++ + backoff
+
+ne pas “spam” la même requête en boucle
+
+8.4 Idempotence (anti doublons)
+
+_uuid doit être écrit dans Sheets
+
+Apps Script doit ignorer une ligne si _uuid existe déjà
+
+sinon retry = doublons
+
+9) Prix / devise : conversion USD→FC + respect devise active lors des modifications
+9.1 Prix par défaut
+
+Si produit a un prix USD :
+
+calculer FC = USD * fx_rate (pour stockage backend)
+
+mais ne pas forcer l’UI à repasser en USD
+
+Si produit a un prix FC :
+
+utiliser FC directement
+
+9.2 Devise active (FC / USD)
+
+Tu gardes activeCurrency côté UI :
+
+si activeCurrency = FC :
+
+input prix en FC
+
+si base USD, tu peux afficher conversion en petit, mais pas switch
+
+si activeCurrency = USD :
+
+input prix en USD
+
+9.3 Si l’utilisateur modifie le prix
+
+si activeCurrency = FC → override_price_fc
+
+si activeCurrency = USD → override_price_usd
+
+Et tu recalcules :
+
+totals en devise active
+
+stockage backend toujours cohérent (FC canonique)
+
+10) Changements attendus dans tes 3 pages
+10.1 SalesPOS.jsx
+
+Doit gérer par ligne :
+
+unit normalisé
+
+markNorm
+
+qtyText + qtyValue
+
+qtyPolicy (allowDecimal/min/step)
+
+Doit appliquer en temps réel :
+
+milliers + non-DZ ⇒ entier min 1 (bloque décimal + corrige)
+
+milliers + DZ ⇒ décimal autorisé
+
+carton ⇒ décimal autorisé
+
+piece ⇒ entier min 1
+
+À Finaliser :
+
+appeler backend finalize
+
+backend fait SQL + crée sync_job + crée print_job
+
+UI affiche OK immédiatement même offline
+
+10.2 SalesDetail.jsx
+
+Afficher :
+
+facture + lignes
+
+prix final + devise active au moment de vente
+
+fx_rate_used
+
+statuts :
+
+Sync pending/synced/error
+
+Print pending/printed/error
+
+10.3 SalesHistory.jsx
+
+Lister factures local :
+
+badge Sync ⏳/✅/⚠️
+
+badge Print ⏳/✅/⚠️
+
+afficher last_error si besoin (debug sans gêner)
+
+11) Règle ultra simple (version “phrase unique”)
+
+Si unit = milliers :
+
+si markNorm = DZ → décimal autorisé (0.25 / 0.5 / 0,50 / 1 / 2 / …)
+
+sinon (PAQUE/BT/PQT/…) → décimal interdit, entier obligatoire, min = 1, bloqué en temps réel
+
+12) Mini check-list de validation (tests rapides)
+
+milliers + DZ + qty 0,50 → accepté → stock -0.5
+
+milliers + DZ + qty 0,25 → accepté
+
+milliers + PAQUE + qty 0,5 → UI corrige instantanément à 1
+
+milliers + BT + qty 0 → UI corrige à 1
+
+piece + qty 0,5 → UI corrige à 1
+
+carton + qty 0,25 → accepté
+
+offline total : finaliser vente → OK, stock local réduit, print_job créé, sync_queue pending  dans @src/ui/pages/SalesPOS.jsx est @src/ui/pages/SalesDetail.jsx est @src/ui/pages/SalesHistory.jsx est @print/module.js est impresion utilise @print/templates/receipt-80.hbs est comprend une chose tres improtant de ne pas confondre sa ameliore tout soit pusiant il doive genere le numero est tou sera syncronise dans sheets 10. À NE PAS FAIRE (risques majeurs)
+
+❌ Ne pas appeler Google Sheets pendant /finalize-sale
+
+❌ Ne pas recalculer tout le stock UI après chaque vente
+
+❌ Ne pas faire de sync ligne par ligne (batch only)
+
+❌ Ne jamais faire de loop bloquante en Node (event loop bloquée) est sa 1) Noms de feuilles Google Sheets (exactement ceux que tu utilises)
+1.1 Feuille des ventes (append)
+
+✅ Nom exact : Ventes
+
+➡️ Chaque ligne d’article vendu (pas une ligne par facture) est ajoutée dans Ventes.
+
+1.2 Feuilles de stock (update Stock initial)
+
+✅ Noms exacts :
+
+Carton (stock pour unité carton)
+
+Milliers (stock pour unité milliers)
+
+Piece (stock pour unité pièce)
+
+➡️ Quand tu vends un produit dans une unité donnée, tu mets à jour le stock dans la feuille correspondante, et tu modifies la colonne Stock initial (ton exemple montre souvent colonne C, mais on ne code pas “C” en dur : on cherche l’en-tête).
+
+1.3 Feuille “prix effectué” (append)
+
+✅ Nom exact : Stock de prix effectué
+
+➡️ Après une vente, tu ajoutes dans cette feuille :
+
+Date
+
+Prix
+
+Numero du produit
+
+Total
+
+Numero de facture
+
+2) Mapping strict : unité → feuille stock (aucune ambiguïté)
+
+Dans ton backend worker (sync), la règle est 100% déterministe :
+
+unit = "carton" → feuille Carton
+
+unit = "milliers" → feuille Milliers
+
+unit = "piece" → feuille Piece
+
+Et les ventes vont toujours dans Ventes, et le journal prix toujours dans Stock de prix effectué.
+
+Tu peux le représenter comme une constante (côté backend) :
+
+const SHEETS = {
+  SALES: "Ventes",
+  PRICE_HISTORY: "Stock de prix effectué",
+  STOCK_BY_UNIT: {
+    carton: "Carton",
+    milliers: "Milliers",
+    piece: "Piece",
+  },
+};
+
+3) OFFLINE-FIRST (rappel) + sync arrière-plan : avec TES feuilles
+3.1 Vente (toujours local SQL)
+
+La vente :
+
+ne dépend jamais de Sheets
+
+se valide toujours en SQL local
+
+réduit le stock local immédiatement
+
+crée des jobs sync_queue (pending)
+
+crée un job print_job (pending)
+
+3.2 Sync Sheets (worker backend)
+
+Le worker lit la queue et pousse vers TES feuilles :
+
+Append dans Ventes
+
+Update stock dans Carton / Milliers / Piece
+
+Append dans Stock de prix effectué

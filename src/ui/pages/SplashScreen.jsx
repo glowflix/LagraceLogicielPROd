@@ -41,12 +41,22 @@ const SplashScreen = () => {
         const licensed = await checkLicense();
 
         // Rediriger avec animation
+        // Conserver la route actuelle si l'utilisateur est déjà authentifié et a une licence
         if (isMounted) {
           setTimeout(() => {
             if (licensed) {
-              navigate('/dashboard');
+              // Vérifier si on vient d'une route spécifique (évite de perdre la page actuelle)
+              const currentPath = window.location.pathname;
+              const validRoutes = ['/dashboard', '/sales', '/products', '/debts', '/users', '/analytics', '/sync', '/settings'];
+              
+              // Si la route actuelle est valide et différente de /, l'utiliser
+              if (currentPath !== '/' && validRoutes.some(route => currentPath.startsWith(route))) {
+                navigate(currentPath, { replace: true });
+              } else {
+                navigate('/dashboard', { replace: true });
+              }
             } else {
-              navigate('/license');
+              navigate('/license', { replace: true });
             }
           }, 800);
         }

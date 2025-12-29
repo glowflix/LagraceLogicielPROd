@@ -2,6 +2,7 @@ import express from 'express';
 import { ratesRepo } from '../../db/repositories/rates.repo.js';
 import { syncRepo } from '../../db/repositories/sync.repo.js';
 import { optionalAuth } from '../middlewares/auth.js';
+import { getSocketIO } from '../socket.js';
 
 const router = express.Router();
 
@@ -42,6 +43,12 @@ router.put('/current', optionalAuth, (req, res) => {
       rate_fc_per_usd: newRate,
       effective_at: new Date().toISOString(),
     });
+
+    // Émettre l'événement WebSocket pour synchronisation temps réel
+    const io = getSocketIO();
+    if (io) {
+      io.emit('rate:updated', { rate: newRate, effective_at: new Date().toISOString() });
+    }
 
     res.json({ success: true, rate: newRate });
   } catch (error) {

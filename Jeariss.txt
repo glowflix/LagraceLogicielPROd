@@ -1,0 +1,312 @@
+Voici une stratégie IA “La Grâce” robuste (offline-first) qui couvre :
+
+l’automatisation du stock (Pièce / Milliers) avec conversion depuis Carton via la colonne “Automatisation Stock”,
+
+un assistant analytique qui répond aux questions,
+
+une interface voix (FR / Swahili / Lingala) qui peut parler pendant l’impression et les actions importantes,
+
+une architecture Python intégrable à ton app (Node/Electron) et fonctionnant hors connexion.
+
+1) Principe clé : IA = “moteur de règles + assistant” (pas un seul bloc)
+
+Pour être fiable en stock, l’IA ne doit pas “inventer” :
+
+Le stock et les conversions doivent être gérés par un moteur déterministe (règles + transactions SQL).
+
+L’IA “conversationnelle” sert à expliquer, résumer, analyser, répondre sur les données, mais ne décide pas seule d’un mouvement de stock sans règles.
+
+Tu obtiens ainsi :
+
+Zéro erreur critique sur le stock.
+
+Un assistant vocal intelligent et utile.
+
+2) Règle d’or sur tes unités
+Objectif demandé
+
+Carton : reste manuel (on ne modifie pas carton par des edits libres automatiques).
+
+Pièce et Milliers : peuvent être automatisés et ajustés automatiquement.
+
+Si une vente ou une modification fait tomber Pièce/Milliers à 0 (ou insuffisant), l’IA peut “ouvrir un carton” si :
+
+le stock Carton > 0
+
+et la colonne Automatisation Stock (dans la ligne Pièce/Milliers) contient un facteur (ex. 50 pièces par carton)
+
+Exemple de ta logique
+
+Automatisation Stock = 50
+
+Pièce stock devient insuffisant
+
+IA fait :
+
+Carton: -1
+
+Pièce: +50
+
+Puis applique la vente demandée (ex: -2)
+
+3) Modèle de données local (SQL) recommandé
+
+Pour que ça marche offline sans perte, il faut des tables “événements” (mouvements) + état courant.
+
+Tables minimales
+
+products
+
+uuid, code, name, mark, etc.
+
+inventory (par produit + unité)
+
+product_uuid
+
+unit ENUM: CARTON|PIECE|MILLIERS
+
+qty (nombre)
+
+updated_at
+
+unit_rules (règles par produit et unité)
+
+product_uuid
+
+unit (PIECE / MILLIERS)
+
+auto_factor = valeur de Automatisation Stock (ex: 50)
+
+auto_enabled (bool)
+
+stock_moves (journal irréversible)
+
+move_id (UUID)
+
+product_uuid
+
+unit
+
+delta (+/-)
+
+reason (SALE|ADJUST|CONVERSION|IMPORT|SYNC)
+
+ref_id (facture, user action, op_id)
+
+created_at
+
+device_id
+
+outbox_ops (sync offline → online)
+
+op_id
+
+type (STOCK_MOVE|SALE|PRODUCT_PATCH|...)
+
+payload JSON
+
+status pending/sent/acked
+
+created_at
+
+Le point critique : on ne synchronise pas un “stock final”, on synchronise des mouvements (deltas) et des ventes, sinon tu vas encore écraser Sheets.
+
+4) Moteur “Auto-Stock” (règles exactes)
+Quand est-ce que ça s’exécute ?
+
+À chaque vente (POS)
+
+À chaque édition stock (sur la page produits) pour Pièce/Milliers
+
+En “surveillance” (job local) : alerte stock bas / rupture
+
+Règle 1 — Interdiction d’auto-modifier Carton sauf conversion
+
+Si l’utilisateur modifie Carton : c’est une action manuelle (OK).
+
+L’IA ne touche Carton automatiquement que dans un scénario de conversion.
+
+Règle 2 — Auto-conversion Pièce/Milliers si insuffisant
+
+Pseudo-logic (transaction SQL) :
+
+// Conceptuel (le code réel sera en Python côté IA)
+function ensure_available(product_uuid, unit, qty_needed):
+  if unit == CARTON: return (manual only)
+
+  factor = unit_rules.auto_factor(product_uuid, unit)
+  if factor is null or factor <= 0: return "no automation"
+
+  current = inventory.qty(product_uuid, unit)
+  if current >= qty_needed: return "ok"
+
+  missing = qty_needed - current
+  cartons_needed = ceil(missing / factor)
+
+  carton_stock = inventory.qty(product_uuid, CARTON)
+  if carton_stock < cartons_needed:
+      return "insufficient_stock" // alerte
+
+  // Conversion
+  decrement CARTON by cartons_needed
+  increment unit by cartons_needed * factor
+
+  return "converted"
+
+
+Ensuite, la vente applique -qty_needed sur l’unité demandée.
+
+Règle 3 — Déclenchement “stock = 0”
+
+Si Pièce/Milliers passe à 0 (ou < seuil), l’IA :
+
+tente conversion si règle activée,
+
+sinon émet une alerte (voix + UI).
+
+5) Le rôle exact de la colonne “Automatisation Stock”
+
+Tu as décrit que la colonne existe dans les feuilles Pièce et Milliers (pas dans Carton). Donc :
+
+Le facteur de conversion appartient à l’unité “petite” :
+
+PIECE.auto_factor = Automatisation Stock
+
+MILLIERS.auto_factor = Automatisation Stock
+
+L’IA utilise ce facteur pour “remplir” l’unité petite lorsqu’un carton est décrémenté.
+
+Si la cellule est vide → automation OFF (donc tout reste manuel).
+
+6) Assistant analytique (Q/A) sur la page Analytics
+Ce que tu veux
+
+“Répond au question”
+
+Explique stock, ventes, tendances, anomalies
+
+Offline
+
+Architecture recommandée (RAG local)
+
+Index local (SQLite + index texte) :
+
+ventes, mouvements, produits, clients, dettes
+
+Moteur de requêtes :
+
+d’abord requêtes SQL déterministes (top produits, marges, ruptures, etc.)
+
+LLM local (optionnel mais puissant) :
+
+reformule réponses, explique, génère rapports
+
+Important :
+
+Les décisions de stock restent règles, pas LLM.
+
+Le LLM sert à expliquer et converser.
+
+7) Voix naturelle (FR / Swahili / Lingala) offline
+Pipeline voix standard
+
+STT (Speech-to-Text) : transformer voix → texte
+
+NLU / Intents : comprendre (“réduis stock”, “imprime facture”, “montre rupture”)
+
+Action : exécuter via règles / services
+
+TTS (Text-to-Speech) : parler naturellement
+
+Stratégie “réaliste” pour langues
+
+Français : excellente qualité possible offline.
+
+Swahili : correct avec modèles multi-langues.
+
+Lingala : support plus rare → stratégie hybride :
+
+commandes courtes + dictionnaire local + fallback français,
+
+ou modèle multi-langue + entraînement vocabulaire (lexique produits / marques).
+
+Événements parlés (dont impression)
+
+Tu veux qu’il parle “au moment de l’impression job”.
+Exemples :
+
+“Facture prête. Impression en cours.”
+
+“Attention : stock faible sur MOSQUITO Familia (10 restants).”
+
+“Conversion automatique : -1 carton, +50 pièces.”
+
+8) Intégration dans ton logiciel (Node/Electron + Python)
+Option recommandée : “Local AI Service”
+
+L’app Electron démarre un processus Python local au lancement.
+
+Communication via HTTP local (FastAPI) ou WebSocket.
+
+Services Python :
+
+/ai/stock/apply (appliquer mouvement, vente, conversion)
+
+/ai/analytics/ask (question → réponse + requêtes SQL)
+
+/ai/voice/stt et /ai/voice/tts (si tu fais tout en local)
+
+/ai/events (push notifications : impression, rupture, sync, etc.)
+
+Offline garanti
+
+Toutes les décisions se font sur SQLite local.
+
+La sync Sheets se fait séparément via outbox_ops quand Internet revient.
+
+9) Sécurité et anti-bug (obligatoire en stock)
+
+Transactions SQL (BEGIN/COMMIT) sur conversion + vente : jamais partiel.
+
+Idempotence : chaque action a un ref_id (facture/op_id) pour empêcher double application.
+
+Audit complet : stock_moves est la vérité historique.
+
+Guardrails :
+
+si auto_factor manquant → pas de conversion
+
+si carton insuffisant → blocage vente ou autorisation “vente négative” selon ta politique
+
+si qty devient négative → alerte + correction contrôlée
+
+10) Plan de construction (pragmatique)
+Phase 1 (robuste et rapide)
+
+Implémenter le moteur Auto-Stock (règles + tables stock_moves + inventory)
+
+Outbox ops pour sync
+
+Alerts UI (sans voix)
+
+Phase 2
+
+Page Analytics : SQL + résumés
+
+Ajout assistant texte
+
+Phase 3
+
+Voix : TTS FR + événements impression
+
+STT + intents (commandes)
+
+Phase 4
+
+Multilingue Swahili + Lingala (lexique + amélioration)
+
+Point important
+
+Ton exemple montre exactement pourquoi il faut basculer vers :
+“mouvements stock + conversion + idempotence + sync par lots”
+et non “écraser stock”.

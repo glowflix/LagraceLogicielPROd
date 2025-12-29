@@ -6,29 +6,340 @@ import { productsRepo } from '../../db/repositories/products.repo.js';
 import { getDb } from '../../db/sqlite.js';
 import { syncRepo } from '../../db/repositories/sync.repo.js';
 import { auditRepo } from '../../db/repositories/audit.repo.js';
+import { printJobsRepo } from '../../db/repositories/print-jobs.repo.js';
 import { authenticate, optionalAuth } from '../middlewares/auth.js';
 import { getPrintDir, getProjectRoot } from '../../core/paths.js';
+import { generateTimestampInvoiceNumber } from '../../core/invoice.js';
+import { normalizeUnit, normalizeMark, validateQtyBackend } from '../../core/qty-rules.js';
+import { getSocketIO } from '../socket.js';
+import { logger } from '../../core/logger.js';
 
 const router = express.Router();
 
 /**
  * POST /api/sales
- * Crée une nouvelle vente
+ * Crée une nouvelle vente (OFFLINE-FIRST)
+ * Pipeline A : Validation + SQL local + sync_queue + print_job
  */
 router.post('/', optionalAuth, (req, res) => {
   try {
-    const saleData = {
-      ...req.body,
+    const db = getDb();
+    const saleData = { ...req.body };
+
+    // 1. Validation et normalisation des quantités selon les règles strictes
+    // IMPORTANT: Récupérer product_id pour chaque item avant la création de la vente
+    if (saleData.items && Array.isArray(saleData.items)) {
+      for (const item of saleData.items) {
+        // CRITIQUE: Normaliser la quantité (0.5 = 0.50 = 0,5 = 0,50)
+        // Gérer tous les formats: convertir toutes les virgules en points
+        let qty = item.qty;
+        if (typeof qty === 'string') {
+          // Remplacer TOUTES les virgules par des points (gérer 0,5, 0,50, etc.)
+          qty = parseFloat(qty.replace(/,/g, '.')) || 0;
+        }
+        qty = Number(qty) || 0;
+        
+        // Vérification de sécurité: la quantité doit être > 0
+        if (qty <= 0) {
+          return res.status(400).json({ 
+            success: false, 
+            error: `Quantité invalide pour produit ${item.product_code}: ${item.qty} → ${qty}`,
+            item: item 
+          });
+        }
+        
+        // Arrondir à 2 décimales pour éviter les problèmes de précision
+        qty = Math.round(qty * 100) / 100;
+        
+        const unitNorm = normalizeUnit(item.unit_level);
+        const markNorm = normalizeMark(item.unit_mark || '');
+        const validation = validateQtyBackend(qty, unitNorm, markNorm);
+        
+        if (!validation.valid) {
+          // Corriger automatiquement si possible
+          if (validation.corrected !== undefined) {
+            qty = validation.corrected;
+          } else {
+            return res.status(400).json({ 
+              success: false, 
+              error: validation.error,
+              item: item 
+            });
+          }
+        }
+        
+        // Récupérer product_id si non fourni
+        if (!item.product_id && item.product_code) {
+          const product = productsRepo.findByCode(item.product_code);
+          if (product) {
+            item.product_id = product.id;
+          } else {
+            // Chercher directement dans la base
+            const dbProduct = db.prepare('SELECT id FROM products WHERE code = ? AND is_active = 1').get(item.product_code);
+            if (dbProduct) {
+              item.product_id = dbProduct.id;
+            } else {
+              return res.status(400).json({ 
+                success: false, 
+                error: `Produit non trouvé: ${item.product_code}`,
+                item: item 
+              });
+            }
+          }
+        }
+        
+        // Mettre à jour la quantité normalisée
+        item.qty = qty;
+        // Recalculer le subtotal avec la quantité normalisée
+        item.subtotal_fc = Math.round((item.unit_price_fc * qty) * 100) / 100;
+        item.subtotal_usd = Math.round((item.unit_price_usd * qty) * 100) / 100;
+      }
+    }
+
+    // CRITIQUE: Recalculer le total à partir des items pour garantir la cohérence
+    // Le frontend peut envoyer total_fc=0 si le calcul n'est pas à jour
+    let recalculatedTotalFC = 0;
+    let recalculatedTotalUSD = 0;
+    if (saleData.items && Array.isArray(saleData.items)) {
+      recalculatedTotalFC = saleData.items.reduce((sum, item) => sum + (item.subtotal_fc || 0), 0);
+      recalculatedTotalUSD = saleData.items.reduce((sum, item) => sum + (item.subtotal_usd || 0), 0);
+      recalculatedTotalFC = Math.round(recalculatedTotalFC * 100) / 100;
+      recalculatedTotalUSD = Math.round(recalculatedTotalUSD * 100) / 100;
+    }
+    
+    // Utiliser le total recalculé si celui envoyé est 0 ou invalide
+    const finalTotalFC = (saleData.total_fc && saleData.total_fc > 0) ? saleData.total_fc : recalculatedTotalFC;
+    const finalTotalUSD = (saleData.total_usd && saleData.total_usd > 0) ? saleData.total_usd : recalculatedTotalUSD;
+    
+    logger.info(`💰 [sales.routes] Calcul des totaux:`);
+    logger.info(`   Total FC envoyé: ${saleData.total_fc || 0}`);
+    logger.info(`   Total USD envoyé: ${saleData.total_usd || 0}`);
+    logger.info(`   Total FC recalculé: ${recalculatedTotalFC}`);
+    logger.info(`   Total USD recalculé: ${recalculatedTotalUSD}`);
+    logger.info(`   Total FC final utilisé: ${finalTotalFC}`);
+    logger.info(`   Total USD final utilisé: ${finalTotalUSD}`);
+
+    // 2. Générer numéro de facture au format YYYYMMDDHHmmss
+    const invoiceNumber = saleData.invoice_number || generateTimestampInvoiceNumber();
+    const dateISO = saleData.sold_at || new Date().toISOString();
+
+    // 3. Préparer les données de vente
+    const finalSaleData = {
+      ...saleData,
+      invoice_number: invoiceNumber,
+      sold_at: dateISO,
       seller_user_id: req.user?.id || null,
       seller_name: req.user?.username || req.body.seller_name || 'System',
+      total_fc: finalTotalFC,
+      total_usd: finalTotalUSD,
+      paid_fc: saleData.isDebt ? 0 : finalTotalFC,
+      paid_usd: saleData.isDebt ? 0 : finalTotalUSD,
+      origin: 'LOCAL',
     };
 
-    const sale = salesRepo.create(saleData);
+    // 4. Créer la vente en SQL local (transaction)
+    const sale = salesRepo.create(finalSaleData);
 
-    // Ajouter à l'outbox
-    syncRepo.addToOutbox('sales', sale.invoice_number, 'upsert', sale);
+    // 5. Créer les jobs de synchronisation (arrière-plan)
+    // 5.1 Sync ventes → feuille "Ventes"
+    syncRepo.addToOutbox('sales', sale.invoice_number, 'upsert', {
+      invoice_number: sale.invoice_number,
+      date_iso: dateISO,
+      ...sale,
+    });
 
-    // Audit log
+    // 5.2 Sync stock → feuilles Carton/Milliers/Piece
+    // CRITIQUE: Envoyer la valeur ABSOLUE du stock local pour écraser la colonne C dans Sheets
+    // Au lieu d'un changement relatif, on envoie le stock exact après réduction (ex: 6.5 au lieu de -1)
+    if (sale.items && Array.isArray(sale.items)) {
+      for (const item of sale.items) {
+        // CRITIQUE: Normaliser unit_level pour correspondre au format attendu par Sheets (CARTON, MILLIER, PIECE)
+        const unitNorm = normalizeUnit(item.unit_level);
+        let unitLevelForSync;
+        if (unitNorm === 'carton') {
+          unitLevelForSync = 'CARTON';
+        } else if (unitNorm === 'milliers') {
+          unitLevelForSync = 'MILLIER'; // Sheets utilise MILLIER (singulier) pour la feuille Milliers
+        } else if (unitNorm === 'piece') {
+          unitLevelForSync = 'PIECE';
+        } else {
+          // Fallback: utiliser tel quel si déjà en majuscules
+          unitLevelForSync = (item.unit_level || '').toString().toUpperCase();
+          // Normaliser MILLIERS → MILLIER
+          if (unitLevelForSync === 'MILLIERS') {
+            unitLevelForSync = 'MILLIER';
+          }
+        }
+        
+        const sheetName = unitNorm === 'carton' ? 'Carton' 
+                        : unitNorm === 'milliers' ? 'Milliers'
+                        : unitNorm === 'piece' ? 'Piece' : null;
+        
+        if (sheetName && unitLevelForSync) {
+          // CRITIQUE: Récupérer le stock ABSOLU après la réduction depuis la base de données
+          // Le stock a déjà été réduit dans sales.repo.js, on récupère la valeur finale
+          logger.info(`📦 [sales.routes] Récupération du stock ABSOLU pour synchronisation:`);
+          logger.info(`   Produit: ${item.product_code} (${item.product_name})`);
+          logger.info(`   Product ID dans item: ${item.product_id || '(non fourni)'}`);
+          logger.info(`   Unité normalisée: ${unitLevelForSync}, Mark: '${item.unit_mark || ''}'`);
+          logger.info(`   Quantité vendue: ${item.qty}`);
+          
+          const db = getDb();
+          
+          // CRITIQUE: Récupérer product_id depuis la base si non fourni dans item
+          let productId = item.product_id;
+          if (!productId && item.product_code) {
+            logger.info(`   🔍 Product ID manquant, recherche depuis product_code: ${item.product_code}`);
+            const product = db.prepare('SELECT id FROM products WHERE code = ? AND is_active = 1 LIMIT 1').get(item.product_code);
+            if (product) {
+              productId = product.id;
+              logger.info(`   ✅ Product ID trouvé: ${productId}`);
+            } else {
+              logger.error(`❌ [sales.routes] ERREUR: Produit non trouvé pour code: ${item.product_code}`);
+              logger.error(`   ⚠️ Impossible d'ajouter update_stock à l'outbox pour ce produit`);
+              continue; // Passer au produit suivant
+            }
+          }
+          
+          if (!productId) {
+            logger.error(`❌ [sales.routes] ERREUR: Product ID non disponible pour ${item.product_code}`);
+            logger.error(`   ⚠️ Impossible d'ajouter update_stock à l'outbox pour ce produit`);
+            continue; // Passer au produit suivant
+          }
+          
+          logger.info(`   🔍 Requête SQL: SELECT stock_initial FROM product_units WHERE product_id = ${productId} AND unit_level = '${unitLevelForSync}' AND unit_mark = '${item.unit_mark || ''}'`);
+          
+          const unitStock = db.prepare(`
+            SELECT stock_initial, stock_current FROM product_units
+            WHERE product_id = ? AND unit_level = ? AND unit_mark = ?
+          `).get(productId, unitLevelForSync, item.unit_mark || '');
+          
+          if (!unitStock) {
+            logger.error(`❌ [sales.routes] ERREUR: Unité non trouvée dans product_units!`);
+            logger.error(`   Product ID: ${productId}, Code produit: ${item.product_code}, Unité: ${unitLevelForSync}, Mark: '${item.unit_mark || ''}'`);
+            logger.error(`   ⚠️ Impossible d'ajouter update_stock à l'outbox pour ce produit`);
+            continue; // Passer au produit suivant
+          }
+          
+          const stockAbsolute = unitStock.stock_initial || 0;
+          const stockCurrent = unitStock.stock_current || 0;
+          const stockAbsoluteRounded = Math.round(stockAbsolute * 100) / 100; // Arrondir à 2 décimales
+          
+          logger.info(`   ✅ Stock trouvé:`);
+          logger.info(`      stock_initial (absolu): ${stockAbsolute} → arrondi: ${stockAbsoluteRounded}`);
+          logger.info(`      stock_current: ${stockCurrent}`);
+          
+          // CRITIQUE: Convertir product_code en chaîne pour correspondre à Sheets (gérer nombre vs chaîne)
+          const productCodeForSync = String(item.product_code || '').trim();
+          
+          const stockUpdatePayload = {
+            product_code: productCodeForSync, // CRITIQUE: Toujours envoyer comme chaîne pour correspondre à Sheets
+            unit_level: unitLevelForSync, // CRITIQUE: Utiliser la version normalisée (CARTON, MILLIER, PIECE)
+            unit_mark: item.unit_mark || '',
+            stock_absolute: stockAbsoluteRounded, // CRITIQUE: Valeur ABSOLUE du stock local (ex: 6.5)
+            invoice_number: sale.invoice_number,
+          };
+          
+          logger.info(`   Code produit pour sync: '${productCodeForSync}' (type: ${typeof productCodeForSync})`);
+          
+          // LOG: Ajout à l'outbox pour synchronisation
+          logger.info(`📦 [sales.routes] Ajout update_stock à l'outbox:`);
+          logger.info(`   Produit: ${item.product_code} (${item.product_name})`);
+          logger.info(`   Unité: ${unitLevelForSync}, Mark: ${item.unit_mark || '(vide)'}`);
+          logger.info(`   Feuille Sheets: ${sheetName}`);
+          logger.info(`   Stock ABSOLU local: ${stockAbsoluteRounded} (sera écrit dans colonne C)`);
+          logger.info(`   Invoice: ${sale.invoice_number}`);
+          logger.info(`   ⚠️ Cette valeur ABSOLUE écrasera la colonne C dans Sheets`);
+          
+          syncRepo.addToOutbox('product_units', `${item.product_code}_${unitLevelForSync}_${item.unit_mark || ''}`, 'update_stock', stockUpdatePayload);
+          
+          logger.info(`   ✅ Opération ajoutée à l'outbox (sera synchronisée dans les 10 secondes)`);
+        } else {
+          logger.warn(`⚠️ [sales.routes] Impossible d'ajouter update_stock à l'outbox:`);
+          logger.warn(`   Produit: ${item.product_code}, Unité: ${item.unit_level}`);
+          logger.warn(`   sheetName: ${sheetName}, unitLevelForSync: ${unitLevelForSync}`);
+        }
+      }
+    }
+
+    // 5.3 Sync prix effectué → feuille "Stock de prix effectué"
+    if (sale.items && Array.isArray(sale.items)) {
+      for (const item of sale.items) {
+        syncRepo.addToOutbox('price_logs', `${sale.invoice_number}_${item.product_code}`, 'append', {
+          at: dateISO,
+          product_code: item.product_code,
+          unit_level: item.unit_level,
+          unit_mark: item.unit_mark,
+          unit_price_fc: item.unit_price_fc,
+          line_total_fc: item.subtotal_fc,
+          invoice_number: sale.invoice_number,
+        });
+      }
+    }
+
+    // 6. Créer le job d'impression (pending)
+    const printPayload = {
+      template: saleData.printCurrency === 'USD' ? 'receipt-80' : 'receipt-80',
+      copies: 1,
+      data: {
+        factureNum: sale.invoice_number,
+        numero: sale.invoice_number,
+        client: sale.client_name || '',
+        taux: sale.rate_fc_per_usd || 2800,
+        dateISO: dateISO,
+        lignes: (sale.items || []).map(item => ({
+          code: item.product_code,
+          nom: item.product_name,
+          unite: normalizeUnit(item.unit_level) || 'piece',
+          mark: normalizeMark(item.unit_mark || ''),
+          qty: item.qty,
+          qteLabel: item.qty_label || item.qty.toString(),
+          puFC: item.unit_price_fc,
+          totalFC: item.subtotal_fc,
+          puUSD: item.unit_price_usd || 0,
+          totalUSD: item.subtotal_usd || 0,
+        })),
+        totalFC: sale.total_fc,
+        totalUSD: sale.total_usd,
+        printCurrency: saleData.printCurrency || 'FC',
+        entreprise: {
+          nom: "ALIMENTATION LA GRACE",
+          rccm: "CD/KIS/RCCM 22-A-00172",
+          impot: "A220883T",
+          tel: "+243 896 885 373 / +243 819 082 637",
+          adresse: "Avenue Lac Tanganyika, Makiso, Kisangani, R.D.Congo"
+        },
+        meta: {
+          vendeur: sale.seller_name || '',
+          payment_mode: sale.payment_mode,
+          autoDette: saleData.autoDette || sale.payment_mode === 'dette',
+          currency: saleData.printCurrency || 'FC',
+          ventesUsd: saleData.printCurrency === 'USD',
+        }
+      }
+    };
+
+    // Créer le job dans la base de données
+    printJobsRepo.create({
+      invoice_number: sale.invoice_number,
+      template: 'receipt-80',
+      payload_json: printPayload,
+    });
+
+    // Écrire aussi le fichier JSON pour le watcher (compatibilité avec print/module.js)
+    try {
+      const printDir = getPrintDir();
+      // Utiliser le numéro de facture pour un nom de fichier unique et identifiable
+      const safeInvoiceNumber = sale.invoice_number.replace(/[^\w\-]/g, '_');
+      const jobFile = path.join(printDir, `job-${safeInvoiceNumber}-${Date.now()}.json`);
+      fs.writeFileSync(jobFile, JSON.stringify(printPayload, null, 2), 'utf-8');
+      console.log(`[PRINT] Job créé: ${path.basename(jobFile)}`);
+    } catch (printError) {
+      // Ne pas bloquer la vente si l'écriture du fichier échoue (OFFLINE-FIRST)
+      console.warn('[PRINT] Erreur écriture fichier print job:', printError);
+    }
+
+    // 7. Audit log
     if (req.user) {
       auditRepo.log(req.user.id, 'sale_create', {
         invoice_number: sale.invoice_number,
@@ -36,8 +347,39 @@ router.post('/', optionalAuth, (req, res) => {
       });
     }
 
-    res.json({ success: true, sale });
+    // 8. Émettre l'événement WebSocket pour synchronisation temps réel et AI LaGrace
+    const io = getSocketIO();
+    if (io) {
+      // Émettre l'événement de vente créée avec toutes les infos pour l'AI
+      const saleEvent = {
+        ...sale,
+        invoice_number: sale.invoice_number,
+        factureNum: sale.invoice_number,
+        client: sale.client_name || '',
+        customer: sale.client_name || '',
+        total_fc: sale.total_fc,
+        total_usd: sale.total_usd,
+        totalFC: sale.total_fc,
+        totalUSD: sale.total_usd,
+        seller: sale.seller_name || '',
+        vendeur: sale.seller_name || '',
+        items_count: (sale.items || []).length,
+        timestamp: new Date().toISOString()
+      };
+      io.emit('sale:created', saleEvent);
+      io.emit('sale:finalized', saleEvent); // Alias pour l'AI
+      logger.info(`🤖 [AI] Événement sale:created émis pour ${sale.invoice_number}`);
+    }
+
+    // 9. Réponse immédiate (OFFLINE-FIRST)
+    res.json({ 
+      success: true, 
+      sale,
+      sync_status: 'pending',
+      print_status: 'pending',
+    });
   } catch (error) {
+    console.error('Erreur création vente:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -45,6 +387,11 @@ router.post('/', optionalAuth, (req, res) => {
 /**
  * GET /api/sales
  * Liste les ventes avec filtres
+ * Query params:
+ *   - from: Date de début (ISO)
+ *   - to: Date de fin (ISO)
+ *   - status: Filtrer par statut exact
+ *   - exclude_status: Exclure un statut (ex: 'pending' pour exclure les ventes en attente)
  */
 router.get('/', optionalAuth, (req, res) => {
   try {
@@ -52,6 +399,7 @@ router.get('/', optionalAuth, (req, res) => {
       from: req.query.from,
       to: req.query.to,
       status: req.query.status,
+      exclude_status: req.query.exclude_status, // IMPORTANT: Exclure les ventes pending par défaut
     };
 
     const sales = salesRepo.findAll(filters);
@@ -147,6 +495,12 @@ router.post('/:invoice/void', authenticate, (req, res) => {
       invoice_number: sale.invoice_number,
       reason,
     });
+
+    // Émettre l'événement WebSocket
+    const io = getSocketIO();
+    if (io) {
+      io.emit('sale:updated', sale);
+    }
 
     res.json({ success: true, sale });
   } catch (error) {

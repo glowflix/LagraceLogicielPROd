@@ -3,9 +3,37 @@ import { usersRepo } from '../../db/repositories/users.repo.js';
 import { syncRepo } from '../../db/repositories/sync.repo.js';
 import { auditRepo } from '../../db/repositories/audit.repo.js';
 import { authenticate, optionalAuth } from '../middlewares/auth.js';
+import { requireAdmin, requirePermission } from '../middlewares/permissions.js';
 import { logger } from '../../core/logger.js';
 
 const router = express.Router();
+
+/**
+ * GET /api/users/debug
+ * Endpoint de debug pour voir tous les utilisateurs (sans filtres)
+ */
+router.get('/debug', (req, res) => {
+  try {
+    const users = usersRepo.findAll();
+    const debugInfo = users.map(u => ({
+      id: u.id,
+      username: u.username,
+      phone: u.phone || 'N/A',
+      is_active: u.is_active,
+      is_admin: u.is_admin,
+      has_password: !!u.password_hash
+    }));
+    
+    res.json({
+      total: users.length,
+      users: debugInfo,
+      message: users.length === 0 ? 'Aucun utilisateur dans la base. Vérifiez la synchronisation depuis Google Sheets.' : 'Utilisateurs trouvés'
+    });
+  } catch (error) {
+    logger.error('Erreur debug users:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
 
 /**
  * GET /api/users
@@ -35,6 +63,28 @@ router.get('/', optionalAuth, (req, res) => {
 });
 
 /**
+ * GET /api/users/me
+ * Récupère l'utilisateur actuellement connecté
+ */
+router.get('/me', authenticate, (req, res) => {
+  try {
+    if (!req.user || !req.user.id) {
+      return res.status(401).json({ success: false, error: 'Utilisateur non authentifié' });
+    }
+    
+    const user = usersRepo.findById(req.user.id);
+    if (!user) {
+      return res.status(404).json({ success: false, error: 'Utilisateur non trouvé' });
+    }
+    
+    res.json(user);
+  } catch (error) {
+    logger.error('❌ Erreur GET /api/users/me:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
  * GET /api/users/:id
  * Récupère un utilisateur par ID
  */
@@ -53,8 +103,9 @@ router.get('/:id', optionalAuth, (req, res) => {
 /**
  * POST /api/users
  * Crée un nouvel utilisateur
+ * STRICTEMENT ADMIN UNIQUEMENT
  */
-router.post('/', authenticate, async (req, res) => {
+router.post('/', authenticate, requireAdmin, async (req, res) => {
   try {
     const { username, password, phone, is_admin, is_active, device_brand, profile_url, expo_push_token } = req.body;
 
@@ -123,10 +174,20 @@ router.post('/', authenticate, async (req, res) => {
 /**
  * PUT /api/users/:id
  * Met à jour un utilisateur
+ * STRICTEMENT ADMIN UNIQUEMENT (sauf pour /me qui est géré séparément)
  */
 router.put('/:id', authenticate, async (req, res) => {
   try {
     const userId = parseInt(req.params.id);
+    const currentUserId = req.user?.id;
+    
+    // Si l'utilisateur essaie de modifier un autre utilisateur que lui-même, vérifier qu'il est admin
+    if (userId !== currentUserId && (!req.userRole || req.userRole !== 'ADMIN')) {
+      return res.status(403).json({ 
+        success: false, 
+        error: 'Seuls les administrateurs peuvent modifier les comptes utilisateurs' 
+      });
+    }
     const { username, password, phone, is_admin, is_active, is_vendeur, is_gerant_stock, can_manage_products, device_brand, profile_url, expo_push_token } = req.body;
 
     const existing = usersRepo.findById(userId);

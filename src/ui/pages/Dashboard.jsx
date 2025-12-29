@@ -14,10 +14,11 @@ import {
 import { useStore } from '../store/useStore';
 import axios from 'axios';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3030';
+// En mode proxy Vite, utiliser des chemins relatifs pour compatibilité LAN
+const API_URL = import.meta.env.DEV ? '' : (import.meta.env.VITE_API_URL || '');
 
 const Dashboard = () => {
-  const { loadSales } = useStore();
+  const { loadSales, loadProducts } = useStore();
   const [stats, setStats] = useState({
     todaySalesFC: 0,
     todaySalesUSD: 0,
@@ -31,7 +32,10 @@ const Dashboard = () => {
 
   useEffect(() => {
     loadDashboardData();
-  }, []);
+    // Charger aussi les ventes et produits pour avoir les données à jour
+    loadSales().catch(err => console.error('Erreur chargement ventes:', err));
+    loadProducts().catch(err => console.error('Erreur chargement produits:', err));
+  }, [loadSales, loadProducts]);
 
   const loadDashboardData = async () => {
     try {

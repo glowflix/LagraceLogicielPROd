@@ -1,5 +1,6 @@
 import express from 'express';
 import { syncRepo } from '../../db/repositories/sync.repo.js';
+import { outboxRepo } from '../../db/repositories/outbox.repo.js';
 import { syncWorker } from '../../services/sync/sync.worker.js';
 import { authenticate, optionalAuth } from '../middlewares/auth.js';
 
@@ -7,12 +8,43 @@ const router = express.Router();
 
 /**
  * GET /api/sync/status
- * Récupère le statut de synchronisation
+ * Récupère le statut de synchronisation (ancien + nouveau système)
  */
 router.get('/status', optionalAuth, (req, res) => {
   try {
-    const status = syncRepo.getStatus();
-    res.json(status);
+    const legacyStatus = syncRepo.getStatus();
+    const outboxStats = outboxRepo.getStats();
+    
+    res.json({
+      ...legacyStatus,
+      outbox: outboxStats,
+      hasPendingChanges: outboxStats.totalPending > 0 || outboxStats.stockMovesPending > 0
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * GET /api/sync/outbox
+ * Récupère les statistiques détaillées de l'outbox PRO
+ */
+router.get('/outbox', optionalAuth, (req, res) => {
+  try {
+    const stats = outboxRepo.getStats();
+    const pendingOps = outboxRepo.getPendingOperations(null, 20); // 20 dernières opérations pending
+    
+    res.json({
+      success: true,
+      stats,
+      recentPending: pendingOps.map(op => ({
+        op_id: op.op_id,
+        op_type: op.op_type,
+        entity_code: op.entity_code,
+        status: op.status,
+        created_at: op.created_at
+      }))
+    });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -21,15 +53,31 @@ router.get('/status', optionalAuth, (req, res) => {
 /**
  * POST /api/sync/push-now
  * Force un push vers Google Sheets
+ * Utilise le nouveau système d'outbox PRO
  */
 router.post('/push-now', authenticate, async (req, res) => {
+  const { logger } = await import('../../core/logger.js');
   try {
-    await syncWorker.pushPending();
-    const status = syncRepo.getStatus();
+    logger.info('📤 [SYNC/PUSH-NOW] Début push manuel demandé');
+    
+    // Utiliser le nouveau système d'outbox
+    await syncWorker.pushPendingOperations();
+    
+    // Garder aussi l'ancien système pour compatibilité
+    if (typeof syncWorker.pushPending === 'function') {
+      await syncWorker.pushPending();
+    }
+    
+    const legacyStatus = syncRepo.getStatus();
+    const outboxStats = outboxRepo.getStats();
+    
+    logger.info('✅ [SYNC/PUSH-NOW] Push terminé');
+    
     res.json({
       success: true,
       message: 'Push terminé',
-      status,
+      status: legacyStatus,
+      outbox: outboxStats
     });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });

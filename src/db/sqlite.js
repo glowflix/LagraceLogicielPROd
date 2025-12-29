@@ -167,7 +167,7 @@ function applyMigrations() {
     // Générer des UUIDs pour les produits existants qui n'en ont pas
     if (productsUuidAdded || columnExists('products', 'uuid')) {
       try {
-        const productsWithoutUuid = database.prepare('SELECT id FROM products WHERE uuid IS NULL OR uuid = ""').all();
+        const productsWithoutUuid = database.prepare("SELECT id FROM products WHERE uuid IS NULL OR uuid = '' OR LENGTH(TRIM(uuid)) = 0").all();
         
         if (productsWithoutUuid.length > 0) {
           logger.info(`[MIGRATION] Génération de ${productsWithoutUuid.length} UUID(s) pour les produits existants...`);
@@ -188,7 +188,7 @@ function applyMigrations() {
     // Générer des UUIDs pour les unités existantes qui n'en ont pas
     if (unitsUuidAdded || columnExists('product_units', 'uuid')) {
       try {
-        const unitsWithoutUuid = database.prepare('SELECT id FROM product_units WHERE uuid IS NULL OR uuid = ""').all();
+        const unitsWithoutUuid = database.prepare("SELECT id FROM product_units WHERE uuid IS NULL OR uuid = '' OR LENGTH(TRIM(uuid)) = 0").all();
         
         if (unitsWithoutUuid.length > 0) {
           logger.info(`[MIGRATION] Génération de ${unitsWithoutUuid.length} UUID(s) pour les unités existantes...`);
@@ -209,7 +209,7 @@ function applyMigrations() {
     // Générer des UUIDs pour les utilisateurs existants qui n'en ont pas
     if (usersUuidAdded || columnExists('users', 'uuid')) {
       try {
-        const usersWithoutUuid = database.prepare('SELECT id FROM users WHERE uuid IS NULL OR uuid = ""').all();
+        const usersWithoutUuid = database.prepare("SELECT id FROM users WHERE uuid IS NULL OR uuid = '' OR LENGTH(TRIM(uuid)) = 0").all();
         
         if (usersWithoutUuid.length > 0) {
           logger.info(`[MIGRATION] Génération de ${usersWithoutUuid.length} UUID(s) pour les utilisateurs existants...`);
@@ -230,7 +230,7 @@ function applyMigrations() {
     // Générer des UUIDs pour les ventes existantes qui n'en ont pas
     if (salesUuidAdded || columnExists('sales', 'uuid')) {
       try {
-        const salesWithoutUuid = database.prepare('SELECT id FROM sales WHERE uuid IS NULL OR uuid = ""').all();
+        const salesWithoutUuid = database.prepare("SELECT id FROM sales WHERE uuid IS NULL OR uuid = '' OR LENGTH(TRIM(uuid)) = 0").all();
         
         if (salesWithoutUuid.length > 0) {
           logger.info(`[MIGRATION] Génération de ${salesWithoutUuid.length} UUID(s) pour les ventes existantes...`);
@@ -251,7 +251,7 @@ function applyMigrations() {
     // Générer des UUIDs pour les items de vente existants qui n'en ont pas
     if (saleItemsUuidAdded || columnExists('sale_items', 'uuid')) {
       try {
-        const itemsWithoutUuid = database.prepare('SELECT id FROM sale_items WHERE uuid IS NULL OR uuid = ""').all();
+        const itemsWithoutUuid = database.prepare("SELECT id FROM sale_items WHERE uuid IS NULL OR uuid = '' OR LENGTH(TRIM(uuid)) = 0").all();
         
         if (itemsWithoutUuid.length > 0) {
           logger.info(`[MIGRATION] Génération de ${itemsWithoutUuid.length} UUID(s) pour les items de vente existants...`);

@@ -3,6 +3,10 @@ import ReactDOM from 'react-dom/client';
 import { BrowserRouter } from 'react-router-dom';
 import App from './App';
 import './index.css';
+import { setupAxiosInterceptors } from './utils/axiosConfig';
+
+// Configurer les intercepteurs axios pour ajouter automatiquement le token
+setupAxiosInterceptors();
 
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>

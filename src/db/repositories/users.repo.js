@@ -21,6 +21,73 @@ export class UsersRepository {
   }
 
   /**
+   * Trouve un utilisateur par numéro de téléphone (colonne Numero dans Sheets)
+   */
+  findByPhone(phone) {
+    const db = getDb();
+    try {
+      if (!phone || phone.trim() === '') return null;
+      // Normaliser le numéro (supprimer espaces, garder seulement chiffres)
+      const normalizedPhone = phone.trim().replace(/\s+/g, '');
+      return db.prepare('SELECT * FROM users WHERE phone = ? AND is_active = 1').get(normalizedPhone);
+    } catch (error) {
+      logger.error('Erreur findByPhone:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Trouve un utilisateur par username ou phone (pour login flexible)
+   * IMPORTANT: Ne filtre PAS par is_active ici, car verifyPassword le fait après
+   */
+  findByUsernameOrPhone(identifier) {
+    const db = getDb();
+    try {
+      if (!identifier || identifier.trim() === '') return null;
+      const normalized = identifier.trim();
+      
+      // Essayer d'abord par username (sans filtre is_active pour voir tous les utilisateurs)
+      let user = db.prepare('SELECT * FROM users WHERE username = ?').get(normalized);
+      if (user) {
+        logger.debug(`🔍 [findByUsernameOrPhone] Trouvé par username: ${user.username}`);
+        return user;
+      }
+      
+      // Sinon essayer par phone (normaliser en supprimant les espaces, tirets, etc.)
+      const normalizedPhone = normalized.replace(/[\s\-\(\)]/g, '');
+      
+      // Essayer d'abord avec le numéro exact
+      user = db.prepare('SELECT * FROM users WHERE phone = ?').get(normalizedPhone);
+      if (user) {
+        logger.debug(`🔍 [findByUsernameOrPhone] Trouvé par phone exact: ${user.phone}`);
+        return user;
+      }
+      
+      // Si pas trouvé, essayer avec tous les utilisateurs et comparer en normalisant
+      // (pour gérer les cas où le numéro pourrait être stocké avec des espaces)
+      const allUsers = db.prepare('SELECT * FROM users').all();
+      for (const u of allUsers) {
+        if (u.phone) {
+          const userPhoneNormalized = String(u.phone).replace(/[\s\-\(\)]/g, '');
+          if (userPhoneNormalized === normalizedPhone) {
+            logger.debug(`🔍 [findByUsernameOrPhone] Trouvé par phone normalisé: ${u.phone} (recherché: ${normalizedPhone})`);
+            return u;
+          }
+        }
+      }
+      
+      // Log pour debug : afficher tous les numéros disponibles
+      logger.warn(`⚠️ [findByUsernameOrPhone] Aucun utilisateur trouvé pour: ${normalized.substring(0, 3)}***`);
+      logger.debug(`📋 [findByUsernameOrPhone] Numéros disponibles dans la base: ${allUsers.map(u => u.phone || 'N/A').join(', ')}`);
+      
+      return null;
+    } catch (error) {
+      logger.error('❌ [findByUsernameOrPhone] Erreur:', error);
+      throw error;
+    }
+  }
+
+  /**
    * Trouve un utilisateur par UUID
    */
   findByUuid(uuid) {
@@ -81,24 +148,70 @@ export class UsersRepository {
 
   /**
    * Vérifie le mot de passe
+   * Accepte soit username soit phone (numéro) comme identifiant
    */
-  async verifyPassword(username, password) {
+  async verifyPassword(identifier, password) {
     try {
-      const user = this.findByUsername(username);
-      if (!user) {
+      if (!identifier || !password) {
+        logger.warn(`⚠️ [verifyPassword] Identifiant ou mot de passe manquant`);
         return null;
       }
 
-      const isValid = await bcrypt.compare(password, user.password_hash);
-      if (!isValid) {
+      // Chercher par username ou phone
+      const user = this.findByUsernameOrPhone(identifier);
+      
+      if (!user) {
+        logger.warn(`⚠️ [verifyPassword] Aucun utilisateur trouvé pour: ${identifier.substring(0, 3)}***`);
+        // Log tous les utilisateurs disponibles pour debug (seulement en dev)
+        if (process.env.NODE_ENV === 'development') {
+          const allUsers = this.findAll();
+          logger.debug(`📋 [verifyPassword] Utilisateurs disponibles: ${allUsers.map(u => `${u.username} (phone: ${u.phone || 'N/A'})`).join(', ')}`);
+        }
         return null;
       }
+
+      logger.info(`✅ [verifyPassword] Utilisateur trouvé: ${user.username} (ID: ${user.id}, Phone: ${user.phone || 'N/A'})`);
+
+      // Vérifier que l'utilisateur est actif
+      if (!user.is_active || user.is_active === 0) {
+        logger.warn(`⚠️ [verifyPassword] Tentative de connexion avec compte inactif: ${identifier}`);
+        return null;
+      }
+
+      // CRITIQUE: Si l'utilisateur n'a pas de password_hash, créer un hash avec le mot de passe par défaut
+      if (!user.password_hash || user.password_hash.trim() === '') {
+        logger.warn(`⚠️ [verifyPassword] Utilisateur ${user.username} n'a pas de password_hash, création avec mot de passe par défaut`);
+        const defaultPassword = 'changeme123';
+        const defaultHash = await bcrypt.hash(defaultPassword, 10);
+        
+        // Mettre à jour le password_hash dans la base
+        const db = getDb();
+        db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(defaultHash, user.id);
+        
+        // Vérifier le mot de passe fourni avec le hash par défaut
+        const isValid = await bcrypt.compare(password, defaultHash);
+        if (!isValid) {
+          logger.warn(`⚠️ [verifyPassword] Mot de passe incorrect pour: ${identifier} (mot de passe par défaut attendu: changeme123)`);
+          return null;
+        }
+        
+        logger.info(`✅ [verifyPassword] Mot de passe par défaut créé et validé pour: ${user.username}`);
+      } else {
+        // Vérifier le mot de passe normalement
+        const isValid = await bcrypt.compare(password, user.password_hash);
+        if (!isValid) {
+          logger.warn(`⚠️ [verifyPassword] Mot de passe incorrect pour: ${identifier}`);
+          return null;
+        }
+      }
+
+      logger.info(`✅ [verifyPassword] Connexion réussie: ${user.username}`);
 
       // Retourner l'utilisateur sans le hash
       const { password_hash, ...userWithoutHash } = user;
       return userWithoutHash;
     } catch (error) {
-      logger.error('Erreur verifyPassword:', error);
+      logger.error('❌ [verifyPassword] Erreur:', error);
       throw error;
     }
   }
@@ -361,6 +474,7 @@ export class UsersRepository {
           u.is_vendeur,
           u.is_gerant_stock,
           u.can_manage_products,
+          u.password_hash,
           u.created_at,
           u.updated_at,
           GROUP_CONCAT(

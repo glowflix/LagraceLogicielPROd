@@ -1666,3 +1666,9 @@ Audit
 Si vous voulez, je peux aussi vous donner :
 
 la structure du menu (sidebar) par rôles (admin/vendeur/caissier), est utilise le id de sheets ici https://docs.google.com/spreadsheets/d/111HH1yCU1gB5Uovbcach_Olz1e3hL4-J0z8QGHoOEtI/edit?gid=344303493#gid=344303493 en genera un code.gs complet qui sera avec tout le code complet pro de appscript qui utilise le strcyure est nom de feille site la 
+
+
+
+
+
+

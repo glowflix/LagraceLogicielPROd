@@ -5,7 +5,8 @@ import { useStore } from '../store/useStore';
 import axios from 'axios';
 import { format } from 'date-fns';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3030';
+// En mode proxy Vite, utiliser des chemins relatifs pour compatibilité LAN
+const API_URL = import.meta.env.DEV ? '' : (import.meta.env.VITE_API_URL || '');
 
 const DebtsPage = () => {
   const [debts, setDebts] = useState([]);

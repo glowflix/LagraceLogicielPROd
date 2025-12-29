@@ -1,21 +1,25 @@
 import { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { ArrowLeft, Printer, XCircle, Package, Calendar, User, Phone, DollarSign, CheckCircle } from 'lucide-react';
+import { ArrowLeft, Printer, XCircle, Package, Calendar, User, Phone, DollarSign, CheckCircle, Cloud, CloudOff, AlertCircle } from 'lucide-react';
 import axios from 'axios';
 import { format } from 'date-fns';
 import { fr } from 'date-fns/locale';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3030';
+// En mode proxy Vite, utiliser des chemins relatifs pour compatibilité LAN
+const API_URL = import.meta.env.DEV ? '' : (import.meta.env.VITE_API_URL || '');
 
 const SalesDetail = () => {
   const { invoice } = useParams();
   const navigate = useNavigate();
   const [sale, setSale] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [syncStatus, setSyncStatus] = useState(null);
+  const [printStatus, setPrintStatus] = useState(null);
 
   useEffect(() => {
     loadSale();
+    loadStatuses();
   }, [invoice]);
 
   const loadSale = async () => {
@@ -26,6 +30,27 @@ const SalesDetail = () => {
       console.error('Erreur chargement vente:', error);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const loadStatuses = async () => {
+    try {
+      // Charger le statut de sync depuis sync_outbox
+      const syncResponse = await axios.get(`${API_URL}/api/sync/status`);
+      const syncData = syncResponse.data?.pending || [];
+      const saleSync = syncData.find(s => s.entity_id === invoice);
+      setSyncStatus(saleSync ? { status: saleSync.status || 'pending' } : { status: sale?.synced_at ? 'synced' : 'none' });
+
+      // Charger le statut d'impression depuis print_jobs
+      try {
+        const printResponse = await axios.get(`${API_URL}/api/print/status/${invoice}`);
+        setPrintStatus(printResponse.data || { status: 'none' });
+      } catch {
+        // Si l'endpoint n'existe pas encore, utiliser le statut par défaut
+        setPrintStatus({ status: 'none' });
+      }
+    } catch (error) {
+      console.error('Erreur chargement statuts:', error);
     }
   };
 
@@ -177,6 +202,86 @@ const SalesDetail = () => {
                 <span className="font-medium text-gray-300">Mode de paiement:</span>{' '}
                 {sale.payment_mode === 'cash' ? 'Cash' : 'Dette'}
               </p>
+              <p>
+                <span className="font-medium text-gray-300">Taux:</span>{' '}
+                {sale.rate_fc_per_usd?.toLocaleString() || 0} FC/USD
+              </p>
+            </div>
+          </div>
+        </div>
+
+        {/* Statuts Sync et Print */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+          {/* Statut Sync */}
+          <div className="p-4 glass rounded-lg border border-gray-700">
+            <div className="flex items-center gap-2 mb-2">
+              {syncStatus?.status === 'synced' || sale?.synced_at ? (
+                <CheckCircle className="w-5 h-5 text-green-400" />
+              ) : syncStatus?.status === 'error' ? (
+                <AlertCircle className="w-5 h-5 text-red-400" />
+              ) : (
+                <CloudOff className="w-5 h-5 text-yellow-400" />
+              )}
+              <h3 className="text-sm font-semibold text-gray-300">Synchronisation Google Sheets</h3>
+            </div>
+            <div className="space-y-1">
+              <p className="text-xs text-gray-400">
+                Statut: <span className={`font-semibold ${
+                  syncStatus?.status === 'synced' || sale?.synced_at ? 'text-green-400' :
+                  syncStatus?.status === 'error' ? 'text-red-400' :
+                  'text-yellow-400'
+                }`}>
+                  {syncStatus?.status === 'synced' || sale?.synced_at ? 'Synchronisé' :
+                   syncStatus?.status === 'error' ? 'Erreur' :
+                   syncStatus?.status === 'pending' ? 'En attente' : 'Non synchronisé'}
+                </span>
+              </p>
+              {sale?.synced_at && (
+                <p className="text-xs text-gray-500">
+                  Le {format(new Date(sale.synced_at), 'dd/MM/yyyy à HH:mm', { locale: fr })}
+                </p>
+              )}
+            </div>
+          </div>
+
+          {/* Statut Print */}
+          <div className="p-4 glass rounded-lg border border-gray-700">
+            <div className="flex items-center gap-2 mb-2">
+              {printStatus?.status === 'printed' ? (
+                <CheckCircle className="w-5 h-5 text-green-400" />
+              ) : printStatus?.status === 'error' ? (
+                <AlertCircle className="w-5 h-5 text-red-400" />
+              ) : printStatus?.status === 'processing' ? (
+                <Printer className="w-5 h-5 text-blue-400 animate-pulse" />
+              ) : (
+                <Printer className="w-5 h-5 text-yellow-400" />
+              )}
+              <h3 className="text-sm font-semibold text-gray-300">Impression</h3>
+            </div>
+            <div className="space-y-1">
+              <p className="text-xs text-gray-400">
+                Statut: <span className={`font-semibold ${
+                  printStatus?.status === 'printed' ? 'text-green-400' :
+                  printStatus?.status === 'error' ? 'text-red-400' :
+                  printStatus?.status === 'processing' ? 'text-blue-400' :
+                  'text-yellow-400'
+                }`}>
+                  {printStatus?.status === 'printed' ? 'Imprimé' :
+                   printStatus?.status === 'error' ? 'Erreur' :
+                   printStatus?.status === 'processing' ? 'En cours...' :
+                   printStatus?.status === 'pending' ? 'En attente' : 'Non imprimé'}
+                </span>
+              </p>
+              {printStatus?.printed_at && (
+                <p className="text-xs text-gray-500">
+                  Le {format(new Date(printStatus.printed_at), 'dd/MM/yyyy à HH:mm', { locale: fr })}
+                </p>
+              )}
+              {printStatus?.last_error && (
+                <p className="text-xs text-red-400">
+                  Erreur: {printStatus.last_error}
+                </p>
+              )}
             </div>
           </div>
         </div>

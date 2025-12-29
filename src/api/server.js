@@ -5,11 +5,13 @@ import { Server } from 'socket.io';
 import path from 'path';
 import { existsSync } from 'fs';
 import { resolve } from 'path';
+import os from 'os';
 import { ensureDirs, getDbPath, getProjectRoot } from '../core/paths.js';
 import { logger } from '../core/logger.js';
 import { initSchema, getDb } from '../db/sqlite.js';
 import { syncWorker } from '../services/sync/sync.worker.js';
 import { createPrinterModule } from '../../print/module.js';
+import { setSocketIO } from './socket.js';
 import dotenv from 'dotenv';
 
 // Routes
@@ -22,6 +24,7 @@ import usersRoutes from './routes/users.routes.js';
 import ratesRoutes from './routes/rates.routes.js';
 import analyticsRoutes from './routes/analytics.routes.js';
 import syncRoutes from './routes/sync.routes.js';
+import licenseRoutes from './routes/license.routes.js';
 // printRoutes remplacé par printerModule.router
 
 // Middlewares
@@ -56,12 +59,63 @@ const io = new Server(httpServer, {
     origin: '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
   },
+  // Configuration pour éviter les déconnexions automatiques
+  pingTimeout: 60000,      // Temps d'attente avant de considérer la connexion comme morte (60s)
+  pingInterval: 25000,     // Intervalle entre les pings (25s)
+  // Permettre les reconnexions
+  allowEIO3: true,
+  // Améliorer la gestion des connexions
+  transports: ['websocket', 'polling'],
+  // Timeout pour les connexions
+  connectTimeout: 45000,
 });
 
-const PORT = process.env.PORT || 3030;
+// Partager l'instance Socket.IO avec les routes
+setSocketIO(io);
 
-// Middlewares
-app.use(cors());
+const PORT = process.env.PORT || 3030;
+const HOST = process.env.HOST || '0.0.0.0'; // Écouter sur toutes les interfaces réseau
+
+// Middlewares - CORS configuré pour accepter LAN et localhost
+// Permet aux PC clients du réseau local de se connecter sans erreur
+app.use(cors({
+  origin: (origin, cb) => {
+    // Permettre les outils non-navigateur (pas d'origine) - important pour Electron
+    if (!origin) return cb(null, true);
+    
+    // Permettre localhost et 127.0.0.1
+    if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
+      return cb(null, true);
+    }
+    
+    // Permettre toutes les IPs privées (LAN)
+    // IPv4 privées: 192.168.x.x, 10.x.x.x, 172.16.x.x - 172.31.x.x
+    const privateIPPatterns = [
+      /^https?:\/\/192\.168\.\d+\.\d+/,
+      /^https?:\/\/10\.\d+\.\d+\.\d+/,
+      /^https?:\/\/172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+/,
+    ];
+    
+    if (privateIPPatterns.some(pattern => pattern.test(origin))) {
+      return cb(null, true);
+    }
+    
+    // Permettre toutes les origines en dev/production pour compatibilité totale
+    return cb(null, true);
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'Cache-Control',
+    'Pragma',
+    'Expires',
+    'X-Requested-With',
+  ],
+}));
+
+app.options('*', cors()); // Gérer les requêtes preflight OPTIONS
 app.use(express.json());
 app.use(express.static('dist')); // Servir l'UI React buildée
 
@@ -95,6 +149,7 @@ app.use('/api/users', usersRoutes);
 app.use('/api/rates', ratesRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/sync', syncRoutes);
+app.use('/api/license', licenseRoutes);
 
 // Module d'impression (remplace printRoutes)
 const printerModule = createPrinterModule({
@@ -108,16 +163,128 @@ const printerModule = createPrinterModule({
 // Intégrer les routes d'impression du module
 app.use('/api/print', printerModule.router);
 
-// WebSocket
+// WebSocket - Synchronisation temps réel multi-utilisateurs
 io.on('connection', (socket) => {
-  logger.info(`Client connecté: ${socket.id}`);
+  logger.info(`Client connecté: ${socket.id} depuis ${socket.handshake.address}`);
 
   socket.on('disconnect', () => {
     logger.info(`Client déconnecté: ${socket.id}`);
   });
 
-  // Écouter les événements de vente
+  // Écouter les événements de vente et diffuser à tous les clients
   socket.on('sale:created', (sale) => {
+    logger.info(`Vente créée: ${sale.invoice_number || sale.id}`);
+    io.emit('sale:created', sale); // Diffuser à tous les clients connectés
+  });
+
+  // Synchronisation des produits
+  socket.on('product:updated', (product) => {
+    logger.info(`Produit mis à jour: ${product.code || product.id}`);
+    socket.broadcast.emit('product:updated', product); // Diffuser aux autres clients
+  });
+
+  // Synchronisation du stock
+  socket.on('stock:updated', (stock) => {
+    logger.info(`Stock mis à jour: produit ${stock.product_id}`);
+    socket.broadcast.emit('stock:updated', stock); // Diffuser aux autres clients
+  });
+
+  // Synchronisation des ventes
+  socket.on('sale:updated', (sale) => {
+    logger.info(`Vente mise à jour: ${sale.invoice_number || sale.id}`);
+    socket.broadcast.emit('sale:updated', sale); // Diffuser aux autres clients
+  });
+
+  // Synchronisation des dettes
+  socket.on('debt:updated', (debt) => {
+    logger.info(`Dette mise à jour: ${debt.id}`);
+    socket.broadcast.emit('debt:updated', debt); // Diffuser aux autres clients
+  });
+
+  // Synchronisation des taux de change
+  socket.on('rate:updated', (rate) => {
+    logger.info(`Taux de change mis à jour: ${rate.rate}`);
+    socket.broadcast.emit('rate:updated', rate); // Diffuser aux autres clients
+  });
+
+  // === AI LaGrace Events - LOGS DÉTAILLÉS ===
+  
+  // AI connectée
+  socket.on('ai:connected', (data) => {
+    logger.info(`🤖 ========================================`);
+    logger.info(`🤖 AI LaGrace CONNECTÉE!`);
+    logger.info(`🤖 Socket ID: ${socket.id}`);
+    logger.info(`🤖 Data: ${JSON.stringify(data)}`);
+    logger.info(`🤖 ========================================`);
+    socket.aiConnected = true;
+    socket.aiData = data;
+    // Notifier les clients que l'AI est disponible
+    io.emit('ai:status', { connected: true, ...data });
+  });
+
+  // AI déconnexion
+  socket.on('ai:disconnecting', (data) => {
+    logger.info(`🤖 AI LaGrace se déconnecte: ${JSON.stringify(data)}`);
+    socket.aiConnected = false;
+    io.emit('ai:status', { connected: false });
+  });
+  
+  // AI ping (keepalive)
+  socket.on('ping', (data) => {
+    // Répondre avec pong pour confirmer la connexion
+    socket.emit('pong', { timestamp: new Date().toISOString() });
+  });
+
+  // AI demande d'impression
+  socket.on('ai:print_request', (data) => {
+    logger.info(`🖨️ AI demande impression: ${JSON.stringify(data)}`);
+    // Rediriger vers le module d'impression
+    socket.emit('print:started', { source: 'ai', ...data });
+    // La logique d'impression réelle est dans le module print
+  });
+
+  // AI requête stock
+  socket.on('ai:stock_request', async (data, callback) => {
+    try {
+      const db = getDb();
+      const { product } = data;
+      const result = db.prepare(`
+        SELECT p.code, p.label, p.brand, s.quantity, p.sell_price
+        FROM products p
+        LEFT JOIN stock s ON p.id = s.product_id
+        WHERE UPPER(p.code) LIKE ? OR UPPER(p.label) LIKE ?
+        LIMIT 1
+      `).get(`%${product.toUpperCase()}%`, `%${product.toUpperCase()}%`);
+      
+      if (callback) callback({ success: true, data: result });
+    } catch (error) {
+      logger.error('AI stock request error:', error);
+      if (callback) callback({ success: false, error: error.message });
+    }
+  });
+
+  // AI requête ventes
+  socket.on('ai:sales_request', async (data, callback) => {
+    try {
+      const db = getDb();
+      const today = new Date().toISOString().split('T')[0];
+      const result = db.prepare(`
+        SELECT COUNT(*) as count, 
+               COALESCE(SUM(total_cdf), 0) as total_cdf,
+               COALESCE(SUM(total_usd), 0) as total_usd
+        FROM sales WHERE DATE(created_at) = ?
+      `).get(today);
+      
+      if (callback) callback({ success: true, data: result });
+    } catch (error) {
+      logger.error('AI sales request error:', error);
+      if (callback) callback({ success: false, error: error.message });
+    }
+  });
+
+  // Notifier l'AI des nouvelles ventes
+  socket.on('sale:created', (sale) => {
+    // Notifier tous les clients y compris l'AI
     io.emit('sale:created', sale);
   });
 });
@@ -144,11 +311,28 @@ app.get('*', (req, res, next) => {
 app.use(notFound);
 app.use(errorHandler);
 
-// Démarrer le serveur
-httpServer.listen(PORT, () => {
-  logger.info(`🚀 Serveur démarré sur http://localhost:${PORT}`);
+// Démarrer le serveur avec gestion d'erreur pour port déjà utilisé
+httpServer.listen(PORT, HOST, () => {
+  const networkInterfaces = os.networkInterfaces();
+  const addresses = [];
+  
+  // Collecter toutes les adresses IP disponibles
+  Object.keys(networkInterfaces).forEach((interfaceName) => {
+    networkInterfaces[interfaceName].forEach((iface) => {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        addresses.push(`http://${iface.address}:${PORT}`);
+      }
+    });
+  });
+  
+  logger.info(`🚀 Serveur démarré sur http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`);
+  if (addresses.length > 0) {
+    logger.info(`🌐 Accessible sur le réseau local:`);
+    addresses.forEach(addr => logger.info(`   - ${addr}`));
+  }
   logger.info(`📁 Base de données: ${getDbPath()}`);
   logger.info(`✅ API disponible sur http://localhost:${PORT}/api`);
+  logger.info(`🔌 WebSocket disponible pour synchronisation temps réel`);
   
   // Démarrer le worker de synchronisation en arrière-plan (non-bloquant)
   if (process.env.GOOGLE_SHEETS_WEBAPP_URL) {
@@ -167,6 +351,22 @@ httpServer.listen(PORT, () => {
   printerModule.start();
   logger.info('🖨️  Module d\'impression démarré');
   logger.info(`📁 Dossier impression: ${path.join(getProjectRoot(), 'printer')}`);
+});
+
+// Gestion d'erreur pour port déjà utilisé
+httpServer.on('error', (error) => {
+  if (error.code === 'EADDRINUSE') {
+    logger.error(`❌ Erreur: Le port ${PORT} est déjà utilisé.`);
+    logger.error(`💡 Solutions:`);
+    logger.error(`   1. Arrêter l'autre processus utilisant le port ${PORT}`);
+    logger.error(`   2. Utiliser un autre port en définissant la variable d'environnement PORT (ex: PORT=3031)`);
+    logger.error(`   3. Sur Windows, exécuter: netstat -ano | findstr :${PORT} pour trouver le PID`);
+    logger.error(`   4. Puis tuer le processus: taskkill /PID <PID> /F`);
+    process.exit(1);
+  } else {
+    logger.error('❌ Erreur serveur:', error);
+    process.exit(1);
+  }
 });
 
 // Gestion des erreurs

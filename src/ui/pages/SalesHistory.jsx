@@ -1,12 +1,13 @@
 import { useEffect, useState, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Search, Receipt, Printer, Eye, Calendar, ChevronLeft, ChevronRight, Package, X, ChevronDown, ChevronUp, Clock, DollarSign, User } from 'lucide-react';
+import { Search, Receipt, Printer, Eye, Calendar, ChevronLeft, ChevronRight, Package, X, ChevronDown, ChevronUp, Clock, DollarSign, User, Cloud, CloudOff, CheckCircle, AlertCircle } from 'lucide-react';
 import { useStore } from '../store/useStore';
 import axios from 'axios';
 import { format, startOfMonth, endOfMonth, parseISO, getHours, getMinutes } from 'date-fns';
 import { fr } from 'date-fns/locale';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3030';
+// En mode proxy Vite, utiliser des chemins relatifs pour compatibilité LAN
+const API_URL = import.meta.env.DEV ? '' : (import.meta.env.VITE_API_URL || '');
 
 /**
  * Convertit unit_level en texte lisible
@@ -51,6 +52,7 @@ const SalesHistory = () => {
   const [saleDetails, setSaleDetails] = useState(null);
   const [loadingDetails, setLoadingDetails] = useState(false);
   const [expandedItems, setExpandedItems] = useState(false);
+  const [printStatuses, setPrintStatuses] = useState({});
 
   // Par défaut, afficher le mois actuel
   const today = new Date();
@@ -69,12 +71,98 @@ const SalesHistory = () => {
     }
   }, [searchQuery, searchAllMonths]);
 
+  // Grouper les ventes par (client_name, invoice_number) et limiter à 50
+  const uniqueSales = useMemo(() => {
+    // IMPORTANT: Filtrer les ventes avec status='pending' (ne pas les afficher)
+    // Ces ventes sont en attente de synchronisation et ne doivent pas apparaître dans l'historique
+    let salesToProcess = sales.filter((sale) => sale.status !== 'pending');
+    
+    // D'abord, filtrer par mois si recherche globale désactivée
+    if (!searchQuery || !searchAllMonths) {
+      const startOfSelectedMonth = startOfMonth(currentDisplayDate);
+      const endOfSelectedMonth = endOfMonth(currentDisplayDate);
+      const startTime = startOfSelectedMonth.getTime();
+      const endTime = endOfSelectedMonth.getTime();
+
+      salesToProcess = salesToProcess.filter((sale) => {
+        if (!sale.sold_at) return false;
+        const saleDate = parseISO(sale.sold_at).getTime();
+        return saleDate >= startTime && saleDate <= endTime;
+      });
+    }
+
+    // Appliquer le filtre de recherche
+    const filtered = salesToProcess.filter(
+      (sale) =>
+        sale.invoice_number.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        (sale.client_name &&
+          sale.client_name.toLowerCase().includes(searchQuery.toLowerCase()))
+    );
+
+    // Grouper par (client_name, invoice_number)
+    const groupedMap = new Map();
+    
+    filtered.forEach((sale) => {
+      const key = `${sale.client_name || 'Sans nom'}_${sale.invoice_number}`;
+      
+      if (!groupedMap.has(key)) {
+        groupedMap.set(key, {
+          ...sale,
+          itemCount: 1,
+          duplicateCount: 1
+        });
+      } else {
+        const existing = groupedMap.get(key);
+        const existingDate = parseISO(existing.sold_at).getTime();
+        const currentDate = parseISO(sale.sold_at).getTime();
+        
+        if (currentDate > existingDate) {
+          groupedMap.set(key, {
+            ...sale,
+            itemCount: existing.itemCount + 1,
+            duplicateCount: existing.duplicateCount + 1
+          });
+        } else {
+          existing.duplicateCount = (existing.duplicateCount || 1) + 1;
+        }
+      }
+    });
+
+    // Convertir en tableau et trier par date (plus récent en premier)
+    const uniqueSalesArray = Array.from(groupedMap.values()).sort(
+      (a, b) => parseISO(b.sold_at).getTime() - parseISO(a.sold_at).getTime()
+    );
+
+    // Limiter à 50 ventes uniques
+    return uniqueSalesArray.slice(0, 50);
+  }, [sales, searchQuery, currentDisplayDate, searchAllMonths]);
+
   // Charger les détails de la vente sélectionnée
   useEffect(() => {
     if (selectedSale) {
       loadSaleDetails(selectedSale.invoice_number);
     }
   }, [selectedSale]);
+
+  // Charger les statuts d'impression pour toutes les ventes
+  useEffect(() => {
+    const loadPrintStatuses = async () => {
+      if (uniqueSales.length === 0) return;
+      const statuses = {};
+      for (const sale of uniqueSales.slice(0, 50)) {
+        try {
+          const response = await axios.get(`${API_URL}/api/print/status/${sale.invoice_number}`);
+          statuses[sale.invoice_number] = response.data;
+        } catch {
+          statuses[sale.invoice_number] = { status: 'none' };
+        }
+      }
+      setPrintStatuses(statuses);
+    };
+    if (!loading && uniqueSales.length > 0) {
+      loadPrintStatuses();
+    }
+  }, [uniqueSales, loading]);
 
   const loadSalesData = async () => {
     setLoading(true);
@@ -152,70 +240,6 @@ const SalesHistory = () => {
     setCurrentDisplayDate(selectedDate);
     setSearchAllMonths(false);
   };
-
-  // Grouper les ventes par (client_name, invoice_number) et limiter à 50
-  const uniqueSales = useMemo(() => {
-    // D'abord, filtrer par mois si recherche globale désactivée
-    let salesToProcess = sales;
-    
-    if (!searchQuery || !searchAllMonths) {
-      const startOfSelectedMonth = startOfMonth(currentDisplayDate);
-      const endOfSelectedMonth = endOfMonth(currentDisplayDate);
-      const startTime = startOfSelectedMonth.getTime();
-      const endTime = endOfSelectedMonth.getTime();
-
-      salesToProcess = sales.filter((sale) => {
-        if (!sale.sold_at) return false;
-        const saleDate = parseISO(sale.sold_at).getTime();
-        return saleDate >= startTime && saleDate <= endTime;
-      });
-    }
-
-    // Appliquer le filtre de recherche
-    const filtered = salesToProcess.filter(
-      (sale) =>
-        sale.invoice_number.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        (sale.client_name &&
-          sale.client_name.toLowerCase().includes(searchQuery.toLowerCase()))
-    );
-
-    // Grouper par (client_name, invoice_number)
-    const groupedMap = new Map();
-    
-    filtered.forEach((sale) => {
-      const key = `${sale.client_name || 'Sans nom'}_${sale.invoice_number}`;
-      
-      if (!groupedMap.has(key)) {
-        groupedMap.set(key, {
-          ...sale,
-          itemCount: 1,
-          duplicateCount: 1
-        });
-      } else {
-        const existing = groupedMap.get(key);
-        const existingDate = parseISO(existing.sold_at).getTime();
-        const currentDate = parseISO(sale.sold_at).getTime();
-        
-        if (currentDate > existingDate) {
-          groupedMap.set(key, {
-            ...sale,
-            itemCount: existing.itemCount + 1,
-            duplicateCount: existing.duplicateCount + 1
-          });
-        } else {
-          existing.duplicateCount = (existing.duplicateCount || 1) + 1;
-        }
-      }
-    });
-
-    // Convertir en tableau et trier par date (plus récent en premier)
-    const uniqueSalesArray = Array.from(groupedMap.values()).sort(
-      (a, b) => parseISO(b.sold_at).getTime() - parseISO(a.sold_at).getTime()
-    );
-
-    // Limiter à 50 ventes uniques
-    return uniqueSalesArray.slice(0, 50);
-  }, [sales, searchQuery, currentDisplayDate, searchAllMonths]);
 
   // Calculer les statistiques du mois
   const monthStats = useMemo(() => {
@@ -431,6 +455,68 @@ const SalesHistory = () => {
                           ? 'Annulé'
                           : 'En attente'}
                       </span>
+                      {/* Badge Sync */}
+                      <span
+                        className={`badge ${
+                          sale.synced_at
+                            ? 'badge-success'
+                            : 'badge-warning'
+                        }`}
+                        title={sale.synced_at ? `Synchronisé le ${format(new Date(sale.synced_at), 'dd/MM/yyyy HH:mm', { locale: fr })}` : 'En attente de synchronisation'}
+                      >
+                        {sale.synced_at ? (
+                          <>
+                            <Cloud className="w-3 h-3 inline mr-1" />
+                            Sync
+                          </>
+                        ) : (
+                          <>
+                            <CloudOff className="w-3 h-3 inline mr-1" />
+                            Sync
+                          </>
+                        )}
+                      </span>
+                      {/* Badge Print */}
+                      {(() => {
+                        const printStatus = printStatuses[sale.invoice_number];
+                        const status = printStatus?.status || 'none';
+                        return (
+                          <span
+                            className={`badge ${
+                              status === 'printed'
+                                ? 'badge-success'
+                                : status === 'error'
+                                ? 'badge-error'
+                                : status === 'processing'
+                                ? 'badge-info'
+                                : 'badge-warning'
+                            }`}
+                            title={
+                              status === 'printed' ? 'Imprimé' :
+                              status === 'error' ? `Erreur: ${printStatus?.last_error || ''}` :
+                              status === 'processing' ? 'En cours d\'impression...' :
+                              'En attente d\'impression'
+                            }
+                          >
+                            {status === 'printed' ? (
+                              <>
+                                <CheckCircle className="w-3 h-3 inline mr-1" />
+                                Print
+                              </>
+                            ) : status === 'error' ? (
+                              <>
+                                <AlertCircle className="w-3 h-3 inline mr-1" />
+                                Print
+                              </>
+                            ) : (
+                              <>
+                                <Printer className="w-3 h-3 inline mr-1" />
+                                Print
+                              </>
+                            )}
+                          </span>
+                        );
+                      })()}
                     </div>
                     <div className="flex items-center gap-4 text-sm text-gray-400">
                       <span className="flex items-center gap-1">

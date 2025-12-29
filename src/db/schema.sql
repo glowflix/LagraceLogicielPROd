@@ -65,8 +65,8 @@ CREATE TABLE IF NOT EXISTS product_units (
   product_id INTEGER NOT NULL,
   unit_level TEXT NOT NULL,
   unit_mark TEXT NOT NULL,
-  stock_initial REAL NOT NULL DEFAULT 0,
-  stock_current REAL NOT NULL DEFAULT 0,
+  stock_initial REAL NOT NULL DEFAULT 0,  -- SOURCE DE VÉRITÉ: Correspond à la colonne C dans Sheets
+  stock_current REAL NOT NULL DEFAULT 0,  -- DOIT être synchronisé avec stock_initial (même valeur)
   purchase_price_usd REAL NOT NULL DEFAULT 0,
   sale_price_fc REAL NOT NULL DEFAULT 0,
   sale_price_usd REAL NOT NULL DEFAULT 0,
@@ -214,7 +214,7 @@ CREATE TABLE IF NOT EXISTS price_logs (
 );
 
 -- =========================
--- SYNC OUTBOX (local -> Sheets)
+-- SYNC OUTBOX (local -> Sheets) - LEGACY TABLE
 -- =========================
 CREATE TABLE IF NOT EXISTS sync_outbox (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -230,6 +230,63 @@ CREATE TABLE IF NOT EXISTS sync_outbox (
 );
 
 CREATE INDEX IF NOT EXISTS idx_outbox_pending ON sync_outbox(status, entity);
+
+-- =========================
+-- SYNC OPERATIONS (Outbox PRO avec idempotence)
+-- =========================
+-- Système d'opérations offline-first avec:
+-- - op_id UUID pour idempotence (évite doublons côté Sheets)
+-- - Déduplication des patches produit (last-write-wins)
+-- - Mouvements de stock par deltas (jamais valeur absolue)
+-- =========================
+CREATE TABLE IF NOT EXISTS sync_operations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  op_id TEXT NOT NULL UNIQUE,     -- UUID unique pour idempotence
+  op_type TEXT NOT NULL,          -- PRODUCT_PATCH|STOCK_MOVE|SALE|DEBT|RATE
+  entity_uuid TEXT NOT NULL,      -- UUID de l'entité concernée (product, sale, etc.)
+  entity_code TEXT,               -- Code produit, numéro facture, etc. (pour lookup)
+  payload_json TEXT NOT NULL,     -- Données de l'opération
+  device_id TEXT,                 -- ID du device source
+  status TEXT NOT NULL DEFAULT 'pending', -- pending|sent|acked|error
+  tries INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  sent_at TEXT,                   -- Date d'envoi réussie
+  acked_at TEXT                   -- Date de confirmation Sheets
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_ops_pending ON sync_operations(status, op_type);
+CREATE INDEX IF NOT EXISTS idx_sync_ops_entity ON sync_operations(entity_uuid, op_type, status);
+CREATE INDEX IF NOT EXISTS idx_sync_ops_opid ON sync_operations(op_id);
+
+-- =========================
+-- STOCK MOVES (Historique des mouvements de stock)
+-- =========================
+-- Table séparée pour tracer tous les mouvements de stock
+-- Permet de reconstruire le stock à tout moment
+-- =========================
+CREATE TABLE IF NOT EXISTS stock_moves (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  move_id TEXT NOT NULL UNIQUE,   -- UUID unique pour idempotence
+  product_uuid TEXT NOT NULL,     -- UUID du produit
+  product_code TEXT NOT NULL,     -- Code produit pour lookup
+  unit_level TEXT NOT NULL,       -- CARTON|MILLIER|PIECE
+  unit_mark TEXT DEFAULT '',      -- Mark de l'unité
+  delta REAL NOT NULL,            -- Mouvement (+50, -3, etc.)
+  reason TEXT NOT NULL,           -- adjustment|sale|void|inventory|correction
+  reference_id TEXT,              -- UUID de la vente, ajustement, etc.
+  stock_before REAL,              -- Stock avant le mouvement
+  stock_after REAL,               -- Stock après le mouvement
+  device_id TEXT,                 -- Device source
+  synced INTEGER NOT NULL DEFAULT 0, -- 0=pending, 1=synced
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  synced_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_stock_moves_product ON stock_moves(product_uuid, unit_level, unit_mark);
+CREATE INDEX IF NOT EXISTS idx_stock_moves_pending ON stock_moves(synced, created_at);
+CREATE INDEX IF NOT EXISTS idx_stock_moves_reason ON stock_moves(reason, created_at);
 
 -- =========================
 -- AUDIT
@@ -334,6 +391,9 @@ BEGIN
   END;
 END;
 
+-- Supprimer le trigger existant s'il existe (pour permettre la mise à jour)
+DROP TRIGGER IF EXISTS trg_sale_items_require_unit;
+
 CREATE TRIGGER IF NOT EXISTS trg_sale_items_require_unit
 BEFORE INSERT ON sale_items
 BEGIN
@@ -345,13 +405,15 @@ BEGIN
       -- Si la vente vient de Sheets, autoriser (pas de vérification stricte)
       SELECT origin FROM sales WHERE id = NEW.sale_id
     ) = 'SHEETS'
-    THEN 1 -- Autoriser pour Sheets
+    THEN 1 -- Autoriser pour Sheets (même si product_id est NULL ou unité n'existe pas)
+    WHEN NEW.product_id IS NULL
+    THEN 1 -- Autoriser si product_id est NULL (pour compatibilité avec ventes historiques)
     WHEN (
       -- Pour les ventes locales, vérifier que l'unité existe
       SELECT COUNT(*) FROM product_units
       WHERE product_id = NEW.product_id
         AND unit_level = NEW.unit_level
-        AND unit_mark  = NEW.unit_mark
+        AND unit_mark  = COALESCE(NEW.unit_mark, '')
     ) = 0
     THEN RAISE(ABORT, 'Unité inconnue pour ce produit (unit_level/unit_mark)')
     ELSE 1 -- Autoriser si l'unité existe
@@ -361,15 +423,27 @@ END;
 -- =========================
 -- STOCK AUTO: INSERT/UPDATE/DELETE sale_items
 -- IMPORTANT: Ne décrémente PAS le stock pour les ventes venant de Sheets (déjà vendues)
+-- CRITIQUE: Réduit stock_initial ET stock_current pour éviter la double réduction
+-- 
+-- RÈGLE PROFESSIONNELLE:
+-- - stock_initial = Source de vérité (correspond à la colonne C dans Sheets)
+-- - stock_current = Même valeur que stock_initial (synchronisé automatiquement)
+-- - Les deux colonnes doivent TOUJOURS être modifiées ensemble
+-- - Le stock n'est réduit QU'UNE SEULE FOIS par le trigger (pas de double réduction)
+-- - La réduction se fait directement avec la quantité vendue (sans auto_stock_factor)
 -- =========================
+DROP TRIGGER IF EXISTS trg_sale_items_stock_decrease_ai;
 CREATE TRIGGER IF NOT EXISTS trg_sale_items_stock_decrease_ai
 AFTER INSERT ON sale_items
 BEGIN
   -- Ne décrémenter le stock QUE si la vente n'est PAS venue de Sheets
   -- Les ventes SHEETS sont déjà des ventes passées, le stock a déjà été décrémenté
+  -- CRITIQUE: Réduire stock_initial ET stock_current pour correspondre à Sheets (colonne C)
   UPDATE product_units
-  SET stock_current = stock_current - NEW.qty,
-      last_update   = datetime('now')
+  SET stock_initial = stock_initial - NEW.qty,
+      stock_current = stock_current - NEW.qty,
+      updated_at = datetime('now'),
+      last_update = datetime('now')
   WHERE product_id = NEW.product_id
     AND unit_level = NEW.unit_level
     AND unit_mark  = NEW.unit_mark
@@ -380,13 +454,17 @@ BEGIN
     );
 END;
 
+DROP TRIGGER IF EXISTS trg_sale_items_stock_adjust_au;
 CREATE TRIGGER IF NOT EXISTS trg_sale_items_stock_adjust_au
 AFTER UPDATE OF qty, unit_level, unit_mark, product_id ON sale_items
 BEGIN
   -- Restore OLD (seulement si pas SHEETS)
+  -- CRITIQUE: Restaurer stock_initial ET stock_current
   UPDATE product_units
-  SET stock_current = stock_current + OLD.qty,
-      last_update   = datetime('now')
+  SET stock_initial = stock_initial + OLD.qty,
+      stock_current = stock_current + OLD.qty,
+      updated_at = datetime('now'),
+      last_update = datetime('now')
   WHERE product_id = OLD.product_id
     AND unit_level = OLD.unit_level
     AND unit_mark  = OLD.unit_mark
@@ -397,9 +475,12 @@ BEGIN
     );
 
   -- Apply NEW (seulement si pas SHEETS)
+  -- CRITIQUE: Réduire stock_initial ET stock_current
   UPDATE product_units
-  SET stock_current = stock_current - NEW.qty,
-      last_update   = datetime('now')
+  SET stock_initial = stock_initial - NEW.qty,
+      stock_current = stock_current - NEW.qty,
+      updated_at = datetime('now'),
+      last_update = datetime('now')
   WHERE product_id = NEW.product_id
     AND unit_level = NEW.unit_level
     AND unit_mark  = NEW.unit_mark
@@ -410,13 +491,17 @@ BEGIN
     );
 END;
 
+DROP TRIGGER IF EXISTS trg_sale_items_stock_restore_ad;
 CREATE TRIGGER IF NOT EXISTS trg_sale_items_stock_restore_ad
 AFTER DELETE ON sale_items
 BEGIN
   -- Restaurer le stock seulement si la vente n'était PAS venue de Sheets
+  -- CRITIQUE: Restaurer stock_initial ET stock_current
   UPDATE product_units
-  SET stock_current = stock_current + OLD.qty,
-      last_update   = datetime('now')
+  SET stock_initial = stock_initial + OLD.qty,
+      stock_current = stock_current + OLD.qty,
+      updated_at = datetime('now'),
+      last_update = datetime('now')
   WHERE product_id = OLD.product_id
     AND unit_level = OLD.unit_level
     AND unit_mark  = OLD.unit_mark
@@ -465,9 +550,10 @@ AFTER INSERT ON sale_voids
 BEGIN
   UPDATE sales SET status = 'void' WHERE id = NEW.sale_id;
 
-  -- Restore stock for all items in the sale (si vous gardez sale_items)
+  -- CRITIQUE: Restaurer stock_initial ET stock_current pour tous les items de la vente
+  -- Restaurer exactement la quantité vendue (sans auto_stock_factor, comme lors de la réduction)
   UPDATE product_units
-  SET stock_current = stock_current + (
+  SET stock_initial = stock_initial + (
     SELECT IFNULL(SUM(si.qty),0)
     FROM sale_items si
     WHERE si.sale_id   = NEW.sale_id
@@ -475,6 +561,15 @@ BEGIN
       AND si.unit_level = product_units.unit_level
       AND si.unit_mark  = product_units.unit_mark
   ),
+  stock_current = stock_current + (
+    SELECT IFNULL(SUM(si.qty),0)
+    FROM sale_items si
+    WHERE si.sale_id   = NEW.sale_id
+      AND si.product_id = product_units.product_id
+      AND si.unit_level = product_units.unit_level
+      AND si.unit_mark  = product_units.unit_mark
+  ),
+  updated_at = datetime('now'),
   last_update = datetime('now')
   WHERE EXISTS (
     SELECT 1 FROM sale_items si
@@ -551,4 +646,24 @@ CREATE INDEX IF NOT EXISTS idx_debt_payments_debt  ON debt_payments(debt_id, pai
 CREATE INDEX IF NOT EXISTS idx_sales_status_date   ON sales(status, sold_at);
 CREATE INDEX IF NOT EXISTS idx_sale_items_prod     ON sale_items(product_id, product_code);
 CREATE INDEX IF NOT EXISTS idx_units_lookup        ON product_units(product_id, unit_level, unit_mark);
+
+-- =========================
+-- PRINT JOBS (Queue d'impression)
+-- =========================
+CREATE TABLE IF NOT EXISTS print_jobs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  invoice_number TEXT NOT NULL,
+  template TEXT NOT NULL DEFAULT 'receipt-80',
+  payload_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending', -- pending|processing|printed|error
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  printed_at TEXT,
+  FOREIGN KEY(invoice_number) REFERENCES sales(invoice_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_print_jobs_status ON print_jobs(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_print_jobs_invoice ON print_jobs(invoice_number);
 

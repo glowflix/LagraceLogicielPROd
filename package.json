@@ -6,7 +6,7 @@
   "main": "electron/main.cjs",
   "scripts": {
     "start": "node src/api/server.js",
-    "dev": "concurrently -n \"backend,ui,electron\" -c \"cyan,magenta,green\" \"node --watch src/api/server.js\" \"vite\" \"npx wait-on http://localhost:3030/api/health http://localhost:5173 && cross-env NODE_ENV=development electron .\"",
+    "dev": "concurrently -n \"backend,ui,electron\" -c \"cyan,magenta,green\" -k \"node --watch src/api/server.js\" \"vite\" \"node scripts/wait-and-launch-electron.js\"",
     "dev:ui": "vite",
     "dev:all": "concurrently -n \"backend,frontend\" -c \"cyan,magenta\" \"npm run dev\" \"npm run dev:ui\"",
     "electron": "electron .",
@@ -19,7 +19,11 @@
     "preview:ui": "vite preview",
     "migrate": "node src/db/migrate.js",
     "build:exe": "pkg package.json --targets node18-win-x64 --output dist/LaGrace-POS.exe",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "check:mcp": "node scripts/check-mcp-prerequisites.js",
+    "setup:mcp": "powershell -ExecutionPolicy Bypass -File scripts/setup-mcp-guide.ps1",
+    "open:mcp-config": "powershell -ExecutionPolicy Bypass -File scripts/open-mcp-config.ps1",
+    "setup:mcp-config": "powershell -ExecutionPolicy Bypass -File copier-config-mcp.ps1"
   },
   "keywords": [
     "pos",

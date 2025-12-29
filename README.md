@@ -150,6 +150,30 @@ npm run dev
 npm run migrate
 ```
 
+## Débogage avec Chrome DevTools MCP
+
+Pour améliorer le débogage avec l'IA dans Cursor, configurez Chrome DevTools MCP :
+
+🚀 **Installation rapide** : Voir [INSTALLATION-MCP.md](./INSTALLATION-MCP.md) (5 minutes)
+
+📖 **Documentation complète** : Voir [SETUP-CHROME-DEVTOOLS-MCP.md](./SETUP-CHROME-DEVTOOLS-MCP.md)
+
+Cette configuration permet à l'IA d'analyser automatiquement :
+- Les erreurs de la console
+- Les requêtes réseau qui échouent
+- Les stack traces
+- Les problèmes de performance
+
+**Vérification des prérequis** :
+```bash
+npm run check:mcp
+```
+
+**Configuration guidée (Windows)** :
+```bash
+npm run setup:mcp
+```
+
 ## Support
 
 Pour toute question ou problème, consultez la documentation dans `projet IDEEE.txt`.
