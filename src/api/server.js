@@ -6,6 +6,7 @@ import path from 'path';
 import { existsSync } from 'fs';
 import { resolve } from 'path';
 import os from 'os';
+import { spawn } from 'child_process';
 import { ensureDirs, getDbPath, getProjectRoot } from '../core/paths.js';
 import { logger } from '../core/logger.js';
 import { initSchema, getDb } from '../db/sqlite.js';
@@ -44,6 +45,126 @@ if (existsSync(configEnvPath)) {
 } else {
   dotenv.config(); // Par défaut
   console.warn(`⚠️  Aucun fichier config.env ou .env trouvé, utilisation des variables d'environnement système`);
+}
+
+// === AI LaGrace - Configuration automatique ===
+const AI_ENABLED = process.env.AI_LAGRACE_ENABLED !== 'false';
+let AI_AUTOSTART = process.env.AI_LAGRACE_AUTOSTART !== 'false';
+// Détection Electron - vérifier uniquement ELECTRON_RUN_AS_NODE, pas argv
+const IS_ELECTRON = process.env.ELECTRON_RUN_AS_NODE === 'true';
+if (IS_ELECTRON) {
+  // Electron gère l'IA seul (démarre via npm run dev concurrently)
+  AI_AUTOSTART = false;
+} else if (AI_ENABLED) {
+  // Navigateur web: l'IA démarre à la demande (via API /api/ai/start)
+  AI_AUTOSTART = false;
+}
+
+logger.info(`[AI] Détection: IS_ELECTRON=${IS_ELECTRON}, AI_ENABLED=${AI_ENABLED}, AI_AUTOSTART=${AI_AUTOSTART}`);
+
+const AI_DIR = resolve(getProjectRoot(), 'ai-lagrace');
+const AI_MAIN = resolve(AI_DIR, 'main.py');
+let aiProcess = null;
+let aiStopping = false;
+
+function checkPython() {
+  return new Promise((resolveCheck) => {
+    // ✅ CORRECTION: Utiliser le venv Python au lieu du Python système
+    const pythonExe = process.platform === 'win32'
+      ? resolve(getProjectRoot(), '.venv', 'Scripts', 'python.exe')
+      : resolve(getProjectRoot(), '.venv', 'bin', 'python');
+    
+    const check = spawn(pythonExe, ['--version'], { shell: true });
+    check.on('close', (code) => resolveCheck(code === 0));
+    check.on('error', () => resolveCheck(false));
+  });
+}
+
+async function startAI() {
+  if (!AI_ENABLED) {
+    logger.info('[AI] AI LaGrace désactivée par configuration');
+    return;
+  }
+  if (!AI_AUTOSTART) {
+    logger.info('[AI] Autostart désactivé pour AI LaGrace (gérée par Electron)');
+    return;
+  }
+  if (!existsSync(AI_MAIN)) {
+    logger.warn('[AI] AI LaGrace non installée (main.py non trouvé)');
+    logger.warn(`[AI] Chemin attendu: ${AI_MAIN}`);
+    return;
+  }
+
+  const hasPython = await checkPython();
+  if (!hasPython) {
+    logger.warn('[AI] Python non disponible, AI LaGrace désactivée');
+    return;
+  }
+
+  logger.info('[AI] ========================================');
+  logger.info('[AI] DÉMARRAGE DE AI LaGrace (serveur)...');
+  logger.info(`[AI] Répertoire: ${AI_DIR}`);
+  logger.info(`[AI] Script: ${AI_MAIN}`);
+  logger.info('[AI] ========================================');
+
+  // ✅ CORRECTION: Utiliser le venv Python au lieu du Python système
+  const pythonExe = process.platform === 'win32'
+    ? resolve(getProjectRoot(), '.venv', 'Scripts', 'python.exe')
+    : resolve(getProjectRoot(), '.venv', 'bin', 'python');
+
+  logger.info(`[AI] Python: ${pythonExe}`);
+
+  aiStopping = false;
+  aiProcess = spawn(pythonExe, ['main.py', '--quiet'], {
+    cwd: AI_DIR,
+    shell: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+    env: {
+      ...process.env,
+      PYTHONUNBUFFERED: '1',
+      PYTHONIOENCODING: 'utf-8',
+    },
+  });
+
+  aiProcess.stdout.on('data', (data) => {
+    const output = data.toString().trim();
+    if (output) logger.info(`[AI] ${output}`);
+  });
+
+  aiProcess.stderr.on('data', (data) => {
+    const output = data.toString().trim();
+    if (output) logger.error(`[AI] ${output}`);
+  });
+
+  aiProcess.on('close', (code) => {
+    logger.warn(`[AI] AI LaGrace arrêtée (code: ${code})`);
+    aiProcess = null;
+    if (!aiStopping && code !== 0 && code !== null) {
+      logger.warn('[AI] Redémarrage automatique dans 5 secondes...');
+      setTimeout(() => {
+        startAI().catch((err) => logger.error('[AI] Erreur au redémarrage:', err));
+      }, 5000);
+    }
+  });
+
+  aiProcess.on('error', (err) => {
+    logger.error('[AI] Erreur process:', err);
+    aiProcess = null;
+  });
+}
+
+function stopAI() {
+  if (!aiProcess) return;
+  aiStopping = true;
+  logger.info('[AI] Arrêt de AI LaGrace...');
+
+  if (process.platform === 'win32') {
+    spawn('taskkill', ['/pid', aiProcess.pid.toString(), '/f', '/t'], { shell: true });
+  } else {
+    aiProcess.kill('SIGTERM');
+  }
+  aiProcess = null;
 }
 
 // Créer les dossiers nécessaires
@@ -122,6 +243,55 @@ app.use(express.static('dist')); // Servir l'UI React buildée
 // Routes API
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Route pour le statut de l'IA (pour navigateur web)
+app.get('/api/ai/status', (req, res) => {
+  const status = aiProcess ? 'running' : 'stopped';
+  res.json({ 
+    status,
+    running: aiProcess !== null,
+    pid: aiProcess ? aiProcess.pid : null,
+    enabled: AI_ENABLED,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Route pour démarrer l'IA (pour navigateur web)
+app.post('/api/ai/start', (req, res) => {
+  if (IS_ELECTRON) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'IA gérée par Electron, utiliser les contrôles Electron' 
+    });
+  }
+  
+  if (aiProcess) {
+    return res.json({ success: true, message: 'IA déjà en cours d\'exécution' });
+  }
+  
+  startAI().then(() => {
+    res.json({ success: true, message: 'IA démarrée' });
+  }).catch(err => {
+    res.status(500).json({ success: false, message: err.message });
+  });
+});
+
+// Route pour arrêter l'IA (pour navigateur web)
+app.post('/api/ai/stop', (req, res) => {
+  if (IS_ELECTRON) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'IA gérée par Electron, utiliser les contrôles Electron' 
+    });
+  }
+  
+  if (!aiProcess) {
+    return res.json({ success: true, message: 'IA déjà arrêtée' });
+  }
+  
+  stopAI();
+  res.json({ success: true, message: 'IA arrêtée' });
 });
 
 // Route de test pour le mode dev
@@ -351,6 +521,11 @@ httpServer.listen(PORT, HOST, () => {
   printerModule.start();
   logger.info('🖨️  Module d\'impression démarré');
   logger.info(`📁 Dossier impression: ${path.join(getProjectRoot(), 'printer')}`);
+
+  // Démarrer l'AI (après le serveur pour que Socket.IO soit prêt)
+  setTimeout(() => {
+    startAI().catch((err) => logger.error('[AI] Erreur démarrage:', err));
+  }, 2000);
 });
 
 // Gestion d'erreur pour port déjà utilisé
@@ -379,5 +554,16 @@ process.on('uncaughtException', (error) => {
   process.exit(1);
 });
 
-export default app;
+process.on('SIGINT', () => {
+  stopAI();
+});
 
+process.on('SIGTERM', () => {
+  stopAI();
+});
+
+process.on('exit', () => {
+  stopAI();
+});
+
+export default app;

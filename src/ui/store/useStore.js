@@ -4,6 +4,7 @@ import axios from 'axios';
 import { io } from 'socket.io-client';
 import { getApiUrl, getSocketUrl } from '../utils/apiConfig.js';
 import { generateLocalToken, decodeLocalToken, isValidToken } from '../utils/token';
+import AudioHandler from '../utils/audioHandler.js';
 
 // URL API dynamique (détectée automatiquement ou configurée)
 // En mode proxy Vite, API_URL sera '' (chemins relatifs)
@@ -47,6 +48,7 @@ export const useStore = create(
       // Socket
       socket: null,
       socketConnected: false,
+      audioHandler: null,
 
       // Données
       products: [],
@@ -361,6 +363,15 @@ export const useStore = create(
 
         socket.on('connect', () => {
           console.log('✅ Socket connecté:', socket.id);
+          
+          // Initialiser l'AudioHandler pour recevoir l'audio de l'IA
+          if (!get().audioHandler) {
+            console.log('🎵 Initialisation AudioHandler...');
+            const audioHandler = new AudioHandler(socket);
+            set({ audioHandler });
+            console.log('🎵 ✅ AudioHandler initialisé');
+          }
+          
           set({ socketConnected: true, isOnline: true });
         });
 

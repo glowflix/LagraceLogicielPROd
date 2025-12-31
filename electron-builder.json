@@ -1,0 +1,50 @@
+{
+  "appId": "com.lagrace.pos",
+  "productName": "LA GRACE POS",
+  "directories": {
+    "output": "dist-electron"
+  },
+  "publish": null,
+  "files": [
+    "electron/**/*",
+    "src/**/*",
+    "dist/**/*",
+    "asset/**/*",
+    "print/**/*",
+    "node_modules/**/*",
+    "package.json",
+    "!node_modules/**/*.{md,ts,map}",
+    "!**/test/**/*",
+    "!**/tests/**/*"
+  ],
+  "win": {
+    "target": [
+      {
+        "target": "nsis",
+        "arch": [
+          "x64"
+        ]
+      }
+    ],
+    "icon": "asset/image/icon/photo.ico",
+    "publisherName": "LA GRACE",
+    "certificateFile": null,
+    "sign": null
+  },
+  "nsis": {
+    "oneClick": false,
+    "allowToChangeInstallationDirectory": true,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true
+  },
+  "mac": {
+    "target": "dmg",
+    "icon": "asset/image/icon/photo.png",
+    "category": "public.app-category.business"
+  },
+  "linux": {
+    "target": "AppImage",
+    "icon": "asset/image/icon/photo.png",
+    "category": "Office"
+  }
+}

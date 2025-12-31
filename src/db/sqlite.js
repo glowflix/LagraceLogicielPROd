@@ -46,6 +46,45 @@ export function getDb() {
 }
 
 /**
+ * Wrapper Promise pour exécuter du SQL
+ */
+export async function runAsync(sql, params = []) {
+  const database = await getDb();
+  return new Promise((resolve, reject) => {
+    database.run(sql, params, function(err) {
+      if (err) reject(err);
+      else resolve(this);
+    });
+  });
+}
+
+/**
+ * Wrapper Promise pour obtenir une ligne
+ */
+export async function getAsync(sql, params = []) {
+  const database = await getDb();
+  return new Promise((resolve, reject) => {
+    database.get(sql, params, (err, row) => {
+      if (err) reject(err);
+      else resolve(row);
+    });
+  });
+}
+
+/**
+ * Wrapper Promise pour obtenir toutes les lignes
+ */
+export async function allAsync(sql, params = []) {
+  const database = await getDb();
+  return new Promise((resolve, reject) => {
+    database.all(sql, params, (err, rows) => {
+      if (err) reject(err);
+      else resolve(rows);
+    });
+  });
+}
+
+/**
  * Ferme la connexion SQLite
  */
 export function closeDb() {

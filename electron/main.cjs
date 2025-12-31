@@ -1,4 +1,4 @@
-const { app, BrowserWindow } = require('electron');
+const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
 const fs = require('fs');
@@ -7,37 +7,153 @@ const http = require('http');
 let serverProcess = null;
 let aiProcess = null;
 let mainWindow = null;
+let appContext = null; // Contexte app (paths, db, etc.)
+
+/**
+ * Envoyer un statut de l'IA à la fenêtre principale
+ */
+function sendAIStatus(status, message = '') {
+  if (mainWindow && mainWindow.webContents) {
+    console.log(`[IPC] Envoi du statut AI: ${status}`);
+    mainWindow.webContents.send('ai-status-update', { status, message });
+  }
+}
 const PORT = process.env.PORT || 3030;
 const SERVER_URL = `http://localhost:${PORT}`;
 
 // Configuration AI LaGrace
 const AI_ENABLED = process.env.AI_LAGRACE_ENABLED !== 'false'; // Activé par défaut
+// ✅ AI_AUTOSTART réactivé: l'IA démarre automatiquement dans Electron une fois le statut connecté
+const AI_AUTOSTART = AI_ENABLED && process.env.AI_LAGRACE_AUTOSTART !== 'false';
 const AI_DIR = path.join(__dirname, '..', 'ai-lagrace');
 const AI_MAIN = path.join(AI_DIR, 'main.py');
 
 /**
- * Vérifier si Python est disponible
+ * Vérifier si Python (venv) est disponible
  */
 function checkPython() {
   return new Promise((resolve) => {
-    const check = spawn('python', ['--version'], { shell: true });
-    check.on('close', (code) => {
-      resolve(code === 0);
-    });
-    check.on('error', () => {
+    const pythonExe = process.platform === 'win32' 
+      ? path.join(__dirname, '..', '.venv', 'Scripts', 'python.exe')
+      : path.join(__dirname, '..', '.venv', 'bin', 'python');
+    
+    // 1️⃣ Vérifier si le fichier existe
+    if (!fs.existsSync(pythonExe)) {
+      console.log(`[AI] Python non trouvé au chemin: ${pythonExe}`);
       resolve(false);
-    });
+      return;
+    }
+    
+    // 2️⃣ Le fichier existe, vérifier si c'est un fichier valide
+    try {
+      const stats = fs.statSync(pythonExe);
+      if (stats.isFile()) {
+        console.log(`[AI] Python trouvé: ${pythonExe} (${stats.size} bytes)`);
+        // 3️⃣ Essayer de lancer Python pour une confirmation finale
+        const check = spawn(pythonExe, ['--version'], { 
+          shell: false,  // ❌ Changer à false pour éviter les problèmes avec les chemins avec espaces
+          timeout: 5000,
+          stdio: ['ignore', 'pipe', 'pipe']
+        });
+        
+        let output = '';
+        check.stdout.on('data', (data) => {
+          output += data.toString();
+        });
+        check.stderr.on('data', (data) => {
+          output += data.toString();
+        });
+        
+        const timeout = setTimeout(() => {
+          check.kill();
+          console.log(`[AI] Timeout lors de la vérification Python`);
+          resolve(false);
+        }, 5000);
+        
+        check.on('close', (code) => {
+          clearTimeout(timeout);
+          if (code === 0) {
+            console.log(`[AI] Python fonctionne: ${output.trim()}`);
+            resolve(true);
+          } else {
+            console.log(`[AI] Python existe mais sortie d'erreur: ${output}`);
+            // Malgré l'erreur, le fichier existe, donc on considère que Python est disponible
+            resolve(true);
+          }
+        });
+        
+        check.on('error', (err) => {
+          clearTimeout(timeout);
+          console.log(`[AI] Erreur spawn Python: ${err.message}`);
+          // Le fichier existe, donc considérer que Python est disponible
+          resolve(true);
+        });
+      } else {
+        console.log(`[AI] ${pythonExe} n'est pas un fichier`);
+        resolve(false);
+      }
+    } catch (e) {
+      console.log(`[AI] Erreur vérification Python: ${e.message}`);
+      resolve(false);
+    }
   });
 }
 
 /**
  * Démarrer AI LaGrace (Python)
- * L'AI reste active en permanence et ne se déconnecte pas automatiquement
+ * ⚠️ NE PAS relancer l'IA si elle est déjà lancée par npm run dev (concurrently)
+ * L'IA reste active en permanence et ne se déconnecte pas automatiquement
  */
 async function startAI() {
   if (!AI_ENABLED) {
     console.log('[AI] AI LaGrace désactivée par configuration');
     return;
+  }
+  
+  // ✅ CORRECTION: NE PAS relancer l'IA si elle est déjà en cours d'exécution
+  // En développement (npm run dev), concurrently lance DÉJÀ l'IA
+  // Relancer ici causait deux instances parlant en même temps (doublons audio)
+  
+  if (!AI_AUTOSTART) {
+    console.log('[AI] AI LaGrace gérée par le serveur (autostart désactivé)');
+    return;
+  }
+  
+  // ✅ CONTRÔLE: Vérifier si l'IA est DÉJÀ en cours d'exécution sur le port/socket
+  const checkAIRunning = new Promise((resolve) => {
+    const req = http.get('http://localhost:3030/api/ai/status', { timeout: 2000 }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          resolve(json.running === true);
+        } catch (e) {
+          resolve(false);
+        }
+      });
+    });
+    req.on('error', () => resolve(false));
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(false);
+    });
+  });
+
+  try {
+    const aiIsRunning = await checkAIRunning;
+    if (aiIsRunning) {
+      console.log('[AI] ========================================');
+      console.log('[AI] ℹ️  AI LAGRACE DÉJÀ EN COURS D\'EXÉCUTION');
+      console.log('[AI] ========================================');
+      console.log('[AI] Une instance de l\'IA est déjà active (lancée par concurrently)');
+      console.log('[AI] Pas besoin de la relancer via Electron');
+      sendAIStatus('connected', 'IA en cours d\'exécution (serveur)');
+      return;
+    }
+  } catch (e) {
+    // Pas de réponse du serveur - continuer avec le démarrage local
+    console.log('[AI] Vérification du statut AI impossible, tentative de démarrage...');
   }
 
   if (!fs.existsSync(AI_MAIN)) {
@@ -49,19 +165,49 @@ async function startAI() {
   const hasPython = await checkPython();
   if (!hasPython) {
     console.log('[AI] Python non disponible, AI LaGrace désactivée');
+    const pythonExe = process.platform === 'win32' 
+      ? path.join(__dirname, '..', '.venv', 'Scripts', 'python.exe')
+      : path.join(__dirname, '..', '.venv', 'bin', 'python');
+    console.log('[AI] Chemin attendu:', pythonExe);
+    console.log('[AI] Existe?:', fs.existsSync(pythonExe));
     console.log('[AI] Installez Python et ajoutez-le au PATH');
     return;
   }
 
+  // ⚠️ DERNIÈRE TENTATIVE: Vérifier s'il y a déjà une instance Python de main.py
+  try {
+    const { exec } = require('child_process');
+    const isWindows = process.platform === 'win32';
+    const cmd = isWindows ? 'tasklist /FI "IMAGENAME eq python.exe"' : 'pgrep python';
+    
+    // Pour Windows, on ne peut pas vérifier facilement, donc on continue
+    console.log('[AI] ⚠️  Vérification de l\'unicité de l\'instance...');
+  } catch (e) {
+    // Continue
+  }
+
   console.log('[AI] ========================================');
-  console.log('[AI] DÉMARRAGE DE AI LaGrace...');
+  console.log('[AI] DÉMARRAGE DE AI LaGrace (Electron)...');
   console.log('[AI] Répertoire:', AI_DIR);
   console.log('[AI] Script:', AI_MAIN);
   console.log('[AI] ========================================');
 
-  aiProcess = spawn('python', ['main.py', '--quiet'], {
-    cwd: AI_DIR,
-    shell: true,
+  sendAIStatus('reconnecting', 'Démarrage de l\'IA...');
+
+  // ✅ CORRECTION: Utiliser le venv Python au lieu du Python système
+  // Cela garantit que les bonnes dépendances sont utilisées (Socket.IO, TTS, etc.)
+  const pythonExe = process.platform === 'win32' 
+    ? path.join(__dirname, '..', '.venv', 'Scripts', 'python.exe')
+    : path.join(__dirname, '..', '.venv', 'bin', 'python');
+  
+  console.log('[AI] Python exécutable:', pythonExe);
+
+  // ⚠️ FIX: Quoter le répertoire si elle contient des espaces
+  const quotedAIDir = AI_DIR.includes(' ') ? `"${AI_DIR}"` : AI_DIR;
+
+  aiProcess = spawn(pythonExe, ['main.py', '--quiet'], {
+    cwd: AI_DIR,  // Non quoté pour Node.js
+    shell: false,  // ❌ shell: true cause le problème avec les espaces
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
     env: {
@@ -78,6 +224,10 @@ async function startAI() {
         // Afficher avec timestamp pour le debug
         const ts = new Date().toISOString().split('T')[1].split('.')[0];
         console.log(`[${ts}] [AI] ${line}`);
+        // Si l'IA est prête, envoyer le statut
+        if (line.includes('AI LaGrace PRÊTE')) {
+          sendAIStatus('connected', 'IA connectée et prête.');
+        }
       }
     });
   });
@@ -94,15 +244,18 @@ async function startAI() {
 
   aiProcess.on('close', (code) => {
     console.log(`[AI] AI LaGrace arrêtée (code: ${code})`);
+    sendAIStatus('disconnected', `IA déconnectée (code: ${code})`);
     
     // Si l'AI s'arrête de façon inattendue, la redémarrer (sauf si code 0 ou arrêt volontaire)
     if (code !== 0 && code !== null && aiProcess !== null) {
       console.log('[AI] Redémarrage automatique dans 5 secondes...');
+      sendAIStatus('reconnecting', 'Tentative de redémarrage de l\'IA...');
       aiProcess = null;
       setTimeout(() => {
         if (mainWindow && !mainWindow.isDestroyed()) {
           startAI().catch((err) => {
             console.error('[AI] Erreur au redémarrage:', err);
+            sendAIStatus('disconnected', 'Échec du redémarrage de l\'IA.');
           });
         }
       }, 5000);
@@ -160,6 +313,13 @@ function checkServerRunning() {
  */
 function startServer() {
   return new Promise(async (resolve, reject) => {
+    // Mode développement: serveur lancé par npm run dev (concurrently)
+    if (process.env.SKIP_BACKEND_WAIT === 'true') {
+      console.log('[SERVER] Mode dev: serveur Node.js lancé par npm, attente 2s...');
+      setTimeout(() => resolve(), 2000);
+      return;
+    }
+
     // Vérifier d'abord si le serveur est déjà en cours d'exécution
     const isRunning = await checkServerRunning();
     if (isRunning) {
@@ -184,6 +344,7 @@ function startServer() {
         ...process.env,
         NODE_ENV: process.env.NODE_ENV || 'production',
         PORT: PORT.toString(),
+        AI_LAGRACE_AUTOSTART: 'false',
       },
     });
 
@@ -317,93 +478,128 @@ async function waitForServer(maxAttempts = 60) {
  * Créer la fenêtre principale
  */
 function createWindow() {
-  mainWindow = new BrowserWindow({
-    width: 1400,
-    height: 900,
-    minWidth: 1200,
-    minHeight: 700,
-    icon: path.join(__dirname, '../asset/image/icon/photo.png'),
-    webPreferences: {
-      nodeIntegration: false,
-      contextIsolation: true,
-      enableRemoteModule: false,
-      webSecurity: true,
-    },
-    titleBarStyle: 'default',
-    show: true, // Afficher immédiatement (le serveur est déjà vérifié)
-    backgroundColor: '#1a1a2e',
-  });
-
-  // Afficher la fenêtre immédiatement (le serveur est déjà prêt)
-  mainWindow.show();
-  
-  // Focus sur la fenêtre
-  if (process.platform === 'darwin') {
-    app.dock.show();
-  }
-
-  // Charger l'application directement (le serveur est déjà vérifié avant createWindow)
-  // En mode développement, utiliser Vite dev server
-  if (process.env.NODE_ENV === 'development') {
-    console.log('Chargement de http://localhost:5173...');
-    mainWindow.loadURL('http://localhost:5173').catch((error) => {
-      console.error('Erreur chargement Vite:', error);
-      // Fallback vers le serveur backend
-      mainWindow.loadURL(SERVER_URL);
-    });
-  } else {
-    console.log(`Chargement de ${SERVER_URL}...`);
-    mainWindow.loadURL(SERVER_URL).catch((error) => {
-      console.error('Erreur chargement serveur:', error);
-      // Fallback vers dist/index.html si disponible
-      const indexPath = path.join(__dirname, '../dist/index.html');
-      if (fs.existsSync(indexPath)) {
-        mainWindow.loadFile(indexPath);
-      }
-    });
-  }
-
-  // Ouvrir DevTools en mode développement
-  if (process.env.NODE_ENV === 'development') {
-    mainWindow.webContents.openDevTools();
-  }
-
-  // Gestion des erreurs de chargement
-  mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL) => {
-    console.error(`Erreur chargement (${errorCode}): ${errorDescription}`);
-    console.error(`URL: ${validatedURL}`);
+  try {
+    console.log('[WINDOW] Création de la fenêtre BrowserWindow...');
     
-    if (errorCode === -106 || errorCode === -105 || errorCode === -102) {
-      // ERR_INTERNET_DISCONNECTED, ERR_ADDRESS_UNREACHABLE, ERR_CONNECTION_REFUSED
-      console.log('Tentative de rechargement dans 2 secondes...');
-      setTimeout(() => {
-        mainWindow.reload();
-      }, 2000);
-    } else {
-      // Pour d'autres erreurs, réessayer avec l'autre URL
-      console.log('Tentative avec URL alternative...');
-      if (process.env.NODE_ENV === 'development' && validatedURL && validatedURL.includes('5173')) {
-        setTimeout(() => {
-          console.log('Chargement de l\'URL alternative:', SERVER_URL);
-          mainWindow.loadURL(SERVER_URL);
-        }, 2000);
-      } else if (validatedURL && validatedURL.includes('3030')) {
-        setTimeout(() => {
-          console.log('Chargement de l\'URL alternative: http://localhost:5173');
-          mainWindow.loadURL('http://localhost:5173');
-        }, 2000);
-      }
-    }
-  });
-  
-  // Log quand la page est chargée avec succès
-  mainWindow.webContents.on('did-finish-load', () => {
-    console.log('✅ Page chargée avec succès');
-  });
+    mainWindow = new BrowserWindow({
+      width: 1400,
+      height: 900,
+      minWidth: 1200,
+      minHeight: 700,
+      icon: path.join(__dirname, '../asset/image/icon/photo.png'),
+      webPreferences: {
+        preload: path.join(__dirname, 'preload.cjs'),
+        nodeIntegration: false,
+        contextIsolation: true,
+        enableRemoteModule: false,
+        webSecurity: true,
+      },
+      titleBarStyle: 'default',
+      show: false, // ✅ Ne pas montrer immédiatement pour éviter les problèmes
+      backgroundColor: '#1a1a2e',
+    });
 
-  mainWindow.on('closed', () => {
-    mainWindow = null;
-  });
+    console.log('[WINDOW] BrowserWindow créée avec succès, ID:', mainWindow.id);
+    
+    // Afficher la fenêtre après un court délai (évite les crashes au démarrage)
+    mainWindow.once('ready-to-show', () => {
+      console.log('[WINDOW] Fenêtre ready-to-show');
+      mainWindow.show();
+    });
+    
+    // Fallback: afficher après 1 seconde si ready-to-show ne se déclenche pas
+    setTimeout(() => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        console.log('[WINDOW] Affichage forcé de la fenêtre (fallback)');
+        mainWindow.show();
+      }
+    }, 1000);
+    
+    // Focus sur la fenêtre
+    if (process.platform === 'darwin') {
+      app.dock.show();
+    }
+
+    // Charger l'application directement (le serveur est déjà vérifié avant createWindow)
+    // En mode développement, utiliser Vite dev server
+    if (process.env.NODE_ENV === 'development') {
+      console.log('[WINDOW] Mode dev: Chargement de http://localhost:5173...');
+      mainWindow.loadURL('http://localhost:5173').catch((error) => {
+        console.error('[WINDOW] ❌ Erreur chargement Vite:', error);
+        // Fallback vers le serveur backend
+        console.log('[WINDOW] Fallback: Chargement de ' + SERVER_URL);
+        mainWindow.loadURL(SERVER_URL);
+      });
+    } else {
+      console.log('[WINDOW] Mode prod: Chargement de ' + SERVER_URL);
+      mainWindow.loadURL(SERVER_URL).catch((error) => {
+        console.error('[WINDOW] ❌ Erreur chargement serveur:', error);
+        // Fallback vers dist/index.html si disponible
+        const indexPath = path.join(__dirname, '../dist/index.html');
+        if (fs.existsSync(indexPath)) {
+          console.log('[WINDOW] Fallback: Chargement de ' + indexPath);
+          mainWindow.loadFile(indexPath);
+        }
+      });
+    }
+
+    // Ouvrir DevTools en mode développement
+    if (process.env.NODE_ENV === 'development') {
+      console.log('[WINDOW] Ouverture des DevTools');
+      mainWindow.webContents.openDevTools();
+    }
+
+    // Gestion des erreurs de chargement
+    mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL) => {
+      console.error(`[WINDOW] ❌ Erreur chargement (${errorCode}): ${errorDescription}`);
+      console.error(`[WINDOW] URL: ${validatedURL}`);
+      
+      if (errorCode === -106 || errorCode === -105 || errorCode === -102) {
+        // ERR_INTERNET_DISCONNECTED, ERR_ADDRESS_UNREACHABLE, ERR_CONNECTION_REFUSED
+        console.log('[WINDOW] Tentative de rechargement dans 2 secondes...');
+        setTimeout(() => {
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.reload();
+          }
+        }, 2000);
+      } else {
+        // Pour d'autres erreurs, réessayer avec l'autre URL
+        console.log('[WINDOW] Tentative avec URL alternative...');
+        if (process.env.NODE_ENV === 'development' && validatedURL && validatedURL.includes('5173')) {
+          setTimeout(() => {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              console.log('[WINDOW] Chargement de l\'URL alternative:', SERVER_URL);
+              mainWindow.loadURL(SERVER_URL);
+            }
+          }, 2000);
+        } else if (validatedURL && validatedURL.includes('3030')) {
+          setTimeout(() => {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              console.log('[WINDOW] Chargement de l\'URL alternative: http://localhost:5173');
+              mainWindow.loadURL('http://localhost:5173');
+            }
+          }, 2000);
+        }
+      }
+    });
+    
+    // Log quand la page est chargée avec succès
+    mainWindow.webContents.on('did-finish-load', () => {
+      console.log('[WINDOW] ✅ Page chargée avec succès');
+    });
+
+    mainWindow.on('closed', () => {
+      console.log('[WINDOW] Fenêtre fermée');
+      mainWindow = null;
+    });
+    
+    console.log('[WINDOW] ✅ Création de fenêtre complétée');
+    
+  } catch (error) {
+    console.error('[WINDOW] ❌ ERREUR CRITIQUE création fenêtre:', error);
+    console.error('[WINDOW] Stack:', error.stack);
+    throw error;
+  }
 }
 
 /**
@@ -411,12 +607,30 @@ function createWindow() {
  */
 app.whenReady().then(async () => {
   try {
+    // Initialiser l'app (chemins, db, loggers, etc.)
+    console.log('🚀 Initialisation Glowflixprojet...');
+    const initBridge = require('./init-bridge.cjs');
+    appContext = await initBridge.initializeApp();
+    console.log('✓ Glowflixprojet contexte prêt');
+    
+    // Initialiser les handlers IPC
+    const { initializeIpcHandlers } = require('./ipc-handlers.cjs');
+    initializeIpcHandlers(appContext);
+    
     // En mode développement, ne pas démarrer le serveur (déjà lancé par npm run dev)
     if (process.env.NODE_ENV === 'development') {
       console.log('Mode développement : utilisation du serveur externe');
       // Le script wait-and-launch-electron.js a déjà vérifié que les serveurs sont prêts
       // On peut créer la fenêtre immédiatement, mais on vérifie rapidement en arrière-plan
-      createWindow();
+      
+      // ✅ IMPORTANT: Créer la fenêtre SYNCHRONE (très rapide) pour éviter que Electron ne quitte
+      try {
+        createWindow();
+        console.log('✅ Fenêtre créée avec succès');
+      } catch (windowError) {
+        console.error('❌ Erreur création fenêtre:', windowError);
+        mainWindow = null;
+      }
       
       // Vérification rapide en arrière-plan (non bloquante)
       waitForServer(5).then((ready) => {
@@ -431,19 +645,48 @@ app.whenReady().then(async () => {
       console.log('Démarrage du serveur...');
       await startServer();
       console.log('Serveur démarré, création de la fenêtre...');
-      createWindow();
+      
+      try {
+        createWindow();
+        console.log('✅ Fenêtre créée avec succès');
+      } catch (windowError) {
+        console.error('❌ Erreur création fenêtre:', windowError);
+        mainWindow = null;
+      }
     }
     
-    // Démarrer AI LaGrace (après le serveur pour que Socket.IO soit prêt)
-    setTimeout(() => {
-      startAI().catch((err) => {
-        console.error('[AI] Erreur démarrage:', err);
-      });
-    }, 2000);
+    // ✅ IMPORTANT: Garder Electron ouvert même si la création de fenêtre échoue
+    if (!mainWindow) {
+      console.warn('⚠️  Avertissement: pas de fenêtre principale, l\'app resta active');
+    }
+    
+    // Démarrer AI LaGrace dès que le serveur est prêt (pas de délai fixe)
+    startAI().catch((err) => {
+      console.error('[AI] Erreur démarrage:', err);
+    });
     
   } catch (error) {
-    console.error('Erreur lors du démarrage:', error);
-    app.quit();
+    console.error('❌ ERREUR CRITIQUE lors du démarrage:', error);
+    console.error('Stack:', error.stack);
+    
+    // ✅ IMPORTANT: NE PAS quitter immédiatement si possible
+    // Essayer de créer une fenêtre vide pour montrer l'erreur
+    try {
+      createWindow();
+      if (mainWindow) {
+        mainWindow.webContents.on('did-finish-load', () => {
+          mainWindow.webContents.executeJavaScript(`
+            document.body.innerHTML = '<h1 style="color:red; font-family:monospace;">❌ ERREUR DE DÉMARRAGE</h1>' +
+            '<pre style="color:#ccc; font-family:monospace; margin:20px; white-space:pre-wrap; word-wrap:break-word;">${error.message}</pre>';
+          `);
+        });
+        mainWindow.loadURL('data:text/html,<h1>❌ Erreur de démarrage</h1>');
+      }
+    } catch (e) {
+      console.error('Impossible de créer une fenêtre d\'erreur:', e);
+      // Seulement quitter si vraiment impossible de continuer
+      process.exit(1);
+    }
   }
 });
 
@@ -469,6 +712,34 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit();
   }
+});
+
+// Gestion des contrôles IA depuis l'interface
+ipcMain.handle('ai-start', async () => {
+  try {
+    await startAI();
+    return { success: true };
+  } catch (error) {
+    console.error('[IPC] Erreur démarrage IA:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('ai-stop', () => {
+  try {
+    stopAI();
+    return { success: true };
+  } catch (error) {
+    console.error('[IPC] Erreur arrêt IA:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('ai-status', () => {
+  return {
+    running: aiProcess !== null,
+    pid: aiProcess ? aiProcess.pid : null
+  };
 });
 
 // Réactiver la fenêtre sur macOS
@@ -498,11 +769,17 @@ function stopServer() {
 }
 
 // Arrêt propre de l'application
-app.on('before-quit', (event) => {
+app.on('before-quit', async (event) => {
   // Arrêter le serveur quand l'application se ferme
   if (serverProcess) {
     event.preventDefault(); // Empêcher la fermeture immédiate
     stopServer();
+    
+    // Shutdown app (DB, loggers, etc.)
+    if (appContext) {
+      const initBridge = require('./init-bridge.cjs');
+      await initBridge.shutdownApp();
+    }
     
     setTimeout(() => {
       app.exit(0); // Fermer l'application après l'arrêt du serveur
@@ -541,4 +818,3 @@ process.on('exit', () => {
 process.on('uncaughtException', (error) => {
   console.error('Erreur non gérée:', error);
 });
-

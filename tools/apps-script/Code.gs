@@ -1931,10 +1931,15 @@ function getSalesPage(sinceDate, cursor, limit) {
   let skippedNoRefDate = 0;
   let skippedDateFilter = 0;
   let skippedNoDate = 0;
+  let skippedDuplicateUuid = 0;
+  
+  // DEDUPLICATION: Track UUIDs seen in this page to prevent duplicates
+  const uuidsSeenInThisPage = new Set();
   
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
     const invoice = (r[colFacture - 1] || '').toString().trim();
+    const pageUuid = colUuid > 0 ? (r[colUuid - 1] || '').toString().trim() : '';
     
     if (!invoice) {
       skippedNoInvoice++;
@@ -1943,6 +1948,20 @@ function getSalesPage(sinceDate, cursor, limit) {
         console.log('   ⚠️ [getSalesPage] Ligne', startRow + i, 'ignorée: pas de numéro de facture');
       }
       continue;
+    }
+    
+    // CRITICAL: Detect duplicate UUIDs within the same page response
+    // This prevents the same row from being returned twice due to Google Sheets API quirks
+    if (pageUuid && uuidsSeenInThisPage.has(pageUuid)) {
+      skippedDuplicateUuid++;
+      skippedCount++;
+      console.log('   ⚠️ [getSalesPage] Ligne', startRow + i, 'ignorée: UUID dupliqué dans la même page (UUID:', pageUuid, ')');
+      continue;
+    }
+    
+    // Add UUID to the seen set if it exists
+    if (pageUuid) {
+      uuidsSeenInThisPage.add(pageUuid);
     }
     
     // Lire la date de vente d'abord
@@ -2054,6 +2073,7 @@ function getSalesPage(sinceDate, cursor, limit) {
   console.log('✅ [getSalesPage] Traité:', processedCount, 'vente(s) | Skippé:', skippedCount, '| Done:', done, '| Next cursor:', next_cursor);
   console.log('📊 [getSalesPage] Détail des lignes ignorées:');
   console.log('   - Sans facture:', skippedNoInvoice);
+  console.log('   - UUID dupliquées dans la page:', skippedDuplicateUuid);
   console.log('   - Sans date de référence:', skippedNoRefDate);
   console.log('   - Filtrées par date:', skippedDateFilter);
   console.log('   - Sans date valide:', skippedNoDate);

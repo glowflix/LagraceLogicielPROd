@@ -56,10 +56,10 @@ const AIIcon = ({ connected }) => (
  */
 export default function AILaGrace({ className = '' }) {
   const [aiStatus, setAiStatus] = useState({
-    connected: false,
+    status: 'disconnected', // 'connected', 'disconnected', 'reconnecting'
+    message: 'Initialisation...',
     speaking: false,
     listening: false,
-    lastMessage: '',
   });
   const [showPanel, setShowPanel] = useState(false);
   const [messages, setMessages] = useState([]);
@@ -67,6 +67,37 @@ export default function AILaGrace({ className = '' }) {
   const audioContextRef = useRef(null);
 
   // Connexion Socket.IO
+  // Vérifier le statut de l'IA (pour navigateur web)
+  const checkAIStatus = useCallback(async () => {
+    if (window.electronAPI) return;
+    
+    try {
+      console.log('📡 Vérification du statut IA...');
+      const response = await fetch(`${SOCKET_URL}/api/ai/status`);
+      if (response.ok) {
+        const data = await response.json();
+        console.log('📡 Réponse statut IA:', data);
+        const newStatus = data.running ? 'connected' : 'disconnected';
+        setAiStatus(prev => {
+          if (prev.status !== newStatus) {
+            console.log(`✅ Changement statut: ${prev.status} → ${newStatus}`);
+            return {
+              ...prev,
+              status: newStatus,
+              message: data.running ? 'IA en cours d\'exécution' : 'IA arrêtée'
+            };
+          }
+          return prev;
+        });
+      } else {
+        console.error('Erreur réponse:', response.status);
+      }
+    } catch (error) {
+      console.error('Erreur vérification IA:', error);
+      setAiStatus(prev => ({ ...prev, status: 'disconnected', message: 'Erreur connexion' }));
+    }
+  }, []); // Dépendance vide - pas de dépendance circulaire
+
   useEffect(() => {
     const socket = io(SOCKET_URL, {
       transports: ['websocket', 'polling'],
@@ -81,24 +112,53 @@ export default function AILaGrace({ className = '' }) {
     socket.on('connect', () => {
       console.log('🔌 [AILaGrace] Connecté au serveur');
       addMessage('system', 'Connecté au serveur La Grâce');
+      
+      // Toujours vérifier le statut pour navigateur web
+      setTimeout(() => {
+        if (!window.electronAPI) {
+          console.log('🔍 Vérification du statut IA (navigateur web)');
+          checkAIStatus();
+        }
+      }, 500);
     });
 
     socket.on('disconnect', () => {
       console.log('🔌 [AILaGrace] Déconnecté');
-      setAiStatus(prev => ({ ...prev, connected: false }));
     });
 
-    // Statut de l'AI Python
-    socket.on('ai:status', (data) => {
-      console.log('🤖 [AILaGrace] Statut AI:', data);
-      setAiStatus(prev => ({
-        ...prev,
-        connected: data.connected || false,
-      }));
-      if (data.connected) {
-        addMessage('ai', 'AI LaGrace connectée et prête');
-      }
-    });
+    // Écouter les mises à jour de statut de l'IA depuis Electron
+    if (window.electronAPI) {
+      const cleanup = window.electronAPI.onAIStatusUpdate(({ status, message }) => {
+        console.log(`[IPC] Statut AI reçu: ${status}`, message);
+        setAiStatus(prev => ({ ...prev, status, message }));
+        
+        if (status === 'connected') {
+          addMessage('ai', message || 'AI LaGrace connectée et prête');
+        } else if (status === 'disconnected') {
+          addMessage('error', message || 'AI LaGrace déconnectée');
+        } else if (status === 'reconnecting') {
+          addMessage('system', message || 'Reconnexion de l\'IA...');
+        }
+      });
+      
+      return () => {
+        cleanup();
+        socket.disconnect();
+      };
+    } else {
+      // Pour navigateur web : vérifier le statut immédiatement et ensuite périodiquement
+      checkAIStatus(); // Vérification immédiate
+      
+      const interval = setInterval(() => {
+        console.log('⏰ Vérification périodique du statut IA');
+        checkAIStatus();
+      }, 5000); // Vérification toutes les 5 secondes
+      
+      return () => {
+        clearInterval(interval);
+        socket.disconnect();
+      };
+    }
 
     // Événements de vente
     socket.on('sale:created', (data) => {
@@ -134,6 +194,42 @@ export default function AILaGrace({ className = '' }) {
     return () => {
       socket.disconnect();
     };
+  }, []);
+
+  // Démarrer l'IA (pour navigateur web)
+  const startAIWeb = useCallback(async () => {
+    if (window.electronAPI) return;
+    
+    try {
+      const response = await fetch(`${SOCKET_URL}/api/ai/start`, { method: 'POST' });
+      const data = await response.json();
+      if (data.success) {
+        addMessage('system', '✅ IA en cours de démarrage...');
+        setTimeout(() => checkAIStatus(), 2000);
+      } else {
+        addMessage('error', `Erreur: ${data.message}`);
+      }
+    } catch (error) {
+      addMessage('error', `Erreur démarrage IA: ${error.message}`);
+    }
+  }, []);
+
+  // Arrêter l'IA (pour navigateur web)
+  const stopAIWeb = useCallback(async () => {
+    if (window.electronAPI) return;
+    
+    try {
+      const response = await fetch(`${SOCKET_URL}/api/ai/stop`, { method: 'POST' });
+      const data = await response.json();
+      if (data.success) {
+        addMessage('system', '✅ IA arrêtée');
+        setTimeout(() => checkAIStatus(), 1000);
+      } else {
+        addMessage('error', `Erreur: ${data.message}`);
+      }
+    } catch (error) {
+      addMessage('error', `Erreur arrêt IA: ${error.message}`);
+    }
   }, []);
 
   // Ajouter un message à la liste
@@ -227,7 +323,7 @@ export default function AILaGrace({ className = '' }) {
         <span 
           className={`
             absolute -top-1 -right-1 w-4 h-4 rounded-full border-2 border-gray-900
-            ${aiStatus.connected ? 'bg-green-400' : 'bg-red-400'}
+            ${aiStatus.status === 'connected' ? 'bg-green-400' : (aiStatus.status === 'reconnecting' ? 'bg-yellow-400' : 'bg-red-400')}
             ${aiStatus.listening ? 'animate-ping' : ''}
           `}
         />
@@ -254,14 +350,63 @@ export default function AILaGrace({ className = '' }) {
                 <AIIcon connected={aiStatus.connected} />
                 <div>
                   <h3 className="font-semibold text-white text-sm">AI LaGrace</h3>
-                  <p className={`text-xs ${aiStatus.connected ? 'text-green-400' : 'text-red-400'}`}>
-                    {aiStatus.connected ? 'Connectée' : 'Déconnectée'}
+                  <p className={`text-xs ${
+                    aiStatus.status === 'connected' ? 'text-green-400' : 
+                    aiStatus.status === 'reconnecting' ? 'text-yellow-400' : 'text-red-400'
+                  }`}>
+                    {aiStatus.status === 'connected' ? 'Connectée' : 
+                     aiStatus.status === 'reconnecting' ? 'Reconnexion...' : 'Déconnectée'}
                   </p>
                 </div>
               </div>
               
               {/* Contrôles */}
               <div className="flex items-center gap-2">
+                {/* Contrôles IA */}
+              <div className="flex items-center gap-1 mr-2">
+                <button
+                  onClick={window.electronAPI ? 
+                    (async () => {
+                      try {
+                        const result = await window.electronAPI.startAI();
+                        if (result.success) {
+                          addMessage('system', 'IA démarrée');
+                        } else {
+                          addMessage('error', `Erreur démarrage IA: ${result.error}`);
+                        }
+                      } catch (error) {
+                        addMessage('error', 'Erreur démarrage IA');
+                      }
+                    }) : startAIWeb
+                  }
+                  className="px-2 py-1 text-xs bg-green-600/20 text-green-400 rounded hover:bg-green-600/30 transition-colors"
+                  title="Démarrer l'IA"
+                >
+                  ▶️
+                </button>
+                
+                <button
+                  onClick={window.electronAPI ?
+                    (async () => {
+                      try {
+                        const result = await window.electronAPI.stopAI();
+                        if (result.success) {
+                          addMessage('system', 'IA arrêtée');
+                        } else {
+                          addMessage('error', `Erreur arrêt IA: ${result.error}`);
+                        }
+                      } catch (error) {
+                        addMessage('error', 'Erreur arrêt IA');
+                      }
+                    }) : stopAIWeb
+                  }
+                  className="px-2 py-1 text-xs bg-red-600/20 text-red-400 rounded hover:bg-red-600/30 transition-colors"
+                  title="Arrêter l'IA"
+                >
+                  ⏹️
+                </button>
+              </div>
+                
                 <button
                   onClick={requestMicrophoneAccess}
                   className={`
@@ -355,4 +500,3 @@ export function useAILaGrace() {
 
   return { socket, announce };
 }
-

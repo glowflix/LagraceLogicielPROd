@@ -69,17 +69,93 @@ def log_speak(msg: str):
     print(f"{Fore.MAGENTA}[{ts}] [PAROLE] 🔊 {msg}{Style.RESET_ALL}")
 
 
+def format_invoice_number(invoice_num: str) -> str:
+    """
+    Formater le numéro de facture pour une prononciation naturelle
+    Ex: "20251230091527" → "deux zéro deux cinq, douze trente, zéro neuf, quinze vingt-sept"
+    """
+    if not invoice_num:
+        return ""
+    
+    invoice_str = str(invoice_num).strip()
+    
+    # Si c'est un numéro court, le lire chiffre par chiffre
+    if len(invoice_str) <= 6:
+        chiffres = {
+            '0': 'zéro', '1': 'un', '2': 'deux', '3': 'trois', '4': 'quatre',
+            '5': 'cinq', '6': 'six', '7': 'sept', '8': 'huit', '9': 'neuf'
+        }
+        return ' '.join(chiffres.get(c, c) for c in invoice_str if c.isdigit())
+    
+    # Pour un numéro long (14 chiffres style: 20251230091527), grouper par paires
+    # Format: YYYYMMDDHHMMSS → lire par parties significatives
+    # 2025 1230 0915 27 → "deux mille vingt-cinq" "douze heures trente" "zéro neuf heures quinze" "vingt-sept"
+    
+    try:
+        # Année (4 chiffres)
+        year = invoice_str[0:4]  # 2025
+        month = invoice_str[4:6]  # 12
+        day = invoice_str[6:8]    # 30
+        hour = invoice_str[8:10]  # 09
+        minute = invoice_str[10:12]  # 15
+        second = invoice_str[12:14]  # 27
+        
+        parts = []
+        
+        # Année
+        if year:
+            year_int = int(year)
+            if year_int >= 2000:
+                parties_annee = [year_int // 1000, year_int % 1000 // 100, year_int % 100 // 10, year_int % 10]
+                annee_text = f"{year_int // 1000} mille {year_int % 1000}"
+                parts.append(annee_text)
+        
+        # Date lisible
+        if month and day:
+            month_int = int(month)
+            day_int = int(day)
+            mois_names = ['', 'janvier', 'février', 'mars', 'avril', 'mai', 'juin',
+                         'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre']
+            month_name = mois_names[month_int] if 1 <= month_int <= 12 else f"{month_int}"
+            parts.append(f"{day_int} {month_name}")
+        
+        # Heure (sans "heures" pour être plus concis)
+        if hour and minute:
+            hour_int = int(hour)
+            minute_int = int(minute)
+            if hour_int > 0 or minute_int > 0:
+                parts.append(f"à {hour_int}:{minute_int:02d}")
+        
+        return ', '.join(parts) if parts else invoice_str
+        
+    except (ValueError, IndexError):
+        # Fallback: numéro par paires si format non reconnu
+        chiffres = {
+            '0': 'zéro', '1': 'un', '2': 'deux', '3': 'trois', '4': 'quatre',
+            '5': 'cinq', '6': 'six', '7': 'sept', '8': 'huit', '9': 'neuf'
+        }
+        result = []
+        for i in range(0, len(invoice_str), 2):
+            pair = invoice_str[i:i+2]
+            pair_value = ' '.join(chiffres.get(c, c) for c in pair)
+            result.append(pair_value)
+        return ', '.join(result)
+
+
 class LaGraceAssistant:
     """Assistant vocal intelligent LaGrace - Version PRO avec logs détaillés"""
     
     def __init__(self):
         log_info("=== INITIALISATION AI LaGrace ===")
         
-        self.tts = TTSService()
+        self.socket = SocketClient()
+        # ✅ NE PAS passer le socket au TTS
+        # Le TTS joue uniquement via sounddevice (Electron), PAS via le navigateur
+        # Cela évite les doublons audio et les conflits de lecture
+        self.tts = TTSService()  # Socket non utilisé - TTS seulement local
         self.stt = STTService()
         self.wake_word: Optional[WakeWordDetector] = None
         self.intent = IntentRecognizer()
-        self.socket = SocketClient()
         self.db = DatabaseService()
         
         self.running = False
@@ -112,6 +188,21 @@ class LaGraceAssistant:
         if self.tts.start():
             log_success("TTS prêt", "TTS")
             services_status['tts'] = True
+            
+            # Vérifier sounddevice si disponible
+            try:
+                import sounddevice as sd
+                devices = sd.query_devices()
+                log_info(f"🔊 Sounddevice disponible - {len(devices)} device(s) détecté(s)", "TTS")
+                if devices:
+                    default_output = sd.default.device[1]
+                    if default_output is not None:
+                        device_info = sd.query_devices(default_output)
+                        log_success(f"📻 Device par défaut: {device_info['name']}", "TTS")
+                    else:
+                        log_warn(f"⚠️ Pas de device output par défaut configuré", "TTS")
+            except Exception as e:
+                log_warn(f"⚠️ Sounddevice check failed: {e}", "TTS")
         else:
             log_warn("TTS non disponible - mode silencieux", "TTS")
             services_status['tts'] = False
@@ -131,7 +222,7 @@ class LaGraceAssistant:
         services_status['wake_word'] = True
         log_debug("Wake Word Detector initialisé", "WAKE")
         
-        # Socket.IO - CRUCIAL pour les annonces
+        # Socket.IO - CRUCIAL pour les annonces (avec timeout court pour startup rapide)
         log_info("Démarrage Socket.IO...", "SOCKET")
         if self.socket.start():
             log_success("Socket.IO démarré", "SOCKET")
@@ -140,9 +231,9 @@ class LaGraceAssistant:
             # Configurer les événements AVANT d'attendre la connexion
             self._setup_socket_events()
             
-            # Attendre la connexion
+            # Attendre la connexion (réduit à 3 secondes pour startup plus rapide)
             log_info("Attente de connexion au serveur Node.js...", "SOCKET")
-            if self.socket.wait_connected(timeout=10):
+            if self.socket.wait_connected(timeout=3):
                 log_success("Connecté au serveur Node.js!", "SOCKET")
             else:
                 log_warn("Pas encore connecté - reconnexion en arrière-plan", "SOCKET")
@@ -150,14 +241,20 @@ class LaGraceAssistant:
             log_warn("Socket.IO non disponible", "SOCKET")
             services_status['socket'] = False
         
-        # Database
-        log_info("Connexion à la base de données...", "DB")
-        if self.db.start():
-            log_success("Base de données connectée", "DB")
-            services_status['db'] = True
-        else:
-            log_warn("Base de données non disponible", "DB")
-            services_status['db'] = False
+        # Database - démarrage asynchrone en arrière-plan
+        log_info("Initialisation base de données en arrière-plan...", "DB")
+        def start_db_async():
+            """Démarrer la BD en thread séparé pour ne pas bloquer le startup"""
+            if self.db.start():
+                log_success("Base de données connectée", "DB")
+                services_status['db'] = True
+            else:
+                log_warn("Base de données non disponible", "DB")
+                services_status['db'] = False
+        
+        db_thread = threading.Thread(target=start_db_async, daemon=True, name="DB-Init")
+        db_thread.start()
+        services_status['db'] = 'initialisation...'
         
         self.running = True
         
@@ -166,12 +263,18 @@ class LaGraceAssistant:
         print(f"{Fore.WHITE}   STATUT DES SERVICES:{Style.RESET_ALL}")
         for svc, status in services_status.items():
             icon = "✅" if status else "❌"
-            color = Fore.GREEN if status else Fore.RED
+            color = Fore.GREEN if status else (Fore.YELLOW if status == 'initialisation...' else Fore.RED)
             print(f"   {color}{icon} {svc.upper()}{Style.RESET_ALL}")
         print(f"{Fore.CYAN}{'='*40}{Style.RESET_ALL}\n")
         
-        # Salutation intelligente au démarrage
-        log_info("Préparation du message de bienvenue...", "AI")
+        # SIGNAL PRÉCOCE - Dire à Electron que l'IA est PRÊTE (avant la salutation)
+        print(f"\n{Fore.GREEN}{'='*60}{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}✅ AI LaGrace PRÊTE !{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}👂 Dites 'LaGrace' suivi de votre commande...{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}{'='*60}{Style.RESET_ALL}\n")
+        
+        # Salutation intelligente au démarrage (en arrière-plan)
+        log_info("Préparation du message de bienvenue (en arrière-plan)...", "AI")
         self._greet_on_startup()
         
         # Démarrer la détection du wake word si STT disponible
@@ -181,11 +284,6 @@ class LaGraceAssistant:
             log_success("Détection 'LaGrace' active", "WAKE")
         else:
             log_warn("Détection du wake word désactivée (STT non disponible)", "WAKE")
-        
-        print(f"\n{Fore.GREEN}{'='*60}{Style.RESET_ALL}")
-        print(f"{Fore.GREEN}✅ AI LaGrace PRÊTE !{Style.RESET_ALL}")
-        print(f"{Fore.CYAN}👂 Dites 'LaGrace' suivi de votre commande...{Style.RESET_ALL}")
-        print(f"{Fore.GREEN}{'='*60}{Style.RESET_ALL}\n")
         
         return True
     
@@ -200,28 +298,35 @@ class LaGraceAssistant:
             return "Bonsoir"
     
     def _greet_on_startup(self):
-        """Salutation intelligente au démarrage du logiciel"""
-        greeting = self._get_time_greeting()
-        hour = datetime.now().hour
-        
-        log_info(f"Salutation de démarrage ({greeting})...", "AI")
-        
-        # Message de bienvenue personnalisé
-        messages = [
-            f"{greeting} ! Je suis LaGrace, votre assistante vocale. "
-            f"Le logiciel La Grâce est prêt. Dites LaGrace pour m'activer.",
+        """Salutation intelligente au démarrage du logiciel - asynchrone"""
+        def greet_async():
+            """Parler en arrière-plan pour ne pas bloquer le startup"""
+            greeting = self._get_time_greeting()
+            hour = datetime.now().hour
             
-            f"{greeting} et bienvenue ! LaGrace est à votre service. "
-            f"Pour m'activer, dites simplement LaGrace suivi de votre demande.",
+            log_info(f"Salutation de démarrage ({greeting})...", "AI")
             
-            f"{greeting} ! Système La Grâce opérationnel. "
-            f"Je suis LaGrace, prête à vous aider. Appelez-moi quand vous voulez."
-        ]
+            # Message de bienvenue personnalisé
+            messages = [
+                f"{greeting} ! Je suis LaGrace, votre assistante vocale. "
+                f"Le logiciel La Grâce est prêt. Dites LaGrace pour m'activer.",
+                
+                f"{greeting} et bienvenue ! LaGrace est à votre service. "
+                f"Pour m'activer, dites simplement LaGrace suivi de votre demande.",
+                
+                f"{greeting} ! Système La Grâce opérationnel. "
+                f"Je suis LaGrace, prête à vous aider. Appelez-moi quand vous voulez."
+            ]
+            
+            message = random.choice(messages)
+            log_speak(message)
+            if self.tts.running:
+                self.tts.speak(message)
+            self._last_greeting_hour = hour
         
-        message = random.choice(messages)
-        log_speak(message)
-        self.tts.speak(message)
-        self._last_greeting_hour = hour
+        # Lancer la salutation en thread séparé pour ne pas bloquer
+        greet_thread = threading.Thread(target=greet_async, daemon=True, name="Greeting")
+        greet_thread.start()
     
     def _setup_socket_events(self):
         """Configurer les événements Socket.IO pour les annonces"""
@@ -232,16 +337,10 @@ class LaGraceAssistant:
             log_info(f"📥 Utilisateur connecté: {data}", "SOCKET")
             username = data.get('username', data.get('name', 'utilisateur'))
             self._current_user = username
-            greeting = self._get_time_greeting()
-            
-            messages = [
-                f"{greeting} {username} ! Bienvenue sur La Grâce. Bonne journée de travail !",
-                f"{greeting} {username} ! Content de vous revoir. Je suis à votre service.",
-                f"Connexion réussie. {greeting} {username} ! Que puis-je faire pour vous ?"
-            ]
-            message = random.choice(messages)
-            log_speak(message)
-            self.tts.speak(message)
+            # ❌ GREETING DÉSACTIVÉ (déjà dit au startup)
+            # greeting = self._get_time_greeting()
+            # messages = [...]
+            # self.tts.speak(message)
         
         # Événement: licence activée
         def on_license_activated(data):
@@ -277,26 +376,39 @@ class LaGraceAssistant:
             except (ValueError, TypeError):
                 pass
             
-            # Message naturel avec variations
+            # ✅ AMÉLIORATION: Formater le numéro de facture pour prononciation naturelle
+            invoice_text = format_invoice_number(invoice) if invoice else ""
+            
+            # Message naturel avec variations (SANS le numéro)
             if seller and str(seller).strip():
                 messages = [
-                    f"La vente de {seller} est finalisée. {client_part} {total_part}. Facture numéro {invoice}.",
-                    f"C'est fait ! {seller} a finalisé une vente {client_part}. {total_part}. Numéro {invoice}.",
-                    f"Nouvelle vente de {seller} ! {total_part}. {client_part}. Facture {invoice}.",
+                    f"La vente de {seller} est finalisée. {client_part} {total_part}.",
+                    f"C'est fait ! {seller} a finalisé une vente {client_part}. {total_part}.",
+                    f"Nouvelle vente de {seller} ! {total_part}. {client_part}.",
                 ]
             else:
                 messages = [
-                    f"La vente est finalisée. {client_part} {total_part}. Facture numéro {invoice}.",
-                    f"Transaction validée ! {client_part} {total_part}. Numéro {invoice}.",
-                    f"Nouvelle vente enregistrée. {total_part}. Facture {invoice}.",
+                    f"La vente est finalisée. {client_part} {total_part}.",
+                    f"Transaction validée ! {client_part} {total_part}.",
+                    f"Nouvelle vente enregistrée. {total_part}.",
                 ]
             
             message = random.choice(messages)
             # Nettoyer les espaces multiples
             message = ' '.join(message.split())
             
+            # ✅ AMÉLIORATION PRO: Parler en deux étapes
+            # 1. Texte normal à vitesse normale
+            # 2. Numéro de facture accéléré
             log_speak(message)
             self.tts.speak(message)
+            
+            # Pause courte avant le numéro
+            if invoice_text:
+                time.sleep(0.3)
+                invoice_announcement = f"Facture {invoice_text}."
+                log_speak(invoice_announcement)
+                self.tts.speak(invoice_announcement)
         
         # Événement: impression démarrée
         def on_print_started(data):
@@ -304,15 +416,28 @@ class LaGraceAssistant:
             facture = data.get('factureNum', data.get('facture', data.get('invoice_number', '')))
             seller = data.get('seller_name', data.get('user', ''))
             
-            if seller and facture:
-                message = f"Impression lancée de {seller}. Facture {facture}."
-            elif facture:
-                message = f"Impression lancée pour la facture {facture}."
+            # ✅ AMÉLIORATION: Formater le numéro de facture
+            facture_text = format_invoice_number(facture) if facture else ""
+            
+            # ✅ AMÉLIORATION PRO: Parler en deux étapes
+            # 1. Annonce normale
+            # 2. Numéro accéléré
+            if seller and facture_text:
+                message = f"Impression lancée de {seller}."
+            elif facture_text:
+                message = f"Impression lancée."
             else:
                 message = "Impression en cours..."
             
             log_speak(message)
             self.tts.speak(message)
+            
+            # Pause courte avant le numéro
+            if facture_text:
+                time.sleep(0.3)
+                facture_announcement = f"Facture {facture_text}."
+                log_speak(facture_announcement)
+                self.tts.speak(facture_announcement)
         
         # Événement: impression terminée
         def on_print_done(data):
@@ -385,22 +510,31 @@ class LaGraceAssistant:
         # Enregistrer tous les événements
         log_debug("Enregistrement des callbacks Socket.IO...", "SOCKET")
         
+        # ✅ CORRECTION DOUBLON AUDIO: utiliser SEULEMENT l'événement principal
+        # Les alias (user:connected, sale:finalized, etc) causaient que le même message 
+        # soit parlé 2x. Garder uniquement les événements primaires.
+        
         self.socket.on('user:login', on_user_login)
-        self.socket.on('user:connected', on_user_login)
+        # ❌ SUPPRIMÉ doublon: self.socket.on('user:connected', on_user_login)
+        
         self.socket.on('license:activated', on_license_activated)
+        
         self.socket.on('sale:created', on_sale_created)
-        self.socket.on('sale:finalized', on_sale_created)
+        # ❌ SUPPRIMÉ doublon: self.socket.on('sale:finalized', on_sale_created)
+        
         self.socket.on('print:started', on_print_started)
-        self.socket.on('print:progress', on_print_started)
+        # ❌ SUPPRIMÉ doublon: self.socket.on('print:progress', on_print_started)
+        
         self.socket.on('print:done', on_print_done)
-        self.socket.on('print:completed', on_print_done)
+        # ❌ SUPPRIMÉ doublon: self.socket.on('print:completed', on_print_done)
+        
         self.socket.on('print:error', on_print_error)
         self.socket.on('stock:low', on_stock_low)
         self.socket.on('sync:completed', on_sync_completed)
         self.socket.on('debt:created', on_debt_created)
         self.socket.on('debt:paid', on_debt_paid)
         
-        log_success("Événements Socket.IO configurés (14 événements)", "SOCKET")
+        log_success("✅ Événements Socket.IO configurés (9 événements - doublons supprimés)", "SOCKET")
     
     def _on_wake_word(self):
         """Appelé quand le wake word est détecté"""

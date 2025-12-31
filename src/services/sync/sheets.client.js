@@ -305,9 +305,11 @@ export class SheetsClient {
     
     const sinceDate = since ? (typeof since === 'string' ? since : since.toISOString()) : new Date(0).toISOString();
     const allData = [];
+    const seenUuids = new Set(); // DEDUPLICATION: Track UUIDs to prevent duplicates across pages
     let cursor = options.startCursor || null;
     let tries = 0;
     let pageCount = 0;
+    let duplicatesRemoved = 0;
 
     syncLogger.info(`📥 [${entity.toUpperCase()}] Début pull paginé${full ? ' (FULL IMPORT)' : ''}${unitLevel ? ` | Unit level: ${unitLevel}` : ''}`);
 
@@ -329,15 +331,27 @@ export class SheetsClient {
         pageCount++;
 
         if (res?.data?.success) {
-          const pageData = Array.isArray(res.data.data) ? res.data.data : [];
+          let pageData = Array.isArray(res.data.data) ? res.data.data : [];
           const nextCursor = res.data.next_cursor || null;
           const done = res.data.done || false;
 
-          allData.push(...pageData);
-          syncLogger.info(`   ✅ [${entity.toUpperCase()}] Page ${pageCount}: ${pageData.length} item(s) en ${ms}ms | Total: ${allData.length}${nextCursor ? ` | Next: ${nextCursor}` : ''}${done ? ' | ✅ Terminé' : ''}`);
+          // DEDUPLICATION: Filter out duplicates based on UUID
+          const filteredPageData = [];
+          for (const item of pageData) {
+            if (item.uuid && seenUuids.has(item.uuid)) {
+              duplicatesRemoved++;
+              syncLogger.warn(`   ⚠️ [${entity.toUpperCase()}] UUID dupliquée détectée et filtrée: ${item.uuid}`);
+            } else {
+              if (item.uuid) seenUuids.add(item.uuid);
+              filteredPageData.push(item);
+            }
+          }
+
+          allData.push(...filteredPageData);
+          syncLogger.info(`   ✅ [${entity.toUpperCase()}] Page ${pageCount}: ${filteredPageData.length}/${pageData.length} item(s) en ${ms}ms (${duplicatesRemoved} doublons supprimés) | Total: ${allData.length}${nextCursor ? ` | Next: ${nextCursor}` : ''}${done ? ' | ✅ Terminé' : ''}`);
 
           if (done || !nextCursor) {
-            syncLogger.info(`✅ [${entity.toUpperCase()}] Pull paginé terminé: ${allData.length} item(s) en ${pageCount} page(s)`);
+            syncLogger.info(`✅ [${entity.toUpperCase()}] Pull paginé terminé: ${allData.length} item(s) en ${pageCount} page(s) (${duplicatesRemoved} doublons supprimés)`);
             return { 
               success: true, 
               data: allData,
