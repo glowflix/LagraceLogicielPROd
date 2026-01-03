@@ -13,7 +13,8 @@ import {
   ChevronDown,
   ArrowUp,
   Upload,
-  Loader2
+  Loader2,
+  Trash2
 } from 'lucide-react';
 import { useStore } from '../store/useStore';
 import axios from 'axios';
@@ -222,10 +223,11 @@ const ProductsPage = () => {
   const [visualValues, setVisualValues] = useState({}); // Map<rowId, {field: value}>
   const visualValuesTimeoutsRef = useRef(new Map()); // Map<rowId, timeoutId>
   
-  // Refs pour debounce - un timeout par rowId pour éviter les conflits
-  const saveTimeoutsRef = useRef(new Map()); // Map<rowId, timeoutId>
+  // Refs pour auto-save IA
   const pendingSavesRef = useRef(new Map());
   const savingLoopRef = useRef(false); // ✅ Boucle de sauvegarde au lieu d'un lock simple
+  const idleSaveTimersRef = useRef(new Map()); // Map<rowId, timeoutId>
+  const lastInputAtRef = useRef(new Map());    // Map<rowId, timestamp>
   
   // ✅ Ref pour éviter les closures stale dans les callbacks
   const editingValuesRef = useRef({});
@@ -246,6 +248,18 @@ const ProductsPage = () => {
         if (IS_DEV && authToken) {
           console.log('🔐 [ProductsPage] Token chargé:', authToken.substring(0, 20) + '...');
         }
+        
+        // ✅ Log du système PRO d'auto-save
+        if (IS_DEV) {
+          console.log('%c✨ [ProductsPage] AUTO-SAVE PRO ACTIF', 'color: #10b981; font-size: 14px; font-weight: bold;');
+          console.log('%c📋 Système intelligent d\'auto-save:', 'color: #10b981; font-weight: bold;');
+          console.log('%c  • 500ms debounce après dernière frappe', 'color: #10b981;');
+          console.log('%c  • Save immédiat au blur (sortie du champ)', 'color: #10b981;');
+          console.log('%c  • Save immédiat si souris quitte la ligne', 'color: #10b981;');
+          console.log('%c  • Déduplication: pas de save si valeur inchangée', 'color: #10b981;');
+          console.log('%c  • Retry automatique (3x) en cas d\'erreur', 'color: #10b981;');
+        }
+        
         await Promise.all([loadProducts(), loadCurrentRate()]);
       } catch (error) {
         // En mode Electron, éviter les console.error qui peuvent causer des problèmes
@@ -260,16 +274,16 @@ const ProductsPage = () => {
     
     // Nettoyer les timeouts au démontage du composant
     return () => {
-      saveTimeoutsRef.current.forEach((timeoutId) => {
-        clearTimeout(timeoutId);
-      });
-      saveTimeoutsRef.current.clear();
-      
       // Nettoyer aussi les timeouts des valeurs visuelles
       visualValuesTimeoutsRef.current.forEach((timeoutId) => {
         clearTimeout(timeoutId);
       });
       visualValuesTimeoutsRef.current.clear();
+      
+      // Cleanup idle-save timers
+      idleSaveTimersRef.current.forEach((t) => clearTimeout(t));
+      idleSaveTimersRef.current.clear();
+      lastInputAtRef.current.clear();
     };
   }, [loadProducts, loadCurrentRate, authToken]);
 
@@ -296,6 +310,94 @@ const ProductsPage = () => {
   const calculateUSD = useCallback((fc) => {
     return Number(((fc || 0) / (currentRate || 2800)).toFixed(2));
   }, [currentRate]);
+
+  // ✅ HELPERS: Payload normalization + bump last_update
+  const nowISO = () => new Date().toISOString();
+
+  const normalizeMark = (v) => {
+    const s = String(v ?? '').trim();
+    return s; // ✅ Jamais null - retourne '' si vide (DB-safe)
+  };
+
+  const omitUndefined = (obj) =>
+    Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined));
+
+  const toNumberSafe = (v, fallback = 0) => {
+    const s = String(v ?? '').trim();
+    if (s === '') return fallback;
+    const n = parseFloat(s);
+    return Number.isFinite(n) ? n : fallback;
+  };
+
+  // Construit une unit "safe" (sans created_at/updated_at etc.)
+  const buildUnitPayload = (u, overrides = {}) => {
+    const merged = { ...u, ...overrides };
+
+    // ✅ PRO Pattern: Mark est MODIFIABLE, jamais utilisé pour identification
+    // Ne l'envoyer que s'il existe et a été modifié ou qu'il existe déjà
+    const result = omitUndefined({
+      id: merged.id, // important pour identifier l'unité
+      unit_level: merged.unit_level,
+      
+      // ⚠️ ATTENTION: unit_mark MODIFIABLE
+      // Seulement envoyer si:
+      // 1. L'utilisateur l'a modifié (dans overrides)
+      // 2. Ou s'il existe déjà dans la base (merged.unit_mark !== undefined)
+      ...(overrides.unit_mark !== undefined 
+        ? { unit_mark: normalizeMark(overrides.unit_mark) }
+        : merged.unit_mark !== undefined
+          ? { unit_mark: normalizeMark(merged.unit_mark) }
+          : {}),
+
+      stock_initial: merged.stock_initial !== undefined ? toNumberSafe(merged.stock_initial, 0) : undefined,
+      stock_current: merged.stock_current !== undefined ? toNumberSafe(merged.stock_current, 0) : undefined,
+
+      purchase_price_usd: merged.purchase_price_usd !== undefined ? toNumberSafe(merged.purchase_price_usd, 0) : undefined,
+      sale_price_usd: merged.sale_price_usd !== undefined ? toNumberSafe(merged.sale_price_usd, 0) : undefined,
+
+      auto_stock_factor: merged.auto_stock_factor !== undefined ? Math.round(toNumberSafe(merged.auto_stock_factor, 1)) : undefined,
+      qty_step: merged.qty_step !== undefined ? Math.round(toNumberSafe(merged.qty_step, 1)) : undefined,
+
+      extra1: merged.extra1 ?? null,
+      extra2: merged.extra2 ?? null,
+      
+      // ✅ CRITIQUE: UUID STABLE - DOIT ÊTRE ENVOYÉ pour identifier l'unité au backend
+      // Le backend utilise uuid pour retrouver l'unité existante et la modifier
+      // Ne JAMAIS envoyer undefined - on le laisse absent du payload plutôt
+      ...(merged.uuid ? { uuid: merged.uuid } : {}),
+
+      // ✅ champs de sync
+      last_update: merged.last_update || nowISO(),
+      synced_at: merged.synced_at ?? null,
+    });
+
+    return result;
+  };
+
+  // Endpoint: utilise ID si dispo, sinon code
+  const getProductKeyFromRow = (row) => row?.product_id ?? row?.product_code;
+
+  // ✅ Affichage "optimiste" post-save (ou pendant sync)
+  const setVisualForRow = useCallback((rowId, patch, ttlMs = 8000) => {
+    setVisualValues((prev) => ({
+      ...prev,
+      [rowId]: { ...(prev[rowId] || {}), ...patch },
+    }));
+
+    const old = visualValuesTimeoutsRef.current.get(rowId);
+    if (old) clearTimeout(old);
+
+    const t = setTimeout(() => {
+      setVisualValues((prev) => {
+        const copy = { ...prev };
+        delete copy[rowId];
+        return copy;
+      });
+      visualValuesTimeoutsRef.current.delete(rowId);
+    }, ttlMs);
+
+    visualValuesTimeoutsRef.current.set(rowId, t);
+  }, []);
 
   // Transformer les produits en format tableau - simplifié et protégé
   const tableData = useMemo(() => {
@@ -330,6 +432,7 @@ const ProductsPage = () => {
                 product_code: product.code || '',
                 product_name: product.name || '',
                 unit_id: unit.id,
+                unit_uuid: unit.uuid ?? null,                    // ✅ utile si id absent / sync
                 unit_level: unit.unit_level || '',
                 unit_mark: unit.unit_mark || '',
                 stock_current: Number(unit.stock_current) || 0,
@@ -337,7 +440,7 @@ const ProductsPage = () => {
                 sale_price_fc: calculatedFC,
                 purchase_price_usd: Number(unit.purchase_price_usd) || 0,
                 // NOUVEAU: Automatisation Stock (seuil d'alerte stock)
-                auto_stock_factor: Number(unit.auto_stock_factor) || 1,
+                auto_stock_factor: (unit.auto_stock_factor ?? 1), // ✅ 0 reste 0
               });
             } catch (err) {
               if (IS_DEV) {
@@ -613,6 +716,13 @@ const ProductsPage = () => {
     }
   }, [filteredData]);
 
+  // ✅ Obtenir le code du produit depuis la ligne
+  const getProductCode = (row) => {
+    // ✅ IMPORTANT: Utiliser product_code, PAS product_id (product_id est un ID numérique)
+    // L'API attend un code pour les endpoints GET/PUT /:code
+    return row?.product_code || '';
+  };
+
   // Créer un produit
   // IMPORTANT: USD est toujours la source de vérité, FC est calculé côté backend
   const handleCreateProduct = useCallback(async (row, edits) => {
@@ -622,6 +732,9 @@ const ProductsPage = () => {
     if (!productName) {
       throw new Error('Le nom du produit est requis');
     }
+
+    // ✅ Normaliser Mark (peut être vide; validation au blur)
+    const mark = normalizeMark(edits?.unit_mark);
     
     // Calculer USD depuis les edits (si FC modifié, convertir en USD)
     // ✅ Convertir en string d'abord pour s'assurer qu'on parse la valeur complète
@@ -661,32 +774,51 @@ const ProductsPage = () => {
       }) : null;
       
       if (existingCarton) {
-        // Utiliser le code et nom du CARTON existant
-        const code = existingCarton.code;
-        const name = existingCarton.name;
-        
-        // Ajouter la nouvelle unité au produit existant
-        const existingUnits = existingCarton.units || [];
-        // ✅ Parser correctement les valeurs numériques
-        const stockStr = String(edits?.stock_current || '').trim();
-        const stockValue = stockStr !== '' ? (parseFloat(stockStr) || 0) : 0;
-        const purchaseStr = String(edits?.purchase_price_usd || '').trim();
-        const purchaseValue = purchaseStr !== '' ? (parseFloat(purchaseStr) || 0) : 0;
-        
-        const newUnit = {
-          unit_level: unitLevel,
-          unit_mark: edits?.unit_mark || '',
-          stock_current: stockValue,
-          sale_price_usd: salePriceUSD, // USD comme source de vérité
-          // Ne pas envoyer sale_price_fc, le backend le calculera depuis USD
-          purchase_price_usd: purchaseValue,
+        const auth = getAuthHeaders();
+        const productKey = existingCarton.id ?? existingCarton.code;
+
+        // Reprendre le produit "frais" (évite unités périmées)
+        let currentProduct = existingCarton;
+        try {
+          const r = await axios.get(`${API_URL}/api/products/${productKey}`, auth);
+          currentProduct = r.data;
+        } catch {
+          // si GET échoue, on fallback sur existingCarton
+        }
+
+        const now = nowISO();
+
+        // ✅ valeurs numériques propres
+        const stockValue = toNumberSafe(edits?.stock_current, 0);
+        const purchaseValue = toNumberSafe(edits?.purchase_price_usd, 0);
+
+        const autoStock = Math.round(toNumberSafe(edits?.auto_stock_factor, 1));
+        const newUnit = buildUnitPayload(
+          {
+            unit_level: unitLevel,
+            unit_mark: mark,
+            stock_current: stockValue,
+            purchase_price_usd: purchaseValue,
+            sale_price_usd: salePriceUSD, // USD source de vérité
+            auto_stock_factor: autoStock,
+            qty_step: 1,
+            extra1: null,
+            extra2: null,
+          },
+          { last_update: now, synced_at: null }
+        );
+
+        const safeUnits = (currentProduct.units || []).map((u) => buildUnitPayload(u));
+        safeUnits.push(newUnit);
+
+        const payload = {
+          name: currentProduct.name,
+          units: safeUnits,
         };
-        
-        await axios.post(`${API_URL}/api/products`, {
-          code,
-          name,
-          units: [...existingUnits, newUnit]
-        }, getAuthHeaders());
+
+        // ✅ UPDATE (pas POST)
+        await axios.put(`${API_URL}/api/products/${productKey}`, payload, auth);
+        return;
       } else {
         // Demander confirmation via modal
         return new Promise((resolve, reject) => {
@@ -707,16 +839,18 @@ const ProductsPage = () => {
                   const purchaseStr = String(edits?.purchase_price_usd || '').trim();
                   const purchaseValue = purchaseStr !== '' ? (parseFloat(purchaseStr) || 0) : 0;
                   
+                  const autoStock = Math.round(toNumberSafe(edits?.auto_stock_factor, 1));
                   await axios.post(`${API_URL}/api/products`, {
                     code,
                     name: productName,
                     units: [{
                       unit_level: unitLevel,
-                      unit_mark: edits?.unit_mark || '',
+                      unit_mark: mark,
                       stock_current: stockValue,
                       sale_price_usd: salePriceUSD, // USD comme source de vérité
                       // Ne pas envoyer sale_price_fc, le backend le calculera depuis USD
                       purchase_price_usd: purchaseValue,
+                      auto_stock_factor: autoStock,  // ✅ ADD
                     }]
                   }, getAuthHeaders());
                   setModalState({ isOpen: false, type: '', data: null });
@@ -734,16 +868,18 @@ const ProductsPage = () => {
                   const purchaseStr = String(edits?.purchase_price_usd || '').trim();
                   const purchaseValue = purchaseStr !== '' ? (parseFloat(purchaseStr) || 0) : 0;
                   
+                  const autoStock = Math.round(toNumberSafe(edits?.auto_stock_factor, 1));
                   await axios.post(`${API_URL}/api/products`, {
                     code,
                     name: customName,
                     units: [{
                       unit_level: unitLevel,
-                      unit_mark: edits?.unit_mark || '',
+                      unit_mark: mark,
                       stock_current: stockValue,
                       sale_price_usd: salePriceUSD, // USD comme source de vérité
                       // Ne pas envoyer sale_price_fc, le backend le calculera depuis USD
                       purchase_price_usd: purchaseValue,
+                      auto_stock_factor: autoStock,  // ✅ ADD
                     }]
                   }, getAuthHeaders());
                   setModalState({ isOpen: false, type: '', data: null });
@@ -769,147 +905,204 @@ const ProductsPage = () => {
       const purchaseStr = String(edits?.purchase_price_usd || '').trim();
       const purchaseValue = purchaseStr !== '' ? (parseFloat(purchaseStr) || 0) : 0;
       
+      const autoStock = Math.round(toNumberSafe(edits?.auto_stock_factor, 1));
       await axios.post(`${API_URL}/api/products`, {
         code,
         name: productName,
         units: [{
           unit_level: 'CARTON',
-          unit_mark: edits?.unit_mark || '',
+          unit_mark: mark,
           stock_current: stockValue,
           sale_price_usd: salePriceUSD, // USD comme source de vérité
           // Ne pas envoyer sale_price_fc, le backend le calculera depuis USD
           purchase_price_usd: purchaseValue,
+          auto_stock_factor: autoStock,  // ✅ ADD
         }]
       }, getAuthHeaders());
     }
   }, [products, calculateFC, calculateUSD, getAuthHeaders]);
 
   // Mettre à jour un produit
-  // IMPORTANT: USD est toujours la source de vérité, FC est calculé côté backend
+  // IMPORTANT: USD est la source de vérité; FC est dérivé (backend + UI)
   const handleUpdateProduct = useCallback(async (row, edits) => {
-    if (row.is_empty) return;
-    
+    if (!row || row.is_empty) return;
+
+    const auth = getAuthHeaders(); // ✅ défini ici pour être dispo dans catch
+    // ✅ CORRECTION: Utiliser product_code (pas product_id) car l'API attend /api/products/:code
+    const productCode = getProductCode(row);
+    if (!productCode) {
+      throw new Error('Code produit invalide');
+    }
+
+    // --- construire unitUpdates (sans sale_price_fc) ---
     const unitUpdates = {};
     let productNameUpdate;
-    
-    // Règle: USD = source de vérité, FC = calculé automatiquement
-    // Si l'utilisateur modifie FC, on calcule USD et on envoie USD au backend
-    // Si l'utilisateur modifie USD, on envoie USD au backend (le backend recalculera FC)
-    // IMPORTANT: Vérifier FC en premier car si FC est modifié, USD est recalculé automatiquement
+
+    // Prix: si FC modifié => calcul USD; sinon si USD modifié => USD direct
     if (edits.sale_price_fc !== undefined) {
-      // Modification de FC → calculer USD depuis FC et utiliser USD comme source
-      // ✅ Convertir en string d'abord pour s'assurer qu'on parse la valeur complète
-      const fcStr = String(edits.sale_price_fc || '').trim();
-      const fc = fcStr !== '' ? parseFloat(fcStr) : 0;
-      if (isNaN(fc) || !isFinite(fc)) {
-        if (IS_DEV) {
-          console.warn(`⚠️ [ProductsPage] Valeur FC invalide: "${edits.sale_price_fc}", utilisation de 0`);
-        }
-        return; // Ne pas sauvegarder si la valeur est invalide
-      }
-      const calculatedUSD = calculateUSD(fc);
-      unitUpdates.sale_price_usd = calculatedUSD;
-      if (IS_DEV) {
-        console.log(`💰 [ProductsPage] Conversion FC → USD: ${fc} FC → ${calculatedUSD} USD (valeur originale: "${edits.sale_price_fc}")`);
-      }
-      // Ne pas envoyer sale_price_fc, le backend le calculera depuis USD
+      const fc = toNumberSafe(edits.sale_price_fc, NaN);
+      if (!Number.isFinite(fc)) return; // valeur invalide => ne pas save
+      unitUpdates.sale_price_usd = calculateUSD(fc);
     } else if (edits.sale_price_usd !== undefined) {
-      // Modification directe de USD → utiliser USD comme source
-      // ✅ Convertir en string d'abord pour s'assurer qu'on parse la valeur complète
-      const usdStr = String(edits.sale_price_usd || '').trim();
-      const usd = usdStr !== '' ? parseFloat(usdStr) : 0;
-      if (isNaN(usd) || !isFinite(usd)) {
-        if (IS_DEV) {
-          console.warn(`⚠️ [ProductsPage] Valeur USD invalide: "${edits.sale_price_usd}", utilisation de 0`);
-        }
-        return; // Ne pas sauvegarder si la valeur est invalide
-      }
+      const usd = toNumberSafe(edits.sale_price_usd, NaN);
+      if (!Number.isFinite(usd)) return;
       unitUpdates.sale_price_usd = usd;
-      if (IS_DEV) {
-        console.log(`💰 [ProductsPage] Modification directe USD: ${usd} USD (valeur originale: "${edits.sale_price_usd}")`);
-      }
-      // Ne pas envoyer sale_price_fc, le backend le calculera depuis USD
     }
-    
-    // ✅ Parser correctement stock_current pour préserver la valeur complète
-    if (edits.stock_current !== undefined) {
-      const stockStr = String(edits.stock_current || '').trim();
-      const stock = stockStr !== '' ? parseFloat(stockStr) : 0;
-      if (!isNaN(stock) && isFinite(stock)) {
-        unitUpdates.stock_current = stock;
-      } else {
-        if (IS_DEV) {
-          console.warn(`⚠️ [ProductsPage] Valeur stock invalide: "${edits.stock_current}", utilisation de 0`);
+
+    if (edits.stock_current !== undefined) unitUpdates.stock_current = toNumberSafe(edits.stock_current, 0);
+    if (edits.purchase_price_usd !== undefined) unitUpdates.purchase_price_usd = toNumberSafe(edits.purchase_price_usd, 0);
+
+    if (edits.auto_stock_factor !== undefined) unitUpdates.auto_stock_factor = Math.round(toNumberSafe(edits.auto_stock_factor, 1));
+    if (edits.unit_mark !== undefined) {
+      unitUpdates.unit_mark = normalizeMark(edits.unit_mark);  // ✅ trim; never null (always '' or string)
+    }
+
+    if (edits.product_name !== undefined) productNameUpdate = String(edits.product_name ?? '').trim();
+
+    // ✅ RETRY AUTOMATIQUE: Si erreur temporaire, réessayer jusqu'à 3 fois
+    const maxRetries = 3;
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const productResponse = await axios.get(`${API_URL}/api/products/${productCode}`, auth);
+        const currentProduct = productResponse.data;
+
+        const now = nowISO();
+
+        // ✅ update uniquement l'unité ciblée + bump last_update + synced_at=null
+        const updatedUnits = (currentProduct.units || []).map((u) => {
+          const isTargetUnit =
+            (u?.id != null && row.unit_id != null && u.id === row.unit_id) ||
+            (u?.uuid && row.unit_uuid && u.uuid === row.unit_uuid);
+          if (isTargetUnit) {
+            const merged = { ...u, ...unitUpdates };
+            return buildUnitPayload(merged, { last_update: now, synced_at: null });
+          }
+          // autres unités: payload propre, on ne bump pas
+          return buildUnitPayload(u);
+        });
+
+        const updatePayload = {
+          name: productNameUpdate || currentProduct.name,
+          units: updatedUnits,
+        };
+
+        // ✅ DEBUG: Vérifier que unit_mark est bien dans le payload
+        if (IS_DEV && attempt === 1) {
+          const targetUnit = updatedUnits.find(u => u.id === row.unit_id);
+          console.log('📋 [handleUpdateProduct] DEBUG unit_mark:');
+          console.log('   ├─ edits.unit_mark (raw):', edits?.unit_mark);
+          console.log('   ├─ unitUpdates.unit_mark:', unitUpdates.unit_mark);
+          console.log('   └─ payload.unit_mark:', targetUnit?.unit_mark);
         }
-        unitUpdates.stock_current = 0;
-      }
-    }
-    
-    // ✅ Parser correctement purchase_price_usd pour préserver la valeur complète
-    if (edits.purchase_price_usd !== undefined) {
-      const purchaseStr = String(edits.purchase_price_usd || '').trim();
-      const purchase = purchaseStr !== '' ? parseFloat(purchaseStr) : 0;
-      if (!isNaN(purchase) && isFinite(purchase)) {
-        unitUpdates.purchase_price_usd = purchase;
-      } else {
-        if (IS_DEV) {
-          console.warn(`⚠️ [ProductsPage] Valeur purchase_price_usd invalide: "${edits.purchase_price_usd}", utilisation de 0`);
+
+        if (IS_DEV && attempt === 1) {
+          console.log(`📤 [ProductsPage] PUT /api/products/${productCode}`);
+          console.log('   Payload:', JSON.stringify(updatePayload, null, 2));
         }
-        unitUpdates.purchase_price_usd = 0;
+
+        const response = await axios.put(`${API_URL}/api/products/${productCode}`, updatePayload, auth);
+
+        if (IS_DEV) {
+          console.log('✅ [ProductsPage] Produit mis à jour:', response.data);
+        }
+
+        // ✅ Succès - sortir de la boucle de retry
+        return;
+
+      } catch (error) {
+        lastError = error;
+        
+        // ✅ Vérifier si c'est une erreur temporaire (409 Conflict, 503 Service Unavailable, timeout, etc.)
+        const statusCode = error.response?.status;
+        const isTemporaryError = statusCode === 409 || statusCode === 503 || !statusCode; // 409=Conflict, 503=Unavailable, no status=timeout/network
+        
+        if (attempt === 1) {
+          if (IS_DEV) {
+            console.error(`❌ [ProductsPage] Tentative ${attempt}/${maxRetries} - Erreur mise à jour produit:`, error);
+            console.error('   Status:', statusCode);
+            console.error('   Message:', error.response?.data?.error || error.message);
+            console.error('   Temporaire:', isTemporaryError);
+            console.error('   productCode:', productCode);
+          }
+        }
+
+        // Si c'est une erreur temporaire ET qu'on peut réessayer, attendre puis réessayer
+        if (isTemporaryError && attempt < maxRetries) {
+          if (IS_DEV) {
+            console.log(`⏳ [ProductsPage] Retry ${attempt + 1}/${maxRetries} après 500ms...`);
+          }
+          await new Promise(r => setTimeout(r, 500 + attempt * 200)); // Délai croissant: 500ms, 700ms, 900ms
+          continue; // Réessayer
+        }
+
+        // ✅ Erreur non-temporaire ou dernier essai: jeter l'erreur
+        throw error;
       }
     }
-    
-    if (edits.unit_mark !== undefined) unitUpdates.unit_mark = edits.unit_mark;
-    if (edits.product_name !== undefined) productNameUpdate = edits.product_name;
-    
-    // Récupérer le produit actuel pour préserver les autres unités
+
+    // Ne devrait pas arriver ici (lancé dans le try/catch)
+    throw lastError;
+
+  }, [getAuthHeaders, calculateUSD, buildUnitPayload, getProductCode]);
+
+  // ✅ NOUVEAU: Supprimer un produit
+  const handleDeleteProduct = useCallback(async (row) => {
+    if (!row || row.is_empty) return;
+
+    const productCode = getProductCode(row);
+    if (!productCode) {
+      alert('Code produit invalide');
+      return;
+    }
+
+    // Demander confirmation
+    const confirmed = window.confirm(
+      `Êtes-vous sûr de vouloir supprimer le produit "${row.product_name}" (${productCode})?\n\nCette action est irréversible.`
+    );
+    if (!confirmed) return;
+
     try {
-      // Calculer les headers une seule fois et réutiliser
       const auth = getAuthHeaders();
-      const productResponse = await axios.get(`${API_URL}/api/products/${row.product_code}`, auth);
-      const currentProduct = productResponse.data;
-      
-      // Mettre à jour l'unité spécifique
-      // IMPORTANT: Ne pas inclure sale_price_fc dans les unitUpdates envoyés au backend
-      // Le backend calculera toujours FC depuis USD
-      const updatedUnits = (currentProduct.units || []).map(u => {
-        if (u.id === row.unit_id) {
-          // Créer un nouvel objet sans sale_price_fc pour forcer le backend à le recalculer
-          const { sale_price_fc, ...unitWithoutFC } = { ...u, ...unitUpdates };
-          return unitWithoutFC;
-        }
-        return u;
-      });
-      
-      // Mettre à jour via l'API - séparer product name des unit updates
-      const updatePayload = {
-        name: productNameUpdate ?? currentProduct.name,
-        units: updatedUnits
-      };
-      
-      // Log de la requête pour débogage réseau
-      if (IS_DEV) {
-        console.log(`📤 [ProductsPage] PUT /api/products/${row.product_code}`);
-        console.log('   Payload:', JSON.stringify(updatePayload, null, 2));
-        console.log('   Headers:', auth);
-      }
-      
-      const response = await axios.put(`${API_URL}/api/products/${row.product_code}`, updatePayload, auth);
       
       if (IS_DEV) {
-        console.log(`✅ [ProductsPage] Produit mis à jour:`, response.data);
+        console.log(`🗑️ [ProductsPage] Suppression produit: ${productCode}`);
       }
+
+      await axios.delete(`${API_URL}/api/products/${productCode}`, auth);
+
+      if (IS_DEV) {
+        console.log('✅ [ProductsPage] Produit supprimé avec succès');
+      }
+
+      // Afficher message de succès
+      setSaveMessage({ type: 'success', text: 'Produit supprimé avec succès' });
+      setTimeout(() => setSaveMessage({ type: '', text: '' }), 2000);
+
+      // Recharger les produits via le store
+      await loadProducts();
+
     } catch (error) {
       if (IS_DEV) {
-        console.error('❌ [ProductsPage] Erreur mise à jour produit:', error);
-        console.error('   Code:', error.response?.status);
+        console.error('❌ [ProductsPage] Erreur suppression produit:', error);
+        console.error('   Status:', error.response?.status);
         console.error('   Message:', error.response?.data?.error || error.message);
-        console.error('   Token présent:', !!authToken);
-        console.error('   Headers envoyés:', auth);
       }
-      throw error;
+
+      let errorMessage = 'Erreur lors de la suppression';
+      if (error.response?.status === 401) {
+        errorMessage = 'Erreur d\'authentification. Veuillez vous reconnecter.';
+      } else if (error.response?.status === 404) {
+        errorMessage = 'Produit non trouvé';
+      } else {
+        errorMessage = error.response?.data?.error || errorMessage;
+      }
+
+      setSaveMessage({ type: 'error', text: errorMessage });
+      setTimeout(() => setSaveMessage({ type: '', text: '' }), 3000);
     }
-  }, [calculateFC, calculateUSD, getAuthHeaders]);
+  }, [getAuthHeaders, getProductCode, loadProducts]);
 
   // Sauvegarder les changements en attente avec boucle (défini avant scheduleSave)
   // ✅ Utilise une boucle au lieu d'un lock pour éviter de perdre les modifications pendant la sauvegarde
@@ -976,6 +1169,47 @@ const ProductsPage = () => {
             });
           }
           
+          // ✅ PRO: Vérifier que les données ont RÉELLEMENT changé (évite 409 sur update inutile)
+          const hasActualChanges = () => {
+            if (edits.product_name !== undefined && String(edits.product_name ?? '').trim() !== String(row.product_name ?? '').trim()) return true;
+            if (edits.unit_mark !== undefined && normalizeMark(edits.unit_mark) !== normalizeMark(row.unit_mark)) return true;
+            if (edits.stock_current !== undefined && toNumberSafe(edits.stock_current, 0) !== toNumberSafe(row.stock_current, 0)) return true;
+            if (edits.purchase_price_usd !== undefined && toNumberSafe(edits.purchase_price_usd, 0) !== toNumberSafe(row.purchase_price_usd, 0)) return true;
+            
+            const lastPriceField = lastPriceEditedRef.current.get(rowId);
+            if (lastPriceField === 'sale_price_fc' && edits.sale_price_fc !== undefined) {
+              const fc = toNumberSafe(edits.sale_price_fc, 0);
+              if (fc !== toNumberSafe(row.sale_price_fc, 0)) return true;
+            }
+            if (lastPriceField === 'sale_price_usd' && edits.sale_price_usd !== undefined) {
+              const usd = toNumberSafe(edits.sale_price_usd, 0);
+              if (usd !== toNumberSafe(row.sale_price_usd, 0)) return true;
+            }
+            
+            // ✅ Auto Stock
+            if (edits.auto_stock_factor !== undefined) {
+              const newVal = Math.round(toNumberSafe(edits.auto_stock_factor, 1));
+              const oldVal = Math.round(toNumberSafe(row.auto_stock_factor, 1));
+              if (newVal !== oldVal) return true;
+            }
+            
+            return false;
+          };
+          
+          if (!hasActualChanges()) {
+            if (IS_DEV) {
+              console.log(`⏭️ [savePendingChanges] Aucun changement pour ${rowId}, skip update`);
+            }
+            // Nettoyer pending et edits
+            pendingSavesRef.current.delete(rowId);
+            setEditingValues((prev) => {
+              const copy = { ...prev };
+              delete copy[rowId];
+              return copy;
+            });
+            return; // Skip update
+          }
+          
           // Sinon, mettre à jour
           return handleUpdateProduct(row, edits).catch(err => {
             if (IS_DEV) {
@@ -986,6 +1220,51 @@ const ProductsPage = () => {
               console.error('   Token présent:', !!authToken);
             }
             throw err;
+          }).then(() => {
+            // ✅ UI post-save: afficher tout de suite les valeurs
+            const lastPriceField = lastPriceEditedRef.current.get(rowId);
+            const patch = {};
+
+            if (edits.product_name !== undefined) patch.product_name = String(edits.product_name ?? '');
+            
+            // ✅ Normaliser Mark aussi au patch visuel (pas juste au save)
+            if (edits.unit_mark !== undefined) {
+              const m = normalizeMark(edits.unit_mark);
+              if (!m) {
+                throw new Error('Le Mark est obligatoire');
+              }
+              patch.unit_mark = m;
+            }
+
+            if (edits.stock_current !== undefined) patch.stock_current = toNumberSafe(edits.stock_current, 0);
+            if (edits.purchase_price_usd !== undefined) patch.purchase_price_usd = toNumberSafe(edits.purchase_price_usd, 0);
+
+            if (lastPriceField === 'sale_price_fc' && edits.sale_price_fc !== undefined) {
+              const fc = toNumberSafe(edits.sale_price_fc, 0);
+              patch.sale_price_fc = fc;
+              patch.sale_price_usd = calculateUSD(fc);
+            }
+            if (lastPriceField === 'sale_price_usd' && edits.sale_price_usd !== undefined) {
+              const usd = toNumberSafe(edits.sale_price_usd, 0);
+              patch.sale_price_usd = usd;
+              patch.sale_price_fc = calculateFC(usd);
+            }
+
+            if (edits.auto_stock_factor !== undefined) {
+              patch.auto_stock_factor = Math.round(toNumberSafe(edits.auto_stock_factor, 1));
+            }
+
+            setVisualForRow(rowId, patch, 8000);  // ✅ 8s pour le cache visuel
+
+            // ✅ nettoyer l'état d'édition après save (mais garder si pending)
+            setEditingValues((prev) => {
+              // ✅ Si pendant la requête il reste des changements, on ne supprime pas
+              if (pendingSavesRef.current.has(rowId)) return prev;
+
+              const copy = { ...prev };
+              delete copy[rowId];
+              return copy;
+            });
           });
         });
         
@@ -1013,42 +1292,135 @@ const ProductsPage = () => {
         console.error('❌ [ProductsPage] Erreur sauvegarde:', error);
         console.error('   Code:', error.response?.status);
         console.error('   Message:', error.response?.data?.error || error.message);
-            console.error('   Token présent:', !!authToken);
+        if (error.response?.status === 409) {
+          console.error('   📋 Détails UNIQUE:', error.response?.data?.details);  // ✅ Log les détails SQL
+        }
+        console.error('   Token présent:', !!authToken);
       }
-      const errorMessage = error.response?.status === 401 
-        ? 'Erreur d\'authentification. Veuillez vous reconnecter.'
-        : error.response?.data?.error || 'Erreur lors de la sauvegarde';
+      
+      // ✅ Handle UNIQUE constraint errors (e.g., duplicate mark)
+      let errorMessage = 'Erreur lors de la sauvegarde';
+      if (error.response?.status === 401) {
+        errorMessage = 'Erreur d\'authentification. Veuillez vous reconnecter.';
+      } else if (error.response?.status === 404) {
+        // ✅ AMÉLIORATION: Message 404 plus clair
+        errorMessage = '❌ Produit non trouvé. Vérifiez que le code du produit est correct.';
+      } else if (error.response?.status === 409) {
+        // UNIQUE constraint violation
+        const detail = error.response?.data?.error || '';
+        if (detail.toLowerCase().includes('mark') || detail.toLowerCase().includes('unique')) {
+          errorMessage = 'Ce Mark existe déjà pour ce produit et cette unité';
+        } else {
+          errorMessage = error.response?.data?.error || 'Conflit: cette donnée existe déjà';
+        }
+      } else {
+        errorMessage = error.response?.data?.error || errorMessage;
+      }
+      
       setSaveMessage({ type: 'error', text: errorMessage });
     } finally {
       setSaving(false);
       savingLoopRef.current = false; // ✅ Utiliser savingLoopRef au lieu de savingInFlightRef
     }
-  }, [tableData, loadProducts, handleCreateProduct, handleUpdateProduct, calculateFC, calculateUSD]);
+  }, [tableData, loadProducts, handleCreateProduct, handleUpdateProduct, calculateFC, calculateUSD, setVisualForRow]);
 
-  // Programmer la sauvegarde avec debounce intelligent
-  // Sauvegarde seulement quand l'utilisateur arrête de taper pendant 2 secondes
-  const scheduleSave = useCallback((rowId) => {
-    // Annuler le timeout précédent pour ce rowId spécifique
-    const existingTimeout = saveTimeoutsRef.current.get(rowId);
-    if (existingTimeout) {
-      clearTimeout(existingTimeout);
-    }
-    
-    // Marquer comme à sauvegarder
+  // ✅ AUTO-SAVE IA : save si 5s sans frappe ET la ligne reste active (focus dans la ligne)
+  // + save immédiat uniquement quand on quitte réellement la ligne (pas quand on change de cellule dans la même ligne)
+  const IDLE_SAVE_MS = 5000;
+
+  // Est-ce que le focus est encore dans la ligne ?
+  const isRowFocused = useCallback((rowId) => {
+    if (typeof document === 'undefined') return false;
+    const el = document.activeElement;
+    return !!(el && el.closest && el.closest(`[data-rowid="${rowId}"]`));
+  }, []);
+
+  const cancelIdleSave = useCallback((rowId) => {
+    const t = idleSaveTimersRef.current.get(rowId);
+    if (t) clearTimeout(t);
+    idleSaveTimersRef.current.delete(rowId);
+  }, []);
+
+  const recordTyping = useCallback((rowId) => {
+    lastInputAtRef.current.set(rowId, Date.now());
+  }, []);
+
+  // ✅ Save après 5s d'inactivité, seulement si la ligne est toujours active (focus dans la ligne)
+  const scheduleIdleSave = useCallback((rowId) => {
+    cancelIdleSave(rowId);
+
+    // Marquer dirty
     pendingSavesRef.current.set(rowId, true);
-    
-    // Programmer la sauvegarde après 2 secondes d'inactivité
-    // Si l'utilisateur continue à taper, ce timeout sera annulé et recréé
-    const timeoutId = setTimeout(() => {
-      if (IS_DEV) {
-        console.log(`💾 [ProductsPage] Auto-save déclenché pour ${rowId} après 2s d'inactivité`);
+
+    // init timestamp si absent
+    if (!lastInputAtRef.current.has(rowId)) recordTyping(rowId);
+
+    const t = setTimeout(() => {
+      const last = lastInputAtRef.current.get(rowId) || 0;
+      const idleFor = Date.now() - last;
+
+      // Si l'utilisateur a retapé (ou rendu lent), on réarme
+      if (idleFor < IDLE_SAVE_MS - 50) {
+        scheduleIdleSave(rowId);
+        return;
       }
+
+      // Condition IA demandée : le champ/ligne reste active
+      if (!isRowFocused(rowId)) return;
+
+      if (IS_DEV) console.log(`🤖 [AUTO-SAVE IA] 5s inactif → save row=${rowId}`);
       savePendingChanges();
-      saveTimeoutsRef.current.delete(rowId);
-    }, 2000); // 2 secondes au lieu de 3 pour être plus réactif
-    
-    saveTimeoutsRef.current.set(rowId, timeoutId);
-  }, [savePendingChanges]);
+    }, IDLE_SAVE_MS);
+
+    idleSaveTimersRef.current.set(rowId, t);
+  }, [cancelIdleSave, isRowFocused, recordTyping, savePendingChanges]);
+
+  // ✅ Save immédiat forcé (Enter, clic dehors, etc.)
+  const flushRowNow = useCallback((rowId, reason = 'manual') => {
+    cancelIdleSave(rowId);
+    if (!pendingSavesRef.current.has(rowId)) return;
+    if (IS_DEV) console.log(`⚡ [AUTO-SAVE IA] ${reason} → save immédiat row=${rowId}`);
+    savePendingChanges();
+  }, [cancelIdleSave, savePendingChanges]);
+
+  // ✅ Blur intelligent :
+  // - si le focus reste dans la même ligne (autre cellule) => PAS de save immédiat (groupage)
+  // - si le focus sort de la ligne => save immédiat
+  const smartBlurRow = useCallback((rowId) => {
+    cancelIdleSave(rowId);
+
+    requestAnimationFrame(() => {
+      // Focus encore dans la ligne => on ne flush pas, on repart sur idle-save
+      if (isRowFocused(rowId)) {
+        scheduleIdleSave(rowId);
+        return;
+      }
+
+      // Focus sorti => save immédiat
+      if (pendingSavesRef.current.has(rowId)) {
+        if (IS_DEV) console.log(`⚡ [AUTO-SAVE IA] sortie ligne row=${rowId} → save immédiat`);
+        savePendingChanges();
+      }
+    });
+  }, [cancelIdleSave, isRowFocused, scheduleIdleSave, savePendingChanges]);
+
+  // ✅ PRO : si clic dehors de la ligne active, on flush AVANT les handlers (capture)
+  useEffect(() => {
+    if (typeof document === 'undefined') return;
+
+    const onPointerDownCapture = (e) => {
+      const activeRowId = editingCell?.rowId;
+      if (!activeRowId) return;
+
+      const inside = e.target?.closest?.(`[data-rowid="${activeRowId}"]`);
+      if (!inside && pendingSavesRef.current.has(activeRowId)) {
+        flushRowNow(activeRowId, 'clic-dehors');
+      }
+    };
+
+    document.addEventListener('pointerdown', onPointerDownCapture, true);
+    return () => document.removeEventListener('pointerdown', onPointerDownCapture, true);
+  }, [editingCell?.rowId, flushRowNow]);
 
   // Démarrer l'édition d'une cellule
   const startEdit = useCallback((rowId, field, currentValue) => {
@@ -1060,19 +1432,24 @@ const ProductsPage = () => {
       
       // ✅ Convertir les valeurs numériques en string pour préserver la valeur complète pendant la saisie
       let initialValue = currentValue ?? '';
-      const numericFields = ['sale_price_usd', 'sale_price_fc', 'purchase_price_usd', 'stock_current'];
+      const numericFields = ['sale_price_usd', 'sale_price_fc', 'purchase_price_usd', 'stock_current', 'auto_stock_factor'];
       if (numericFields.includes(field) && (initialValue !== null && initialValue !== undefined && initialValue !== '')) {
         // Convertir en string pour préserver la valeur exacte
         initialValue = String(initialValue);
       }
       
-      setEditingValues(prev => ({
-        ...prev,
-        [rowId]: {
-          ...(prev[rowId] || {}),
-          [field]: initialValue
-        }
-      }));
+      setEditingValues(prev => {
+        const newValues = {
+          ...prev,
+          [rowId]: {
+            ...(prev[rowId] || {}),
+            [field]: initialValue
+          }
+        };
+        // ✅ PRO: Sync ref immédiatement (pas de lag jusqu'au prochain render)
+        editingValuesRef.current = newValues;
+        return newValues;
+      });
     } catch (error) {
       if (IS_DEV) {
         console.error('Erreur startEdit:', error);
@@ -1090,7 +1467,9 @@ const ProductsPage = () => {
     'sale_price_usd',
     'purchase_price_usd',
     'stock_current',
-    'auto_stock_factor'
+    'auto_stock_factor',
+    'unit_mark',      // ✅ Ajouter pour éviter perte du mark
+    'product_name'    // ✅ Ajouter pour nom du produit
   ]);
 
   // Obtenir les suggestions de produits par nom - avec cache
@@ -1213,14 +1592,39 @@ const ProductsPage = () => {
         }
       }
       
+      // ✅ PRO: Sync ref immédiatement (pas de lag jusqu'au prochain render)
+      editingValuesRef.current = newValues;
+      
       return newValues;
     });
     
-    // Autosave uniquement sur champs numériques pour éviter re-renders pendant la saisie
+    // ✅ AUTOSAVE IA: Si unit_mark est vide, annuler autosave
+    if (field === 'unit_mark') {
+      const vNorm = String(value ?? '').trim();
+      
+      // ✅ Si vide -> annuler autosave + enlever pending
+      if (!vNorm) {
+        cancelIdleSave(rowId);
+        pendingSavesRef.current.delete(rowId);
+        if (IS_DEV) {
+          console.log(`🚫 [updateEditValue] unit_mark vide pour ${rowId}, autosave annulé`);
+        }
+        return;
+      }
+      
+      // ✅ Mark valide -> IA auto-save OK
+      recordTyping(rowId);
+      scheduleIdleSave(rowId);
+      return;
+    }
+    
+    // Autosave IA uniquement sur champs numériques pour éviter re-renders pendant la saisie
     if (AUTO_SAVE_FIELDS.has(field)) {
-      scheduleSave(rowId);
+      recordTyping(rowId);
+      scheduleIdleSave(rowId);
     } else {
       // Marquer comme modifié sans reload agressif pendant la saisie
+      recordTyping(rowId);
       pendingSavesRef.current.set(rowId, true);
     }
   };
@@ -1240,23 +1644,26 @@ const ProductsPage = () => {
   // Priorité: valeurs visuelles (après sauvegarde) > valeurs en édition > valeurs de la ligne
   const getCellValue = (row, field) => {
     if (!row) return '';
-    
-    // Si on est en train d'éditer ce champ, utiliser la valeur d'édition
-    // (qui peut inclure des valeurs calculées en temps réel)
-    if (editingCell?.rowId === row.id) {
-      const editValue = editingValues[row.id]?.[field];
-      if (editValue !== undefined) {
-        // ✅ Préserver la valeur exacte (string ou nombre) telle qu'elle est
-        return editValue;
-      }
+
+    // ✅ PRO: Priorité correcte
+    // 1) Si la cellule est EN COURS D'ÉDITION → valeur d'édition
+    const isEditingThisCell =
+      editingCell?.rowId === row.id && editingCell?.field === field;
+
+    if (isEditingThisCell) {
+      const v = editingValues?.[row.id]?.[field];
+      if (v !== undefined) return v;
     }
-    
-    // Sinon, utiliser la valeur visuelle si elle existe (après sauvegarde)
-    if (visualValues[row.id]?.[field] !== undefined) {
-      return visualValues[row.id][field];
-    }
-    
-    // Sinon, utiliser la valeur de la ligne
+
+    // 2) Si on force un affichage "après save" (visualValues post-sauvegarde)
+    const visual = visualValues?.[row.id]?.[field];
+    if (visual !== undefined) return visual;
+
+    // 3) Si une valeur a été éditée mais on n'est plus sur la cellule
+    const edit = editingValues?.[row.id]?.[field];
+    if (edit !== undefined) return edit;
+
+    // 4) Valeur venant des données chargées (backend/local DB)
     return row[field] ?? '';
   };
 
@@ -1534,25 +1941,26 @@ const ProductsPage = () => {
         </div>
       </div>
 
-      {/* Message de sauvegarde */}
+      {/* Message de sauvegarde - AMÉLIORÉ */}
       {saveMessage.text && (
         <div
-          className={`card flex items-center gap-2 ${
+          className={`card flex items-center gap-3 px-6 py-4 font-semibold ${
             saveMessage.type === 'success'
-              ? 'bg-green-500/20 border-green-500/30'
+              ? 'bg-gradient-to-r from-green-500/30 to-green-500/10 border-2 border-green-500/60 rounded-xl'
               : saveMessage.type === 'error'
-              ? 'bg-red-500/20 border-red-500/30'
-              : 'bg-blue-500/20 border-blue-500/30'
-          }`}
+              ? 'bg-gradient-to-r from-red-500/30 to-red-500/10 border-2 border-red-500/60 rounded-xl'
+              : 'bg-gradient-to-r from-blue-500/30 to-blue-500/10 border-2 border-blue-500/60 rounded-xl'
+          } shadow-lg animate-in fade-in`}
+          role="alert"
         >
           {saveMessage.type === 'success' ? (
-            <CheckCircle2 className="w-5 h-5 text-green-400" />
+            <CheckCircle2 className="w-6 h-6 text-green-400 flex-shrink-0" />
           ) : saveMessage.type === 'error' ? (
-            <XCircle className="w-5 h-5 text-red-400" />
+            <XCircle className="w-6 h-6 text-red-400 flex-shrink-0" />
           ) : (
-            <TrendingUp className="w-5 h-5 text-blue-400" />
+            <Loader2 className="w-6 h-6 text-blue-400 flex-shrink-0 animate-spin" />
           )}
-          <span className={`text-sm ${
+          <span className={`text-base ${
             saveMessage.type === 'success' ? 'text-green-300' :
             saveMessage.type === 'error' ? 'text-red-300' : 'text-blue-300'
           }`}>
@@ -1648,6 +2056,7 @@ const ProductsPage = () => {
                       return (
                         <tr
                           key={row.id || `row-${index}`}
+                          data-rowid={row.id}
                           className={`group ${
                             row.is_empty ? 'opacity-30' : 'hover:bg-dark-700/50'
                           } ${
@@ -1657,6 +2066,7 @@ const ProductsPage = () => {
                               ? 'bg-orange-500/5 border-l-2 border-orange-500/30'
                               : ''
                           } transition-colors`}
+                          onMouseLeave={() => smartBlurRow(row.id)}
                         >
                     {/* Produit */}
                     <td className="px-4 py-3">
@@ -1673,7 +2083,7 @@ const ProductsPage = () => {
                             onBlur={() => {
                               setTimeout(() => {
                                 if (row?.id) {
-                                  scheduleSave(row.id); // ✅ save au blur pour product_name
+                                  smartBlurRow(row.id);
                                 }
                                 setEditingCell(null);
                                 setFocusedField(null);
@@ -1682,7 +2092,7 @@ const ProductsPage = () => {
                             onKeyPress={(e) => {
                               if (e.key === 'Enter') {
                                 if (row?.id) {
-                                  scheduleSave(row.id);
+                                  flushRowNow(row.id, 'enter');
                                 }
                                 setEditingCell(null);
                                 setFocusedField(null);
@@ -1751,7 +2161,7 @@ const ProductsPage = () => {
                         <div
                           onClick={() => {
                             if (row?.id) {
-                              startEdit(row.id, 'product_name', row?.product_name || '');
+                              startEdit(row.id, 'product_name', getCellValue(row, 'product_name') || '');
                             }
                           }}
                           className={`cursor-pointer ${
@@ -1760,14 +2170,16 @@ const ProductsPage = () => {
                               : 'text-gray-200 group-hover:text-gray-100 group-hover:font-semibold'
                           }`}
                         >
-                          {row?.product_name || (
+                          {String(getCellValue(row, 'product_name') || '').trim() ? (
+                            String(getCellValue(row, 'product_name')).trim()
+                          ) : (
                             <span className="text-gray-500 italic">Nouveau produit...</span>
                           )}
                         </div>
                       )}
                       {!row?.is_empty && (
                         <div className="text-xs text-gray-500 group-hover:text-gray-400">
-                          ({row?.product_code || editingValues[row?.id]?.product_code || '...'})
+                          ({getCellValue(row, 'product_code') || '...'})
                         </div>
                       )}
                       {row?.is_empty && editingValues[row?.id]?.product_code && (
@@ -1789,7 +2201,7 @@ const ProductsPage = () => {
                           }}
                           onBlur={() => {
                             if (row?.id) {
-                              scheduleSave(row.id); // ✅ save au blur pour unit_level
+                              smartBlurRow(row.id);
                             }
                             setEditingCell(null);
                             setFocusedField(null);
@@ -1826,20 +2238,58 @@ const ProductsPage = () => {
                                 updateEditValue(row.id, 'unit_mark', e.target.value);
                               }
                             }}
-                            onBlur={() => {
-                              setTimeout(() => {
-                                if (row?.id) {
-                                  scheduleSave(row.id); // ✅ save au blur pour unit_mark
-                                }
-                                setEditingCell(null);
-                                setFocusedField(null);
-                              }, 50);
+                            onBlur={(e) => {
+                              const vNorm = String(e.currentTarget.value ?? '').trim(); // ✅ CORRECT: e.currentTarget
+
+                              // ✅ VALIDATION: Mark ne peut pas être vide (DB constraint)
+                              if (!vNorm) {
+                                cancelIdleSave(row.id);
+                                pendingSavesRef.current.delete(row.id);
+                                
+                                setSaveMessage({ 
+                                  type: 'error', 
+                                  text: 'Le Mark (unité de vente) est obligatoire' 
+                                });
+                                setTimeout(() => setSaveMessage({ type: '', text: '' }), 3000);
+                                // Rester en édition pour que l'utilisateur corrige
+                                return;
+                              }
+
+                              // ✅ cache visuel immédiat 8s
+                              setVisualForRow(row.id, { unit_mark: vNorm }, 8000);
+
+                              // ✅ Pousser la valeur normalisée dans editingValues
+                              updateEditValue(row.id, 'unit_mark', vNorm);
+
+                              // ✅ IA: Blur intelligent - save immédiat si focus sort de la ligne
+                              smartBlurRow(row.id);
+
+                              setEditingCell(null);
+                              setFocusedField(null);
                             }}
                             onKeyPress={(e) => {
                               if (e.key === 'Enter') {
-                                if (row?.id) {
-                                  scheduleSave(row.id);
+                                const vNorm = String(e.currentTarget.value ?? '').trim();
+
+                                // ✅ VALIDATION: Mark ne peut pas être vide (DB constraint)
+                                if (!vNorm) {
+                                  setSaveMessage({ 
+                                    type: 'error', 
+                                    text: 'Le Mark (unité de vente) est obligatoire' 
+                                  });
+                                  setTimeout(() => setSaveMessage({ type: '', text: '' }), 3000);
+                                  return;
                                 }
+
+                                // ✅ cache visuel immédiat 8s
+                                setVisualForRow(row.id, { unit_mark: vNorm }, 8000);
+
+                                // ✅ Pousser la valeur normalisée
+                                updateEditValue(row.id, 'unit_mark', vNorm);
+
+                                // ✅ IA: save immédiat à Enter
+                                flushRowNow(row.id, 'enter');
+
                                 setEditingCell(null);
                                 setFocusedField(null);
                               }
@@ -1893,12 +2343,12 @@ const ProductsPage = () => {
                         <span
                           onClick={() => {
                             if (row?.id) {
-                              startEdit(row.id, 'unit_mark', row?.unit_mark || '');
+                              startEdit(row.id, 'unit_mark', getCellValue(row, 'unit_mark') || '');
                             }
                           }}
                           className="cursor-pointer text-gray-200 group-hover:text-primary-300 group-hover:font-semibold group-hover:px-2 group-hover:py-1 group-hover:bg-primary-500/20 group-hover:rounded hover:text-primary-400"
                         >
-                          {row?.unit_mark || '—'}
+                          {String(getCellValue(row, 'unit_mark') || '').trim() || '—'}
                         </span>
                       )}
                     </td>
@@ -1920,38 +2370,18 @@ const ProductsPage = () => {
                             }
                           }}
                           onBlur={() => {
-                            // Sauvegarder immédiatement quand l'utilisateur quitte le champ
+                            // IA auto-save intelligent avec blur detection
                             if (row?.id && pendingSavesRef.current.has(row.id)) {
-                              if (IS_DEV) {
-                                console.log(`💾 [ProductsPage] Blur détecté, sauvegarde immédiate pour ${row.id}`);
-                              }
-                              // Annuler le timeout en cours pour ce rowId
-                              const timeoutId = saveTimeoutsRef.current.get(row.id);
-                              if (timeoutId) {
-                                clearTimeout(timeoutId);
-                                saveTimeoutsRef.current.delete(row.id);
-                              }
-                              // Sauvegarder immédiatement
-                              savePendingChanges();
+                              smartBlurRow(row.id);
                             }
                             setEditingCell(null);
                             setFocusedField(null);
                           }}
                           onKeyPress={(e) => {
                             if (e.key === 'Enter') {
-                              // Sauvegarder immédiatement quand l'utilisateur appuie sur Enter
+                              // Flush immédiat à Enter
                               if (row?.id && pendingSavesRef.current.has(row.id)) {
-                                if (IS_DEV) {
-                                  console.log(`💾 [ProductsPage] Enter détecté, sauvegarde immédiate pour ${row.id}`);
-                                }
-                                // Annuler le timeout en cours pour ce rowId
-                                const timeoutId = saveTimeoutsRef.current.get(row.id);
-                                if (timeoutId) {
-                                  clearTimeout(timeoutId);
-                                  saveTimeoutsRef.current.delete(row.id);
-                                }
-                                // Sauvegarder immédiatement
-                                savePendingChanges();
+                                flushRowNow(row.id, 'enter');
                               }
                               setEditingCell(null);
                               setFocusedField(null);
@@ -1997,38 +2427,18 @@ const ProductsPage = () => {
                             }
                           }}
                           onBlur={() => {
-                            // Sauvegarder immédiatement quand l'utilisateur quitte le champ
+                            // IA auto-save intelligent avec blur detection
                             if (row?.id && pendingSavesRef.current.has(row.id)) {
-                              if (IS_DEV) {
-                                console.log(`💾 [ProductsPage] Blur détecté, sauvegarde immédiate pour ${row.id}`);
-                              }
-                              // Annuler le timeout en cours pour ce rowId
-                              const timeoutId = saveTimeoutsRef.current.get(row.id);
-                              if (timeoutId) {
-                                clearTimeout(timeoutId);
-                                saveTimeoutsRef.current.delete(row.id);
-                              }
-                              // Sauvegarder immédiatement
-                              savePendingChanges();
+                              smartBlurRow(row.id);
                             }
                             setEditingCell(null);
                             setFocusedField(null);
                           }}
                           onKeyPress={(e) => {
                             if (e.key === 'Enter') {
-                              // Sauvegarder immédiatement quand l'utilisateur appuie sur Enter
+                              // Flush immédiat à Enter
                               if (row?.id && pendingSavesRef.current.has(row.id)) {
-                                if (IS_DEV) {
-                                  console.log(`💾 [ProductsPage] Enter détecté, sauvegarde immédiate pour ${row.id}`);
-                                }
-                                // Annuler le timeout en cours pour ce rowId
-                                const timeoutId = saveTimeoutsRef.current.get(row.id);
-                                if (timeoutId) {
-                                  clearTimeout(timeoutId);
-                                  saveTimeoutsRef.current.delete(row.id);
-                                }
-                                // Sauvegarder immédiatement
-                                savePendingChanges();
+                                flushRowNow(row.id, 'enter');
                               }
                               setEditingCell(null);
                               setFocusedField(null);
@@ -2074,38 +2484,18 @@ const ProductsPage = () => {
                             }
                           }}
                           onBlur={() => {
-                            // Sauvegarder immédiatement quand l'utilisateur quitte le champ
+                            // IA auto-save intelligent avec blur detection
                             if (row?.id && pendingSavesRef.current.has(row.id)) {
-                              if (IS_DEV) {
-                                console.log(`💾 [ProductsPage] Blur détecté, sauvegarde immédiate pour ${row.id}`);
-                              }
-                              // Annuler le timeout en cours pour ce rowId
-                              const timeoutId = saveTimeoutsRef.current.get(row.id);
-                              if (timeoutId) {
-                                clearTimeout(timeoutId);
-                                saveTimeoutsRef.current.delete(row.id);
-                              }
-                              // Sauvegarder immédiatement
-                              savePendingChanges();
+                              smartBlurRow(row.id);
                             }
                             setEditingCell(null);
                             setFocusedField(null);
                           }}
                           onKeyPress={(e) => {
                             if (e.key === 'Enter') {
-                              // Sauvegarder immédiatement quand l'utilisateur appuie sur Enter
+                              // Flush immédiat à Enter
                               if (row?.id && pendingSavesRef.current.has(row.id)) {
-                                if (IS_DEV) {
-                                  console.log(`💾 [ProductsPage] Enter détecté, sauvegarde immédiate pour ${row.id}`);
-                                }
-                                // Annuler le timeout en cours pour ce rowId
-                                const timeoutId = saveTimeoutsRef.current.get(row.id);
-                                if (timeoutId) {
-                                  clearTimeout(timeoutId);
-                                  saveTimeoutsRef.current.delete(row.id);
-                                }
-                                // Sauvegarder immédiatement
-                                savePendingChanges();
+                                flushRowNow(row.id, 'enter');
                               }
                               setEditingCell(null);
                               setFocusedField(null);
@@ -2145,38 +2535,18 @@ const ProductsPage = () => {
                             }
                           }}
                           onBlur={() => {
-                            // Sauvegarder immédiatement quand l'utilisateur quitte le champ
+                            // IA auto-save intelligent avec blur detection
                             if (row?.id && pendingSavesRef.current.has(row.id)) {
-                              if (IS_DEV) {
-                                console.log(`💾 [ProductsPage] Blur détecté, sauvegarde immédiate pour ${row.id}`);
-                              }
-                              // Annuler le timeout en cours pour ce rowId
-                              const timeoutId = saveTimeoutsRef.current.get(row.id);
-                              if (timeoutId) {
-                                clearTimeout(timeoutId);
-                                saveTimeoutsRef.current.delete(row.id);
-                              }
-                              // Sauvegarder immédiatement
-                              savePendingChanges();
+                              smartBlurRow(row.id);
                             }
                             setEditingCell(null);
                             setFocusedField(null);
                           }}
                           onKeyPress={(e) => {
                             if (e.key === 'Enter') {
-                              // Sauvegarder immédiatement quand l'utilisateur appuie sur Enter
+                              // Flush immédiat à Enter
                               if (row?.id && pendingSavesRef.current.has(row.id)) {
-                                if (IS_DEV) {
-                                  console.log(`💾 [ProductsPage] Enter détecté, sauvegarde immédiate pour ${row.id}`);
-                                }
-                                // Annuler le timeout en cours pour ce rowId
-                                const timeoutId = saveTimeoutsRef.current.get(row.id);
-                                if (timeoutId) {
-                                  clearTimeout(timeoutId);
-                                  saveTimeoutsRef.current.delete(row.id);
-                                }
-                                // Sauvegarder immédiatement
-                                savePendingChanges();
+                                flushRowNow(row.id, 'enter');
                               }
                               setEditingCell(null);
                               setFocusedField(null);
@@ -2214,12 +2584,7 @@ const ProductsPage = () => {
                           }}
                           onBlur={() => {
                             if (row?.id && pendingSavesRef.current.has(row.id)) {
-                              const timeoutId = saveTimeoutsRef.current.get(row.id);
-                              if (timeoutId) {
-                                clearTimeout(timeoutId);
-                                saveTimeoutsRef.current.delete(row.id);
-                              }
-                              savePendingChanges();
+                              smartBlurRow(row.id);
                             }
                             setEditingCell(null);
                             setFocusedField(null);
@@ -2227,12 +2592,7 @@ const ProductsPage = () => {
                           onKeyPress={(e) => {
                             if (e.key === 'Enter') {
                               if (row?.id && pendingSavesRef.current.has(row.id)) {
-                                const timeoutId = saveTimeoutsRef.current.get(row.id);
-                                if (timeoutId) {
-                                  clearTimeout(timeoutId);
-                                  saveTimeoutsRef.current.delete(row.id);
-                                }
-                                savePendingChanges();
+                                flushRowNow(row.id, 'enter');
                               }
                               setEditingCell(null);
                               setFocusedField(null);
@@ -2270,6 +2630,17 @@ const ProductsPage = () => {
                             title="Imprimer ce produit"
                           >
                             <Printer className="w-4 h-4 text-blue-400" />
+                          </button>
+                          <button
+                            onClick={() => {
+                              if (row) {
+                                handleDeleteProduct(row);
+                              }
+                            }}
+                            className="p-2 bg-dark-700 hover:bg-red-500/20 rounded-lg border border-dark-600 hover:border-red-500/50 transition-colors"
+                            title="Supprimer ce produit"
+                          >
+                            <Trash2 className="w-4 h-4 text-red-400" />
                           </button>
                         </div>
                       )}

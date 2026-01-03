@@ -1,0 +1,303 @@
+﻿import { syncRepo } from '../../db/repositories/sync.repo.js';
+import { outboxRepo } from '../../db/repositories/outbox.repo.js';
+import { sheetsClient } from './sheets.client.js';
+import { productsRepo } from '../../db/repositories/products.repo.js';
+import { salesRepo } from '../../db/repositories/sales.repo.js';
+import { debtsRepo } from '../../db/repositories/debts.repo.js';
+import { ratesRepo } from '../../db/repositories/rates.repo.js';
+import { usersRepo } from '../../db/repositories/users.repo.js';
+import { syncLogger } from '../../core/logger.js';
+import { generateUUID } from '../../core/crypto.js';
+import { getDb } from '../../db/sqlite.js';
+import bcrypt from 'bcrypt';
+
+// Intervalle de synchronisation (augmentÃ© pour rÃ©duire la charge)
+const SYNC_INTERVAL_MS = parseInt(process.env.SYNC_INTERVAL_MS) || 10000; // 10 secondes par dÃ©faut
+
+let syncInterval = null;
+let isSyncing = false;
+let syncRunning = false; // Mutex global pour empÃªcher les overlaps
+let _started = false; // Flag pour la boucle "aprÃ¨s fin"
+let _loopTimeout = null; // Timeout de la boucle
+let isOnline = true; // Ã‰tat de connexion Internet
+let _salesSyncRunning = false; // Mutex pour la synchronisation des ventes
+let _salesLoopTimeout = null; // Timeout de la boucle de synchronisation des ventes
+let _pushSyncRunning = false; // Mutex pour le push des opÃ©rations pending
+let _lastPushTime = 0; // Dernier push rÃ©ussi
+
+/**
+ * Normalise l'unitÃ© depuis Sheets vers le format SQLite
+ * Sheets peut avoir: "millier", "carton", "piece" (ou variations)
+ * SQLite attend: "MILLIER", "CARTON", "PIECE" ou 1, 2, 3
+ */
+function normalizeUnitFromSheets(unitValue) {
+  if (!unitValue || typeof unitValue !== 'string') return null;
+  
+  const trimmed = unitValue.trim();
+  if (!trimmed) return null;
+  
+  const normalized = trimmed.toLowerCase();
+  
+  // Mapping des valeurs possibles depuis Sheets (ordre important : millier avant carton pour Ã©viter les faux positifs)
+  // GÃ©rer "milliers" (pluriel) et "millier" (singulier)
+  if (normalized === 'millier' || normalized === 'milliers' || normalized.includes('millier')) {
+    return 'MILLIER';
+  }
+  // GÃ©rer "carton" et "cartons"
+  if (normalized === 'carton' || normalized === 'cartons' || normalized.includes('carton')) {
+    return 'CARTON';
+  }
+  // GÃ©rer "piece", "piÃ¨ce", "pieces", "piÃ¨ces"
+  if (normalized === 'piece' || normalized === 'piÃ¨ce' || normalized === 'pieces' || normalized === 'piÃ¨ces' || normalized.includes('piece') || normalized.includes('piÃ¨ce')) {
+    return 'PIECE';
+  }
+  
+  // Si c'est dÃ©jÃ  en majuscules, le retourner tel quel
+  const upper = trimmed.toUpperCase();
+  if (upper === 'MILLIER' || upper === 'MILLIERS' || upper === 'CARTON' || upper === 'CARTONS' || upper === 'PIECE' || upper === 'PIECES' || upper === 'PIÃˆCE' || upper === 'PIÃˆCES') {
+    // Normaliser les pluriels en singulier
+    if (upper === 'MILLIERS') return 'MILLIER';
+    if (upper === 'CARTONS') return 'CARTON';
+    if (upper === 'PIECES' || upper === 'PIÃˆCES') return 'PIECE';
+    return upper;
+  }
+  
+  // Valeur non reconnue, retourner null pour forcer la recherche dans le produit
+  return null;
+}
+
+/**
+ * Worker de synchronisation qui tourne en arriÃ¨re-plan
+ */
+export class SyncWorker {
+  /**
+   * DÃ©marre le worker avec import initial intelligent
+   */
+  async start() {
+    if (syncInterval) {
+      return; // DÃ©jÃ  dÃ©marrÃ©
+    }
+
+    syncLogger.info(`ðŸš€ DÃ©marrage du worker de synchronisation (intervalle: ${SYNC_INTERVAL_MS}ms)`);
+    syncLogger.info(`ðŸ“¡ URL Google Apps Script: ${process.env.GOOGLE_SHEETS_WEBAPP_URL ? 'âœ… ConfigurÃ©e' : 'âŒ Non configurÃ©e'}`);
+
+    // DÃ©tection automatique de connexion (doit Ãªtre fait en premier)
+    this.setupConnectionDetection();
+
+    // VÃ©rifier si l'import initial a dÃ©jÃ  Ã©tÃ© fait
+    const initialImportDone = syncRepo.isInitialImportDone();
+    const isDatabaseEmpty = !productsRepo.hasProducts();
+    
+    // BOOTSTRAP AUTOMATIQUE : Si table vide â†’ full pull (mÃªme si flag = 1)
+    if (isDatabaseEmpty) {
+      syncLogger.warn('âš ï¸  [BOOTSTRAP] Base de donnÃ©es vide (0 produits) â†’ Bootstrap automatique activÃ©');
+      syncLogger.info('   ðŸ”„ [BOOTSTRAP] Mode: Full pull (toutes les donnÃ©es) mÃªme si initial_import_done = 1');
+      syncLogger.info('   ðŸ“‹ [BOOTSTRAP] Le systÃ¨me va tÃ©lÃ©charger TOUTES les donnÃ©es existantes dans Google Sheets');
+      
+      // VÃ©rifier la connexion d'abord
+      await this.checkConnection();
+      
+      // Si en ligne, faire le bootstrap immÃ©diatement
+      if (isOnline) {
+        syncLogger.info('   ðŸš€ [BOOTSTRAP] DÃ©marrage du bootstrap (full pull)...');
+        this.pullUpdates(true).catch(err => {
+          syncLogger.error('âŒ [BOOTSTRAP] Erreur lors du bootstrap:', err);
+          syncLogger.warn('   âš ï¸  [BOOTSTRAP] Bootstrap Ã©chouÃ©, sera rÃ©essayÃ© au prochain cycle si base toujours vide');
+        });
+      } else {
+        syncLogger.info('â³ [BOOTSTRAP] En attente de connexion Internet pour le bootstrap...');
+      }
+    } else if (!initialImportDone) {
+      // Import initial classique (si flag = 0 mais base non vide, c'est suspect mais on continue)
+      syncLogger.info('ðŸ“¥ [IMPORT] Flag initial_import_done = 0, mais base contient des donnÃ©es');
+      syncLogger.info('   ðŸ”„ [IMPORT] Synchronisation incrÃ©mentale normale');
+      if (isOnline) {
+        await this.runSyncSafe();
+      }
+    } else {
+      // Mode normal : base non vide + flag = 1
+      syncLogger.info('ðŸ“Š [SYNC] Mode normal : synchronisation incrÃ©mentale uniquement');
+      if (isOnline) {
+        await this.runSyncSafe();
+      }
+    }
+
+    // Boucle "aprÃ¨s fin" au lieu de setInterval (Ã©vite les overlaps)
+    syncLogger.info(`â° [AUTO-SYNC] Synchronisation automatique configurÃ©e: toutes les ${SYNC_INTERVAL_MS / 1000} secondes (TEMPS RÃ‰EL)`);
+    syncLogger.info(`   ðŸ”„ [AUTO-SYNC] Mode: DÃ©tection Internet auto + Sync auto toutes les ${SYNC_INTERVAL_MS / 1000}s`);
+    syncLogger.info(`   ðŸ“Š [AUTO-SYNC] Les donnÃ©es seront stockÃ©es dans SQL et disponibles immÃ©diatement dans les pages`);
+    syncLogger.info(`   âš¡ [AUTO-SYNC] Mode PRO: Boucle "aprÃ¨s fin" (pas de setInterval) pour Ã©viter les overlaps`);
+    
+    _started = true;
+    const loop = async () => {
+      if (!_started) return;
+      
+      // Utiliser setImmediate pour diffÃ©rer la sync et ne pas bloquer l'event loop
+      setImmediate(async () => {
+        const t0 = Date.now();
+        if (isOnline) {
+          // Utiliser process.nextTick pour donner la prioritÃ© aux requÃªtes API
+          process.nextTick(async () => {
+            await this.runSyncSafe().catch(err => {
+              syncLogger.error(`âŒ [AUTO-SYNC] Erreur sync automatique: ${err.message}`);
+            });
+          });
+        } else {
+          syncLogger.debug(`â¸ï¸  [AUTO-SYNC] Sync ignorÃ©e: pas de connexion Internet`);
+        }
+        
+        const elapsed = Date.now() - t0;
+        const wait = Math.max(2000, SYNC_INTERVAL_MS - elapsed); // min 2s (au lieu de 1s)
+        
+        if (_started) {
+          _loopTimeout = setTimeout(loop, wait);
+        }
+      });
+    };
+    
+    // DÃ©marrer la boucle avec un dÃ©lai initial pour ne pas bloquer le dÃ©marrage
+    setTimeout(loop, 5000); // Attendre 5s avant la premiÃ¨re sync
+    
+    // DÃ©marrer la synchronisation dÃ©diÃ©e des ventes (immÃ©diate + toutes les 10 secondes)
+    this.startSalesSyncLoop();
+    
+    // DÃ©marrer la synchronisation des opÃ©rations pending (push vers Sheets)
+    // IMPORTANT: Les modifications locales (prix, stock, etc.) sont pushÃ©es automatiquement
+    this.startPushSyncLoop();
+  }
+  
+  /**
+   * Boucle de push des opÃ©rations pending vers Google Sheets
+   * GÃ¨re automatiquement les modifications locales quand la connexion revient
+   * 
+   * FonctionnalitÃ©s:
+   * - Push automatique des PRODUCT_PATCH (modifications prix/nom)
+   * - Push automatique des UNIT_PATCH (modifications unitÃ©s)
+   * - Push automatique des STOCK_MOVE (mouvements de stock)
+   * - DÃ©duplication automatique (last-write-wins pour les patches)
+   * - Idempotence via op_id (pas de doublons cÃ´tÃ© Sheets)
+   */
+  async startPushSyncLoop() {
+    const PUSH_SYNC_INTERVAL_MS = 15000; // 15 secondes
+    
+    syncLogger.info(`ðŸ“¤ [PUSH-SYNC] DÃ©marrage de la synchronisation des modifications locales`);
+    syncLogger.info(`   âš¡ [PUSH-SYNC] Mode: AUTO-PUSH toutes les ${PUSH_SYNC_INTERVAL_MS / 1000} secondes`);
+    syncLogger.info(`   ðŸ“¦ [PUSH-SYNC] Types: PRODUCT_PATCH, UNIT_PATCH, STOCK_MOVE`);
+    syncLogger.info(`   ðŸ”„ [PUSH-SYNC] Idempotence via op_id (pas de doublons)`);
+    
+    const pushLoop = async () => {
+      if (!_started) return;
+      
+      if (_pushSyncRunning) {
+        syncLogger.debug(`â­ï¸ [PUSH-SYNC] Push dÃ©jÃ  en cours, skip`);
+        setTimeout(pushLoop, PUSH_SYNC_INTERVAL_MS);
+        return;
+      }
+      
+      if (!isOnline) {
+        syncLogger.debug(`â¸ï¸ [PUSH-SYNC] Pas de connexion Internet, opÃ©rations en attente`);
+        // Afficher le nombre d'opÃ©rations en attente
+        try {
+          const stats = outboxRepo.getStats();
+          if (stats.totalPending > 0) {
+            syncLogger.info(`   ðŸ“Š [PUSH-SYNC] ${stats.totalPending} opÃ©ration(s) en attente de connexion`);
+          }
+        } catch (e) {}
+        setTimeout(pushLoop, PUSH_SYNC_INTERVAL_MS);
+        return;
+      }
+      
+      _pushSyncRunning = true;
+      const pushStartTime = Date.now();
+      
+      try {
+        await this.pushPendingOperations();
+      } catch (error) {
+        syncLogger.error(`âŒ [PUSH-SYNC] Erreur lors du push: ${error.message}`);
+      } finally {
+        _pushSyncRunning = false;
+        const elapsed = Date.now() - pushStartTime;
+        const wait = Math.max(5000, PUSH_SYNC_INTERVAL_MS - elapsed);
+        
+        if (_started) {
+          setTimeout(pushLoop, wait);
+        }
+      }
+    };
+    
+    // DÃ©marrer aprÃ¨s un dÃ©lai initial (laisser le temps au pull de se faire d'abord)
+    setTimeout(pushLoop, 10000);
+  }
+  
+  /**
+   * Push les opÃ©rations pending vers Google Sheets
+   * GÃ¨re les patches produits, patches unitÃ©s et mouvements de stock
+   */
+  async pushPendingOperations() {
+    try {
+      // RÃ©cupÃ©rer les statistiques
+      const stats = outboxRepo.getStats();
+      
+      if (stats.totalPending === 0 && stats.stockMovesPending === 0) {
+        syncLogger.debug(`ðŸ“¤ [PUSH-SYNC] Aucune opÃ©ration pending`);
+        return;
+      }
+      
+      syncLogger.info(`ðŸ“¤ [PUSH-SYNC] ==========================================`);
+      syncLogger.info(`ðŸ“¤ [PUSH-SYNC] PUSH DES MODIFICATIONS LOCALES`);
+      syncLogger.info(`ðŸ“¤ [PUSH-SYNC] ==========================================`);
+      syncLogger.info(`   ðŸ“Š Pending: ${JSON.stringify(stats.pendingByType)}`);
+      syncLogger.info(`   ðŸ“Š Stock moves pending: ${stats.stockMovesPending}`);
+      
+      // 1. Push des patches produits (PRODUCT_PATCH)
+      const productPatches = outboxRepo.getPendingOperations('PRODUCT_PATCH', 50);
+      if (productPatches.length > 0) {
+        syncLogger.info(`   ðŸ“¦ [PRODUCT_PATCH] ${productPatches.length} patch(es) Ã  envoyer`);
+        await this.pushProductPatches(productPatches);
+      }
+      
+      // 2. Push des patches unitÃ©s (UNIT_PATCH) - inclut les prix
+      const unitPatches = outboxRepo.getPendingOperations('UNIT_PATCH', 50);
+      if (unitPatches.length > 0) {
+        syncLogger.info(`   ðŸ’° [UNIT_PATCH] ${unitPatches.length} patch(es) Ã  envoyer (prix, etc.)`);
+        await this.pushUnitPatches(unitPatches);
+      }
+      
+      // 3. Push des mouvements de stock (STOCK_MOVE)
+      const stockMoves = outboxRepo.getPendingOperations('STOCK_MOVE', 50);
+      if (stockMoves.length > 0) {
+        syncLogger.info(`   ðŸ“Š [STOCK_MOVE] ${stockMoves.length} mouvement(s) Ã  envoyer`);
+        await this.pushStockMoves(stockMoves);
+      }
+      
+      // RÃ©essayer les opÃ©rations en erreur (max 3 tentatives)
+      outboxRepo.retryErrorOperations();
+      
+      _lastPushTime = Date.now();
+      
+      // CRITIQUE: AprÃ¨s un push rÃ©ussi, dÃ©clencher un pull pour recevoir les mises Ã  jour depuis Sheets
+      // Cela libÃ¨re les produits pour accepter les modifications venant de Sheets
+      const pushedCount = (productPatches.length || 0) + (unitPatches.length || 0) + (stockMoves.length || 0);
+      if (pushedCount > 0) {
+        syncLogger.info(`   ðŸ”„ [PUSH-SYNC] ${pushedCount} opÃ©ration(s) envoyÃ©e(s), dÃ©clenchement pull pour recevoir les mises Ã  jour depuis Sheets...`);
+        
+        // DÃ©clencher un pull aprÃ¨s un court dÃ©lai pour laisser Sheets se mettre Ã  jour
+        // CRITIQUE: Cela libÃ¨re les produits pour recevoir les mises Ã  jour depuis Sheets
+        setTimeout(async () => {
+          try {
+            syncLogger.info(`   ðŸ“¥ [PUSH-SYNC] Pull dÃ©clenchÃ© aprÃ¨s push rÃ©ussi pour libÃ©rer les produits`);
+            await this.syncProductsFromSheets();
+          } catch (pullError) {
+            syncLogger.warn(`   âš ï¸ [PUSH-SYNC] Erreur pull aprÃ¨s push: ${pullError.message}`);
+          }
+        }, 2000); // 2 secondes de dÃ©lai pour laisser Sheets se mettre Ã  jour
+      }
+      
+      syncLogger.info(`ðŸ“¤ [PUSH-SYNC] ==========================================`);
+      
+    } catch (error) {
+      syncLogger.error(`âŒ [PUSH-SYNC] Erreur pushPendingOperations: ${error.message}`);
+    }
+  }
+  
+  /**

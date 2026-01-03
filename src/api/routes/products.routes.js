@@ -136,82 +136,151 @@ router.post('/', authenticate, (req, res) => {
  * Utilise le nouveau système d'outbox PRO avec:
  * - Déduplication des patches (last-write-wins)
  * - Idempotence via op_id
+ * - ✅ RETRY automatique en cas de race condition (409 Conflict)
  */
-router.put('/:code', authenticate, (req, res) => {
+router.put('/:code', authenticate, async (req, res) => {
   try {
-    const product = productsRepo.upsert({ ...req.body, code: req.params.code });
-    
-    // Récupérer le produit complet depuis la base pour avoir toutes les données à jour
-    const fullProduct = productsRepo.findByCode(req.params.code);
-    
-    // Utiliser le nouveau système d'outbox avec déduplication
-    
-    // 1. Enqueue le patch produit (nom, etc.) avec déduplication
-    outboxRepo.enqueueProductPatch(
-      fullProduct.uuid,
-      fullProduct.code,
-      {
-        name: fullProduct.name,
-        is_active: fullProduct.is_active !== undefined ? fullProduct.is_active : 1
-      }
-    );
-    
-    // 2. Enqueue chaque unité avec déduplication (prix, stock, qty_step, etc.)
-    // IMPORTANT: Inclure TOUS les champs nécessaires pour Sheets (sale_price_fc, stock_current)
-    if (fullProduct.units && Array.isArray(fullProduct.units)) {
-      for (const unit of fullProduct.units) {
-        outboxRepo.enqueueUnitPatch(
-          fullProduct.uuid,
-          fullProduct.code,
-          unit.unit_level,
-          unit.unit_mark || '',
-          {
+    // ✅ RETRY AUTOMATIQUE: Réessayer jusqu'à 3 fois en cas de 409 Conflict
+    const maxRetries = 3;
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const product = productsRepo.upsert({ ...req.body, code: req.params.code });
+        
+        // Récupérer le produit complet depuis la base pour avoir toutes les données à jour
+        const fullProduct = productsRepo.findByCode(req.params.code);
+        
+        // Utiliser le nouveau système d'outbox avec déduplication
+        
+        // ✅ NOUVEAU: Créer une PRODUCT_PATCH PAR UNITÉ (comme les UNIT_PATCH)
+        // Cela permet à Google Sheets de savoir à quelle feuille (CARTON/MILLIER/PIECE) appliquer le nom
+        if (fullProduct.units && Array.isArray(fullProduct.units)) {
+          for (const unit of fullProduct.units) {
+            // 1. Patch produit (nom) par unité
+            const productPatch = {
+              name: fullProduct.name,
+              is_active: fullProduct.is_active !== undefined ? fullProduct.is_active : 1,
+              unit_level: unit.unit_level,
+              unit_mark: unit.unit_mark || ''
+            };
+            logger.info(`📤 [PATCH-ENQUEUE-UNIT] Produit ${fullProduct.code}/${unit.unit_level}: name='${productPatch.name}'`);
+            outboxRepo.enqueueProductPatch(
+              fullProduct.uuid,
+              fullProduct.code,
+              productPatch
+            );
+
+            // 2. Patch unité (prix, stock, etc.) pour la même unité
+            outboxRepo.enqueueUnitPatch(
+              fullProduct.uuid,
+              fullProduct.code,
+              unit.unit_level,
+              unit.unit_mark || '',
+              {
+                purchase_price_usd: unit.purchase_price_usd || 0,
+                sale_price_usd: unit.sale_price_usd || 0,
+                // CRITIQUE: Inclure sale_price_fc pour les feuilles Milliers et Piece
+                sale_price_fc: unit.sale_price_fc || 0,
+                // CRITIQUE: Inclure stock_current pour synchronisation stock
+                stock_current: unit.stock_current || unit.stock_initial || 0,
+                stock_initial: unit.stock_initial || unit.stock_current || 0,
+                auto_stock_factor: unit.auto_stock_factor || 1,
+                qty_step: unit.qty_step || 1
+              }
+            );
+          }
+        } else {
+          // Fallback: si pas d'unités, créer une PRODUCT_PATCH globale
+          const productPatch = {
+            name: fullProduct.name,
+            is_active: fullProduct.is_active !== undefined ? fullProduct.is_active : 1
+          };
+          logger.info(`📤 [PATCH-ENQUEUE] Produit ${fullProduct.code}: name='${productPatch.name}' (pas d'unités)`);
+          outboxRepo.enqueueProductPatch(
+            fullProduct.uuid,
+            fullProduct.code,
+            productPatch
+          );
+        }
+        
+        // Garder aussi l'ancien système pour compatibilité (sera supprimé plus tard)
+        syncRepo.addToOutbox('products', req.params.code, 'upsert', {
+          code: fullProduct.code,
+          name: fullProduct.name,
+          uuid: fullProduct.uuid,
+          is_active: fullProduct.is_active !== undefined ? fullProduct.is_active : 1,
+          units: (fullProduct.units || []).map(unit => ({
+            uuid: unit.uuid,
+            unit_level: unit.unit_level,
+            unit_mark: unit.unit_mark || '',
+            stock_initial: unit.stock_initial || 0,
+            stock_current: unit.stock_current || 0,
             purchase_price_usd: unit.purchase_price_usd || 0,
             sale_price_usd: unit.sale_price_usd || 0,
-            // CRITIQUE: Inclure sale_price_fc pour les feuilles Milliers et Piece
-            sale_price_fc: unit.sale_price_fc || 0,
-            // CRITIQUE: Inclure stock_current pour synchronisation stock
-            stock_current: unit.stock_current || unit.stock_initial || 0,
-            stock_initial: unit.stock_initial || unit.stock_current || 0,
             auto_stock_factor: unit.auto_stock_factor || 1,
-            qty_step: unit.qty_step || 1
-          }
-        );
+            qty_step: unit.qty_step || 1,
+            last_update: unit.last_update || new Date().toISOString()
+          }))
+        });
+
+        // Audit log
+        auditRepo.log(req.user.id, 'product_update', { code: req.params.code });
+
+        // Émettre l'événement WebSocket
+        const io = getSocketIO();
+        if (io) {
+          io.emit('product:updated', fullProduct);
+        }
+
+        // ✅ SUCCÈS - Sortir de la boucle de retry
+        return res.json({ success: true, product: fullProduct });
+
+      } catch (error) {
+        lastError = error;
+
+        // ✅ Vérifier si c'est une erreur de race condition (409 Conflict, UNIQUE constraint)
+        const isConflictError = error.message && error.message.includes('UNIQUE');
+        
+        if (attempt === 1 && isConflictError) {
+          logger.warn(`⚠️ [PUT /api/products] Tentative ${attempt}/${maxRetries} - Conflit UNIQUE détecté, réessai automatique...`);
+          logger.warn(`   Message: ${error.message}`);
+        }
+
+        // Si c'est un conflit UNIQUE ET qu'on peut réessayer, attendre puis réessayer
+        if (isConflictError && attempt < maxRetries) {
+          // Délai croissant: 100ms, 200ms, 300ms
+          await new Promise(r => setTimeout(r, attempt * 100));
+          logger.info(`⏳ [PUT /api/products] Retry ${attempt + 1}/${maxRetries}...`);
+          continue; // Réessayer
+        }
+
+        // ✅ Erreur non-récupérable ou dernier essai: lancer l'erreur
+        throw error;
       }
     }
-    
-    // Garder aussi l'ancien système pour compatibilité (sera supprimé plus tard)
-    syncRepo.addToOutbox('products', req.params.code, 'upsert', {
-      code: fullProduct.code,
-      name: fullProduct.name,
-      uuid: fullProduct.uuid,
-      is_active: fullProduct.is_active !== undefined ? fullProduct.is_active : 1,
-      units: (fullProduct.units || []).map(unit => ({
-        uuid: unit.uuid,
-        unit_level: unit.unit_level,
-        unit_mark: unit.unit_mark || '',
-        stock_initial: unit.stock_initial || 0,
-        stock_current: unit.stock_current || 0,
-        purchase_price_usd: unit.purchase_price_usd || 0,
-        sale_price_usd: unit.sale_price_usd || 0,
-        auto_stock_factor: unit.auto_stock_factor || 1,
-        qty_step: unit.qty_step || 1,
-        last_update: unit.last_update || new Date().toISOString()
-      }))
-    });
 
-    // Audit log
-    auditRepo.log(req.user.id, 'product_update', { code: req.params.code });
+    // Ne devrait pas arriver ici
+    throw lastError;
 
-    // Émettre l'événement WebSocket
-    const io = getSocketIO();
-    if (io) {
-      io.emit('product:updated', fullProduct);
-    }
-
-    res.json({ success: true, product: fullProduct });
   } catch (error) {
     logger.error('Erreur PUT /api/products/:code:', error);
+    
+    // ✅ Détect UNIQUE constraint violations + détails précis
+    if (error.message && error.message.includes('UNIQUE')) {
+      // Retourner le message SQL brut pour identifier la colonne exacte
+      const details = error.message;
+      const message = error.message.includes('product_id, product_id, unit_level, unit_mark') 
+        || error.message.includes('unit_level, unit_mark')
+        ? 'Ce Mark existe déjà pour ce produit et cette unité'
+        : 'Cette donnée existe déjà (conflit UNIQUE)';
+      return res.status(409).json({ 
+        success: false, 
+        error: message,
+        details: details  // ✅ Inclure le message SQL pour debug
+      });
+    }
+    
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -432,6 +501,96 @@ router.put('/:code/units/:unitId/stock', authenticate, (req, res) => {
     });
   } catch (error) {
     logger.error('Erreur PUT /api/products/:code/units/:unitId/stock:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * DELETE /api/products/:code
+ * Supprime un produit et toutes ses unités
+ */
+router.delete('/:code', authenticate, (req, res) => {
+  try {
+    const code = req.params.code;
+    
+    logger.info(`🗑️ DELETE /api/products/${code}`);
+
+    // Récupérer le produit avant suppression (pour l'audit)
+    const product = productsRepo.findByCode(code);
+    if (!product) {
+      return res.status(404).json({ success: false, error: 'Produit non trouvé' });
+    }
+
+    // Supprimer le produit (soft delete: is_active = 0)
+    const db = getDb();
+    db.prepare('UPDATE products SET is_active = 0 WHERE code = ?').run(code);
+    
+    logger.info(`✅ Produit marqué comme inactif: ${code}`);
+
+    // Audit log
+    auditRepo.log(req.user.id, 'product_delete', { code: code });
+
+    // Émettre l'événement WebSocket
+    const io = getSocketIO();
+    if (io) {
+      io.emit('product:deleted', { code: code });
+    }
+
+    res.json({ success: true, message: 'Produit supprimé avec succès' });
+  } catch (error) {
+    logger.error('Erreur DELETE /api/products/:code:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * TEST ENDPOINT: POST /api/products/test/sync-name
+ * Déclenche manuellement une synchronisation du nom du produit code "1"
+ * Utile pour diagnostiquer les problèmes de sync de nom
+ */
+router.post('/test/sync-name', authenticate, (req, res) => {
+  try {
+    const testCode = '1';
+    const testName = `TEST_${new Date().toLocaleTimeString('fr-FR').replace(/:/g, '')}`;
+    
+    logger.info(`🧪 TEST ENDPOINT: /api/products/test/sync-name`);
+    logger.info(`   Updating product '${testCode}' name to '${testName}'`);
+    
+    // Step 1: Update product name in database
+    const fullProduct = productsRepo.upsert({
+      code: testCode,
+      name: testName,
+      is_active: 1
+    });
+    
+    logger.info(`   ✅ Product updated in DB: uuid=${fullProduct.uuid}, name='${testName}'`);
+    
+    // Step 2: Enqueue the patch
+    const opId = outboxRepo.enqueueProductPatch(
+      fullProduct.uuid,
+      fullProduct.code,
+      {
+        name: testName,
+        is_active: 1
+      }
+    );
+    
+    logger.info(`   ✅ Patch enqueued: op_id=${opId}`);
+    logger.info(`   📋 Check Google Apps Script Logs (Tools → Script editor → Logs) for [PRODUCT-PATCH messages`);
+    
+    res.json({
+      success: true,
+      message: 'Test patch enqueued',
+      test_name: testName,
+      op_id: opId,
+      instructions: [
+        '1. Wait 10 seconds for sync cycle',
+        '2. Check Google Apps Script logs for [PRODUCT-PATCH messages',
+        '3. Verify Google Sheets has the new name in product code 1'
+      ]
+    });
+  } catch (error) {
+    logger.error('TEST ENDPOINT error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });

@@ -4,6 +4,12 @@ import { logger } from '../core/logger.js';
 import { generateUUID } from '../core/crypto.js';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+
+// ✅ ESM: Créer __dirname et __filename
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 let db = null;
 
@@ -111,6 +117,23 @@ export function runMigration(sql) {
 }
 
 /**
+ * Vérifie si une table existe
+ */
+export function tableExists(tableName) {
+  const database = getDb();
+  try {
+    const result = database.prepare(`
+      SELECT COUNT(*) as count 
+      FROM sqlite_master 
+      WHERE type='table' AND name=?
+    `).get(tableName);
+    return result.count > 0;
+  } catch (error) {
+    return false;
+  }
+}
+
+/**
  * Vérifie si une colonne existe dans une table
  */
 export function columnExists(tableName, columnName) {
@@ -137,6 +160,12 @@ export function columnExists(tableName, columnName) {
 export function ensureColumn(tableName, columnName, columnType = 'TEXT') {
   const database = getDb();
   try {
+    // ✅ CORRECTION: Vérifier d'abord que la table existe
+    if (!tableExists(tableName)) {
+      logger.debug(`[MIGRATION] ⚠️  Table ${tableName} n'existe pas encore, skip colonne ${columnName}`);
+      return false; // Table sera créée lors d'une future migration
+    }
+    
     if (columnExists(tableName, columnName)) {
       logger.debug(`[MIGRATION] Colonne ${tableName}.${columnName} existe déjà`);
       return false;
@@ -152,6 +181,11 @@ export function ensureColumn(tableName, columnName, columnType = 'TEXT') {
       logger.debug(`[MIGRATION] Colonne ${tableName}.${columnName} existe déjà (ignoré)`);
       return false;
     }
+    // Ignorer aussi si la table n'existe pas (sera créée après)
+    if (error.message.includes('no such table')) {
+      logger.debug(`[MIGRATION] Table ${tableName} n'existe pas encore (sera créée après)`);
+      return false;
+    }
     logger.error(`[MIGRATION] Erreur ajout colonne ${tableName}.${columnName}:`, error);
     throw error;
   }
@@ -164,6 +198,128 @@ function applyMigrations() {
   const database = getDb();
   try {
     logger.info('[MIGRATION] Vérification des migrations nécessaires...');
+    
+    // ✅ IMPORTANT: Vérifier que les tables existent avant de migrer
+    // Si une table n'existe pas, les migrations vont échouer
+    const requiredTables = ['products', 'product_units', 'users', 'debts', 'sales', 'sale_items'];
+    const missingTables = requiredTables.filter(t => !tableExists(t));
+    
+    if (missingTables.length > 0) {
+      logger.info(`[MIGRATION] ⚠️  Tables manquantes: ${missingTables.join(', ')}`);
+      logger.info('[MIGRATION] Création des tables de base...');
+      
+      // ✅ FALLBACK: Créer les tables essentielles si schema.sql n'a pas pu être trouvé
+      try {
+        // Table products
+        if (!tableExists('products')) {
+          database.exec(`
+            CREATE TABLE IF NOT EXISTS products (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              name TEXT NOT NULL,
+              description TEXT,
+              uuid TEXT UNIQUE
+            )
+          `);
+          logger.info('[MIGRATION] ✅ Table products créée');
+        }
+        
+        // Table product_units
+        if (!tableExists('product_units')) {
+          database.exec(`
+            CREATE TABLE IF NOT EXISTS product_units (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              product_id INTEGER,
+              unit_level INTEGER DEFAULT 1,
+              unit_name TEXT,
+              quantity_per_unit REAL,
+              uuid TEXT UNIQUE,
+              FOREIGN KEY(product_id) REFERENCES products(id)
+            )
+          `);
+          logger.info('[MIGRATION] ✅ Table product_units créée');
+        }
+        
+        // Table users
+        if (!tableExists('users')) {
+          database.exec(`
+            CREATE TABLE IF NOT EXISTS users (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              username TEXT UNIQUE NOT NULL,
+              password TEXT,
+              is_admin INTEGER DEFAULT 0,
+              uuid TEXT UNIQUE,
+              is_vendeur INTEGER DEFAULT 1,
+              is_gerant_stock INTEGER DEFAULT 0,
+              can_manage_products INTEGER DEFAULT 0
+            )
+          `);
+          logger.info('[MIGRATION] ✅ Table users créée');
+        }
+        
+        // Table sales
+        if (!tableExists('sales')) {
+          database.exec(`
+            CREATE TABLE IF NOT EXISTS sales (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id INTEGER,
+              total REAL,
+              sale_date TEXT,
+              uuid TEXT UNIQUE,
+              client_phone TEXT,
+              origin TEXT DEFAULT 'LOCAL',
+              FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+          `);
+          logger.info('[MIGRATION] ✅ Table sales créée');
+        }
+        
+        // Table sale_items
+        if (!tableExists('sale_items')) {
+          database.exec(`
+            CREATE TABLE IF NOT EXISTS sale_items (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              sale_id INTEGER,
+              product_id INTEGER,
+              unit_level INTEGER,
+              quantity REAL,
+              price REAL,
+              uuid TEXT UNIQUE,
+              product_unit_uuid TEXT,
+              FOREIGN KEY(sale_id) REFERENCES sales(id),
+              FOREIGN KEY(product_id) REFERENCES products(id)
+            )
+          `);
+          logger.info('[MIGRATION] ✅ Table sale_items créée');
+        }
+        
+        // Table debts
+        if (!tableExists('debts')) {
+          database.exec(`
+            CREATE TABLE IF NOT EXISTS debts (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              client_name TEXT,
+              amount REAL,
+              debt_date TEXT,
+              uuid TEXT UNIQUE,
+              client_phone TEXT,
+              product_description TEXT,
+              total_usd REAL,
+              debt_fc_in_usd REAL,
+              note TEXT,
+              synced_at TEXT
+            )
+          `);
+          logger.info('[MIGRATION] ✅ Table debts créée');
+        }
+        
+        logger.info('[MIGRATION] ✅ Tables de base créées avec succès');
+      } catch (tableError) {
+        logger.error('[MIGRATION] ❌ Erreur création tables de base:', tableError.message);
+        throw tableError;
+      }
+      
+      // Maintenant continuer avec les migrations
+    }
     
     // Migrations pour la table products
     const productsUuidAdded = ensureColumn('products', 'uuid', 'TEXT');
@@ -202,6 +358,44 @@ function applyMigrations() {
     
     // Migrations pour la table sale_items (CRITIQUE pour synchronisation Sheets)
     const saleItemsUuidAdded = ensureColumn('sale_items', 'uuid', 'TEXT');
+    
+    // ✅ MIGRATION: Ajouter product_unit_uuid (RÉFÉRENCE STABLE à l'unité)
+    const saleItemsUnitUuidAdded = ensureColumn('sale_items', 'product_unit_uuid', 'TEXT');
+    
+    // Backfill product_unit_uuid pour les items existants
+    if (saleItemsUnitUuidAdded || columnExists('sale_items', 'product_unit_uuid')) {
+      try {
+        const itemsWithoutUnitUuid = database.prepare(`
+          SELECT si.id 
+          FROM sale_items si
+          WHERE si.product_unit_uuid IS NULL OR TRIM(si.product_unit_uuid) = ''
+        `).all();
+        
+        if (itemsWithoutUnitUuid.length > 0) {
+          logger.info(`[MIGRATION] Backfill de ${itemsWithoutUnitUuid.length} product_unit_uuid(s) pour les items existants...`);
+          
+          const updateStmt = database.prepare(`
+            UPDATE sale_items
+            SET product_unit_uuid = (
+              SELECT pu.uuid
+              FROM product_units pu
+              WHERE pu.product_id = sale_items.product_id
+                AND pu.unit_level = sale_items.unit_level
+              LIMIT 1
+            )
+            WHERE id = ?
+          `);
+          
+          for (const item of itemsWithoutUnitUuid) {
+            updateStmt.run(item.id);
+          }
+          
+          logger.info(`[MIGRATION] ✅ ${itemsWithoutUnitUuid.length} product_unit_uuid(s) rempli(s) pour les items existants`);
+        }
+      } catch (error) {
+        logger.warn('[MIGRATION] Erreur backfill product_unit_uuid:', error.message);
+      }
+    }
     
     // Générer des UUIDs pour les produits existants qui n'en ont pas
     if (productsUuidAdded || columnExists('products', 'uuid')) {
@@ -328,6 +522,10 @@ function applyMigrations() {
       if (columnExists('sale_items', 'uuid')) {
         database.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_sale_items_uuid ON sale_items(uuid) WHERE uuid IS NOT NULL');
       }
+      // ✅ Index sur product_unit_uuid pour les triggers et requêtes
+      if (columnExists('sale_items', 'product_unit_uuid')) {
+        database.exec('CREATE INDEX IF NOT EXISTS idx_sale_items_unit_uuid ON sale_items(product_unit_uuid)');
+      }
     } catch (error) {
       // Ignorer si l'index existe déjà
       if (!error.message.includes('already exists')) {
@@ -350,21 +548,161 @@ function applyMigrations() {
  */
 export function initSchema() {
   const database = getDb();
-  const schemaPath = path.join(process.cwd(), 'src/db/schema.sql');
+  
+  // ✅ CORRECTION: Chercher schema.sql à plusieurs emplacements possibles en production
+  // 1. RESOURCES_ROOT (défini par Electron pour les extraResources)
+  // 2. APP_ROOT (application root)
+  // 3. process.resourcesPath (path Electron standard)
+  // 4. __dirname (fallback DEV)
+  
+  const possiblePaths = [
+    process.env.RESOURCES_ROOT && path.join(process.env.RESOURCES_ROOT, 'src/db/schema.sql'),
+    process.env.APP_ROOT && path.join(process.env.APP_ROOT, 'src/db/schema.sql'),
+    process.resourcesPath && path.join(process.resourcesPath, 'src/db/schema.sql'),
+    path.join(__dirname, 'schema.sql'), // DEV: chemin direct
+    path.join(process.cwd(), 'src/db/schema.sql'), // Fallback
+  ].filter(Boolean);
+  
+  let schemaPath = null;
+  
+  // Chercher le premier chemin qui existe
+  for (const checkPath of possiblePaths) {
+    logger.info(`[SCHEMA] Vérification: ${checkPath}`);
+    if (fs.existsSync(checkPath)) {
+      schemaPath = checkPath;
+      logger.info(`[SCHEMA] ✅ Trouvé: ${schemaPath}`);
+      break;
+    }
+  }
   
   try {
-    if (fs.existsSync(schemaPath)) {
-      const schema = fs.readFileSync(schemaPath, 'utf-8');
+    if (!schemaPath) {
+      logger.warn('[SCHEMA] ❌ schema.sql introuvable à aucun emplacement');
+      logger.warn('[SCHEMA] Chemins vérifiés:');
+      possiblePaths.forEach((p, i) => {
+        logger.warn(`  ${i + 1}. ${p}`);
+      });
+      logger.warn(`[SCHEMA] RESOURCES_ROOT=${process.env.RESOURCES_ROOT}`);
+      logger.warn(`[SCHEMA] APP_ROOT=${process.env.APP_ROOT}`);
+      logger.warn(`[SCHEMA] process.resourcesPath=${process.resourcesPath}`);
+      logger.warn(`[SCHEMA] __dirname=${__dirname}`);
+      logger.warn(`[SCHEMA] cwd=${process.cwd()}`);
+      logger.warn('[SCHEMA] ⚠️  Création des tables de base via fallback SQL...');
+      
+      // ✅ FALLBACK: Créer les tables de base directement en SQL
+      // Ceci garantit qu'au moins les tables existent avant les migrations
+      const fallbackSQL = `
+        -- Tables de base avec CREATE TABLE IF NOT EXISTS
+        CREATE TABLE IF NOT EXISTS products (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL UNIQUE,
+          description TEXT,
+          uuid TEXT UNIQUE,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        
+        CREATE TABLE IF NOT EXISTS product_units (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          product_id INTEGER NOT NULL,
+          unit_name TEXT NOT NULL,
+          unit_level INTEGER NOT NULL,
+          quantity_per_unit REAL NOT NULL,
+          price_in_fc REAL NOT NULL,
+          price_in_usd REAL,
+          uuid TEXT UNIQUE,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+        );
+        
+        CREATE TABLE IF NOT EXISTS users (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          username TEXT NOT NULL UNIQUE,
+          password TEXT NOT NULL,
+          uuid TEXT UNIQUE,
+          is_vendeur INTEGER DEFAULT 1,
+          is_gerant_stock INTEGER DEFAULT 0,
+          can_manage_products INTEGER DEFAULT 0,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        
+        CREATE TABLE IF NOT EXISTS sales (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL,
+          sale_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+          total_amount_fc REAL NOT NULL DEFAULT 0,
+          total_amount_usd REAL,
+          uuid TEXT UNIQUE,
+          client_phone TEXT,
+          origin TEXT DEFAULT 'LOCAL',
+          synced_at DATETIME,
+          FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+        
+        CREATE TABLE IF NOT EXISTS sale_items (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          sale_id INTEGER NOT NULL,
+          product_id INTEGER NOT NULL,
+          unit_level INTEGER,
+          quantity REAL NOT NULL,
+          price_in_fc REAL NOT NULL,
+          price_in_usd REAL,
+          uuid TEXT UNIQUE,
+          product_unit_uuid TEXT,
+          FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE,
+          FOREIGN KEY (product_id) REFERENCES products(id)
+        );
+        
+        CREATE TABLE IF NOT EXISTS debts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          client_name TEXT NOT NULL,
+          product_description TEXT,
+          debt_amount_fc REAL NOT NULL,
+          debt_amount_usd REAL,
+          debt_fc_in_usd REAL,
+          total_usd REAL,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          uuid TEXT UNIQUE,
+          client_phone TEXT,
+          note TEXT,
+          synced_at DATETIME
+        );
+      `;
+      
+      try {
+        database.exec(fallbackSQL);
+        logger.info('[SCHEMA] ✅ Tables de base créées via fallback SQL');
+      } catch (fallbackError) {
+        logger.warn('[SCHEMA] Certaines tables existent déjà (acceptable):', fallbackError.message);
+      }
+      
+      // Ensuite appliquer les migrations pour ajouter les colonnes manquantes
+      applyMigrations();
+      return;
+    }
+    
+    logger.info('[SCHEMA] ✅ Chargement de schema.sql...');
+    const schema = fs.readFileSync(schemaPath, 'utf-8');
+    try {
       database.exec(schema);
-      logger.info('Schéma de base de données initialisé');
-    } else {
-      logger.warn('Fichier schema.sql non trouvé');
+      logger.info('[SCHEMA] ✅ Schéma de base de données initialisé avec succès');
+    } catch (schemaError) {
+      // Les erreurs de contraintes UNIQUE ou KEY peuvent être normales si la table existe déjà
+      if (schemaError.message.includes('UNIQUE') || 
+          schemaError.message.includes('already exists') ||
+          schemaError.message.includes('duplicate') ||
+          schemaError.message.includes('product_unit_uuid')) {
+        logger.info('[SCHEMA] ℹ️  Certain schéma éléments existent déjà, utilisation des migrations pour l\'update');
+      } else {
+        throw schemaError;
+      }
     }
     
     // Appliquer les migrations après l'initialisation du schéma
     applyMigrations();
   } catch (error) {
-    logger.error('Erreur initialisation schéma:', error);
+    logger.error('[SCHEMA] ❌ Erreur initialisation schéma:', error);
     throw error;
   }
 }

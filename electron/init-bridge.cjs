@@ -9,9 +9,12 @@ const isDev = process.env.NODE_ENV === 'development';
 
 // En production: les ressources sont dans le bundle Electron
 // En dev: les ressources sont dans le dossier print/
+// ✅ CORRECTIF: Utiliser process.env.RESOURCES_ROOT qui est défini dans main.cjs
+// et a une fallback correcte pour NSIS
 const embeddedResourcesPath = isDev
   ? path.join(__dirname, '..', 'print')
-  : path.join(process.resourcesPath || path.dirname(__dirname), 'resources', 'print');
+  : path.join(process.env.RESOURCES_ROOT || process.resourcesPath || path.dirname(__dirname), 'print');
+
 
 /**
  * Wrapper pour importer les modules ESM depuis CommonJS

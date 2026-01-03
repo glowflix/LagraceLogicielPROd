@@ -55,6 +55,19 @@ function safeParseJson(str, fallback = null) {
 }
 
 /**
+ * Helper PRO: Trouve la première colonne valide parmi plusieurs noms
+ * Corrige le bug: findColumnIndex(...) || findColumnIndex(...) ne marche pas avec -1
+ * Raison: -1 est "truthy" en JS, donc le || ne retombe jamais sur le fallback
+ */
+function firstCol(sheet, names) {
+  for (const n of names) {
+    const idx = findColumnIndex(sheet, n);
+    if (idx > 0) return idx;
+  }
+  return -1;
+}
+
+/**
  * Génère un UUID v4 compatible avec Google Apps Script
  * Format: PM{prefix}{13 chars alphanumériques}
  * Exemple: PMGTKQ4THRIFF (comme les codes existants)
@@ -115,26 +128,23 @@ function toNumber(v) {
  */
 function toDate(v) {
   if (!v) return null;
-  if (v instanceof Date) {
-    // Vérifier que la date est valide
-    return isNaN(v.getTime()) ? null : v;
-  }
+
+  if (v instanceof Date) return isNaN(v.getTime()) ? null : v;
   if (typeof v === 'number') {
     const dt = new Date(v);
     return isNaN(dt.getTime()) ? null : dt;
   }
-  
+
   const s = String(v).trim();
-  if (!s || s === '') return null;
-  
-  // Essayer d'abord le format ISO (2025-11-20T10:44:58.918Z)
-  // Le constructeur Date() gère déjà ce format correctement
-  const dtIso = new Date(s);
-  if (!isNaN(dtIso.getTime())) {
-    return dtIso;
+  if (!s) return null;
+
+  // ISO (2025-11-20T10:44:58.918Z)
+  if (s.includes('T') && s.includes('-')) {
+    const dtIso = new Date(s);
+    return isNaN(dtIso.getTime()) ? null : dtIso;
   }
-  
-  // Format FR: dd/mm/yyyy ou dd-mm-yyyy
+
+  // FR: dd/mm/yyyy ou dd-mm-yyyy (à tester AVANT new Date(s))
   const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
   if (m) {
     const d = parseInt(m[1], 10);
@@ -144,10 +154,82 @@ function toDate(v) {
     const dtFr = new Date(y, mo, d);
     return isNaN(dtFr.getTime()) ? null : dtFr;
   }
-  
-  // Dernier essai avec le constructeur Date standard
+
+  // Fallback
   const dt = new Date(s);
   return isNaN(dt.getTime()) ? null : dt;
+}
+
+/**
+ * ✅ HELPER: Récupère la première valeur définie parmi les clés
+ * Utile pour gérer multiple noms de champs de l'app (name, product_name, nom, productName)
+ */
+function pickFirst(obj, keys, fallback = undefined) {
+  for (const k of keys) {
+    if (obj && Object.prototype.hasOwnProperty.call(obj, k) && obj[k] !== undefined) return obj[k];
+  }
+  return fallback;
+}
+
+/**
+ * ✅ HELPER: Normalise un code produit
+ * Gère null, undefined, nombre vs chaîne
+ */
+function normalizeCode(v) {
+  return (v === null || v === undefined) ? '' : String(v).trim();
+}
+
+/**
+ * ✅ HELPER: Normalise le "unit_level" (CARTON, MILLIER, PIECE)
+ * Gère majuscules/minuscules, gère MILLIERS → MILLIER
+ */
+function normalizeUnitLevel(v) {
+  const s = (v || '').toString().trim().toUpperCase();
+  if (s === 'MILLIERS') return 'MILLIER';
+  if (s === 'PIECES') return 'PIECE';
+  return s;
+}
+
+/**
+ * ✅ HELPER: Normalise un "Mark" (unité d'emballage)
+ * Gère DZ/dz/dozen → DZ
+ * Autres → UPPERCASE
+ * Vide → ''
+ */
+function normalizeMark(v) {
+  let m = (v || '').toString().trim();
+  if (!m) return '';
+  const lower = m.toLowerCase();
+
+  // Normaliser DZ (douzaine)
+  if (['dz','dzn','douz','douzaine','douzain','dizaine','dozen'].includes(lower)) return 'DZ';
+
+  // Standard: UPPERCASE
+  return m.toUpperCase();
+}
+
+/**
+ * ✅ HELPER: Calcule le max _updated_at parmi les lignes
+ * Nécessaire pour l'incrémental (batch pull)
+ */
+function computeMaxUpdatedAt(rows, fallbackIso) {
+  let max = toDate(fallbackIso) || new Date(0);
+
+  for (const r of (rows || [])) {
+    const d = toDate(
+      r?._remote_updated_at ||
+      r?._updated_at ||
+      r?.last_update ||
+      r?.updated_at ||
+      r?.created_at ||
+      r?.sold_at ||
+      r?.effective_at ||
+      null
+    );
+    if (d && d > max) max = d;
+  }
+
+  return max.toISOString();
 }
 
 /**
@@ -155,8 +237,10 @@ function toDate(v) {
  */
 function ensureTechColumns(sheet) {
   ensureColumn(sheet, '_uuid');
+  ensureColumn(sheet, '_unit_uuid');
   ensureColumn(sheet, '_updated_at');
   ensureColumn(sheet, '_device_id');
+  ensureColumn(sheet, '_version');
   // ensureColumn(sheet, '_deleted_at'); // si vous voulez gérer delete plus tard
 }
 
@@ -240,14 +324,55 @@ function onEdit(e) {
     if (!e || !e.range) return;
     const sheet = e.range.getSheet();
     const row = e.range.getRow();
+    const col = e.range.getColumn();
     if (row <= 1) return; // ignore header
     
-    // Mettre _updated_at sur la ligne modifiée
+    // ✅ PRO: Détecter modifications colonnes clés (B=Nom, F=Mark) et mettre à jour tech columns
     ensureTechColumns(sheet);
+    
     const colUpdatedAt = findColumnIndex(sheet, '_updated_at');
+    const colVersion = findColumnIndex(sheet, '_version');
+    const colUuid = findColumnIndex(sheet, '_uuid');
+    
+    // Colonnes clés: B (Nom/name) et F (Mark)
+    const sheetName = sheet.getName().toLowerCase();
+    const isUnitSheet = ['carton', 'milliers', 'piece'].some(s => sheetName.includes(s)) || 
+                       sheetName.includes('product') || sheetName.includes('inventory');
+    
+    if (isUnitSheet && (col === 2 || col === 6)) {
+      // col 2 = Nom, col 6 = Mark
+      const isNameChange = (col === 2);
+      const isMarkChange = (col === 6);
+      
+      // 1️⃣ Remplir _uuid si manquant
+      if (colUuid > 0) {
+        const existingUuid = sheet.getRange(row, colUuid).getValue();
+        if (!existingUuid || String(existingUuid).trim() === '') {
+          const newUuid = Utilities.getUuid();
+          sheet.getRange(row, colUuid).setValue(newUuid);
+          console.log(`[onEdit] 🆔 UUID généré pour ligne ${row}: ${newUuid}`);
+        }
+      }
+      
+      // 2️⃣ Mettre à jour _updated_at
+      if (colUpdatedAt > 0) {
+        sheet.getRange(row, colUpdatedAt).setValue(nowIso());
+      }
+      
+      // 3️⃣ Incrémenter _version
+      if (colVersion > 0) {
+        const currentVersion = sheet.getRange(row, colVersion).getValue();
+        const newVersion = (typeof currentVersion === 'number' ? currentVersion : 0) + 1;
+        sheet.getRange(row, colVersion).setValue(newVersion);
+        console.log(`[onEdit] 📝 Ligne ${row} - Version: ${newVersion} (${isNameChange ? 'Nom' : 'Mark'} modifié)`);
+      }
+    }
+    
+    // ✅ Toujours mettre à jour _updated_at sur toute modification
     if (colUpdatedAt > 0) {
       sheet.getRange(row, colUpdatedAt).setValue(nowIso());
     }
+    
   } catch (err) {
     // ne pas casser l'édition utilisateur
     logDebug('onEdit error:', err);
@@ -255,92 +380,434 @@ function onEdit(e) {
 }
 
 /**
+ * ✅ PRO: Backfill UUID pour toutes les lignes sans _uuid
+ * Traverse toutes les feuilles produit et génère UUID manquants
+ */
+function backfillAllUUIDs() {
+  const sheets = [SHEETS.CARTON, SHEETS.MILLIERS, SHEETS.PIECE];
+  let totalBackfilled = 0;
+  
+  for (const sheetName of sheets) {
+    const sheet = getSheet(sheetName);
+    ensureTechColumns(sheet);
+    
+    const colUuid = findColumnIndex(sheet, '_uuid');
+    if (colUuid <= 0) continue;
+    
+    const colUpdatedAt = findColumnIndex(sheet, '_updated_at');
+    const colVersion = findColumnIndex(sheet, '_version');
+    
+    const lastRow = sheet.getLastRow();
+    if (lastRow <= 1) continue;
+    
+    const uuidRange = sheet.getRange(2, colUuid, lastRow - 1, 1);
+    const uuidValues = uuidRange.getValues();
+    
+    const updatesToApply = [];
+    
+    for (let i = 0; i < uuidValues.length; i++) {
+      const existingUuid = uuidValues[i][0];
+      if (!existingUuid || String(existingUuid).trim() === '') {
+        const newUuid = Utilities.getUuid();
+        const updates = [newUuid];
+        
+        // Mettre à jour _updated_at et _version aussi
+        if (colUpdatedAt > 0) {
+          updates.push(nowIso());
+        }
+        if (colVersion > 0) {
+          updates.push(1);
+        }
+        
+        updatesToApply.push([i + 2, newUuid]);  // row index
+        totalBackfilled++;
+      }
+    }
+    
+    // Écrire les UUIDs générés
+    for (const [rowNum, uuid] of updatesToApply) {
+      sheet.getRange(rowNum, colUuid).setValue(uuid);
+      if (colUpdatedAt > 0) sheet.getRange(rowNum, colUpdatedAt).setValue(nowIso());
+      if (colVersion > 0) sheet.getRange(rowNum, colVersion).setValue(1);
+      console.log(`[backfillAllUUIDs] 🆔 Ligne ${rowNum} (${sheetName}): ${uuid}`);
+    }
+  }
+  
+  console.log(`[backfillAllUUIDs] ✅ Total UUID générés: ${totalBackfilled}`);
+  return totalBackfilled;
+}
+
+/**
+ * ✅ PRO: Récupère les modifications depuis Sheets (Pull)
+ * Stratégie: "Last Write Wins" (LWW) - compare updated_at
+ * Retourne les produits modifiés avec leur version et UUID
+ */
+function getPullChanges(sinceDate) {
+  const results = {
+    products: [],      // Modifications de name/mark
+    units: [],         // Modifications de stock/prix
+    conflicts: [],     // Conflits détectés
+    meta: {
+      total: 0,
+      since: sinceDate ? sinceDate.toISOString() : '1970-01-01T00:00:00Z',
+      pulledAt: nowIso()
+    }
+  };
+  
+  const sheets = [SHEETS.CARTON, SHEETS.MILLIERS, SHEETS.PIECE];
+  const sinceTs = sinceDate ? sinceDate.getTime() : 0;
+  
+  for (const sheetName of sheets) {
+    const sheet = getSheet(sheetName);
+    ensureTechColumns(sheet);
+    
+    const colUuid = findColumnIndex(sheet, '_uuid');
+    const colUpdatedAt = findColumnIndex(sheet, '_updated_at');
+    const colVersion = findColumnIndex(sheet, '_version');
+    const colName = firstCol(sheet, ['Nom du produit', 'Nom']);
+    const colMark = firstCol(sheet, ['Mark', 'MARK']);
+    const colCode = findColumnIndex(sheet, 'Code produit');
+    const colStock = findColumnIndex(sheet, 'Stock initial');
+    
+    const lastRow = sheet.getLastRow();
+    if (lastRow <= 1) continue;
+    
+    const values = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+    
+    for (let i = 0; i < values.length; i++) {
+      const row = i + 2;
+      const uuid = colUuid > 0 ? String(values[i][colUuid - 1] || '') : '';
+      const updatedAtVal = colUpdatedAt > 0 ? values[i][colUpdatedAt - 1] : null;
+      const updatedAt = toDate(updatedAtVal);
+      const version = colVersion > 0 ? (values[i][colVersion - 1] || 0) : 0;
+      const name = colName > 0 ? values[i][colName - 1] : '';
+      const mark = colMark > 0 ? values[i][colMark - 1] : '';
+      const code = colCode > 0 ? values[i][colCode - 1] : '';
+      const stock = colStock > 0 ? values[i][colStock - 1] : 0;
+      
+      // Filtrer par date
+      if (updatedAt && updatedAt.getTime() > sinceTs) {
+        const unitLevel = sheetName === SHEETS.CARTON ? 'CARTON' : 
+                         (sheetName === SHEETS.MILLIERS ? 'MILLIER' : 'PIECE');
+        
+        // Enregistrer comme changement de produit
+        results.products.push({
+          uuid: uuid || Utilities.getUuid(),
+          code,
+          name,
+          mark,
+          unit: unitLevel,
+          version,
+          updated_at: updatedAt.toISOString(),
+          row,
+          sheet: sheetName,
+          stock  // Inclure aussi pour info
+        });
+        
+        results.meta.total++;
+      }
+    }
+  }
+  
+  console.log(`[getPullChanges] 📥 ${results.meta.total} changement(s) depuis ${sinceDate?.toISOString()}`);
+  return results;
+}
+
+/**
+ * ✅ PRO: Propage name/mark sur toutes les unités d'un produit via son CODE
+ * ⭐ ROBUST: Même si _uuid diffère entre feuilles, le Code est identique partout
+ * Remplace propagateNameMarkToAllUnits (basée sur UUID) qui ne marche pas
+ */
+function propagateNameMarkByCode(code, newName, newMark) {
+  if (!code) {
+    console.warn('[propagateNameMarkByCode] Code vide');
+    return 0;
+  }
+  
+  const codeNormalized = normalizeCode(code);
+  const sheets = [SHEETS.CARTON, SHEETS.MILLIERS, SHEETS.PIECE];
+  let countUpdated = 0;
+  
+  for (const sheetName of sheets) {
+    const sheet = getSheet(sheetName);
+    if (!sheet) continue;
+    ensureTechColumns(sheet);
+    
+    const colCode = firstCol(sheet, ['Code produit', 'Code']);
+    const colName = firstCol(sheet, ['Nom du produit', 'Nom']);
+    const colMark = firstCol(sheet, ['Mark', 'MARK']);
+    const colUpdatedAt = firstCol(sheet, ['_updated_at', '_date_update']);
+    const colVersion = firstCol(sheet, ['_version']);
+    
+    const lastRow = sheet.getLastRow();
+    if (lastRow <= 1 || colCode <= 0) continue;
+    
+    const values = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+    
+    for (let i = 0; i < values.length; i++) {
+      const rowCode = normalizeCode(String(values[i][colCode - 1] || '').trim());
+      
+      if (rowCode === codeNormalized) {
+        const row = i + 2;
+        
+        // Mettre à jour name si fourni
+        if (newName !== undefined && newName !== null && colName > 0) {
+          sheet.getRange(row, colName).setValue(String(newName ?? ''));
+          console.log(`[propagateNameMarkByCode] ✏️  ${sheetName} ligne ${row}: Nom → "${newName}"`);
+        }
+        
+        // Mettre à jour mark si fourni
+        if (newMark !== undefined && newMark !== null && colMark > 0) {
+          sheet.getRange(row, colMark).setValue(normalizeMark(newMark));
+          console.log(`[propagateNameMarkByCode] 🏷️  ${sheetName} ligne ${row}: Mark → "${newMark}"`);
+        }
+        
+        // Mettre à jour _updated_at et _version
+        if (colUpdatedAt > 0) sheet.getRange(row, colUpdatedAt).setValue(nowIso());
+        if (colVersion > 0) {
+          const currentVersion = values[i][colVersion - 1] || 0;
+          sheet.getRange(row, colVersion).setValue(currentVersion + 1);
+        }
+        
+        countUpdated++;
+      }
+    }
+  }
+  
+  console.log(`[propagateNameMarkByCode] ✅ ${countUpdated} ligne(s) mise(s) à jour pour Code "${code}"`);
+  
+  return countUpdated;
+}
+
+/**
+ * DEPRECATED: Ancienne fonction basée sur UUID
+ * Garde pour compatibilité seulement
+ * Utiliser propagateNameMarkByCode() à la place (plus robuste)
+ */
+function propagateNameMarkToAllUnits(uuid, newName, newMark) {
+  if (!uuid) {
+    console.warn('[propagateNameMarkToAllUnits] DEPRECATED - utiliser propagateNameMarkByCode() à la place');
+    return 0;
+  }
+  
+  const sheets = [SHEETS.CARTON, SHEETS.MILLIERS, SHEETS.PIECE];
+  let countUpdated = 0;
+  
+  for (const sheetName of sheets) {
+    const sheet = getSheet(sheetName);
+    ensureTechColumns(sheet);
+    
+    const colUuid = findColumnIndex(sheet, '_uuid');
+    const colName = firstCol(sheet, ['Nom du produit', 'Nom']);
+    const colMark = firstCol(sheet, ['Mark', 'MARK']);
+    const colUpdatedAt = findColumnIndex(sheet, '_updated_at');
+    const colVersion = findColumnIndex(sheet, '_version');
+    
+    const lastRow = sheet.getLastRow();
+    if (lastRow <= 1) continue;
+    
+    const values = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+    
+    for (let i = 0; i < values.length; i++) {
+      const rowUuid = colUuid > 0 ? String(values[i][colUuid - 1] || '') : '';
+      
+      if (rowUuid === uuid) {
+        const row = i + 2;
+        
+        // Mettre à jour name si fourni et différent
+        if (newName !== undefined && newName !== null && colName > 0) {
+          const currentName = values[i][colName - 1];
+          if (String(currentName || '') !== String(newName)) {
+            sheet.getRange(row, colName).setValue(newName);
+            console.log(`[propagateNameMarkToAllUnits] ✏️  ${sheetName} ligne ${row}: Nom → "${newName}"`);
+          }
+        }
+        
+        // Mettre à jour mark si fourni et différent
+        if (newMark !== undefined && newMark !== null && colMark > 0) {
+          const currentMark = values[i][colMark - 1];
+          if (String(currentMark || '') !== String(newMark)) {
+            sheet.getRange(row, colMark).setValue(newMark);
+            console.log(`[propagateNameMarkToAllUnits] 🏷️  ${sheetName} ligne ${row}: Mark → "${newMark}"`);
+          }
+        }
+        
+        // Mettre à jour _updated_at et _version
+        if (colUpdatedAt > 0) sheet.getRange(row, colUpdatedAt).setValue(nowIso());
+        if (colVersion > 0) {
+          const currentVersion = values[i][colVersion - 1] || 0;
+          sheet.getRange(row, colVersion).setValue(currentVersion + 1);
+        }
+        
+        countUpdated++;
+      }
+    }
+  }
+  
+  if (countUpdated > 0) {
+    console.log(`[propagateNameMarkToAllUnits] ✅ ${countUpdated} ligne(s) mise(s) à jour pour UUID ${uuid}`);
+  }
+  
+  return countUpdated;
+}
+
+/**
+ * ✅ PRO: Gère la synchronisation bidirectionnelle avec résolution de conflits
+ * Appelé après un Pull pour synchroniser les modifications
+ */
+function syncWithConflictResolution(pullChanges, localVersion = null) {
+  const conflicts = [];
+  const applied = [];
+  
+  // Stratégie LWW (Last Write Wins): comparer timestamps
+  for (const change of pullChanges.products) {
+    // Si version local > Sheets → conflit
+    if (localVersion && localVersion[change.uuid] && localVersion[change.uuid].version > change.version) {
+      conflicts.push({
+        uuid: change.uuid,
+        reason: 'LOCAL_NEWER',
+        sheets_version: change.version,
+        sheets_updated_at: change.updated_at,
+        local_version: localVersion[change.uuid].version,
+        local_updated_at: localVersion[change.uuid].updated_at
+      });
+      console.log(`[syncWithConflictResolution] ⚠️  Conflit: ${change.uuid} (local plus récent)`);
+      continue;
+    }
+    
+    // Sinon: appliquer la modification Sheets
+    applied.push(change);
+    console.log(`[syncWithConflictResolution] ✅ Appliquer: ${change.uuid} (${change.name} / ${change.mark})`);
+  }
+  
+  return {
+    applied,
+    conflicts,
+    totalApplied: applied.length,
+    totalConflicts: conflicts.length
+  };
+}
+
+/**
  * ENDPOINT: Push depuis local vers Sheets
  * POST avec body: { entity, entity_id, op, payload } OU { action: 'batchPush', ops: [...] }
  * Sécurité: { key: 'API_KEY' } (optionnel, vérifier si configuré)
  */
-function doPost(e) {
+/**
+ * ✅ CONCURRENCE: Éviter que 2 pushes écrivent en même temps
+ * Utilise LockService pour synchroniser l'accès aux feuilles
+ */
+function withScriptLock_(fn) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);  // Attendre max 30s
   try {
-    const body = e && e.postData && e.postData.contents ? e.postData.contents : '{}';
-    const data = safeParseJson(body, {});
-    
-    // Sécurité: Vérifier API key si configuré
-    const apiKey = PropertiesService.getScriptProperties().getProperty('API_KEY');
-    if (apiKey && data.key !== apiKey) {
-      return jsonOut({ success: false, error: 'API key invalide', server_time: nowIso() });
-    }
-    
-    const action = (data.action || '').toString().trim().toLowerCase();
-    
-    // Mode batchPush (PRO)
-    if (action === 'batchpush') {
-      return handleBatchPush(data);
-    }
-    
-    // Compatibilité ancienne: { entity, entity_id, op, payload }
-    const entityRaw = data.entity || '';
-    const entity = entityRaw.toString().trim().toLowerCase();
-    const { entity_id, op, payload } = data;
-    
-    logDebug('doPost entity:', entity);
-    
-    let result;
-    
-    switch (entity) {
-      case 'products':
-      case 'product_units':
-        // Vérifier si c'est une opération update_stock
-        // CRITIQUE: Vérifier stock_absolute (nouveau mode) OU stock_change (ancien mode pour compatibilité)
-        if (op === 'update_stock' && (payload.stock_absolute !== undefined || payload.stock_change !== undefined)) {
-          result = handleStockUpdate(payload);
-        } else {
-          result = handleProductUpsert(payload, entity);
-        }
-        break;
-      case 'sales':
-        result = handleSaleUpsert(payload);
-        break;
-      case 'sale_items':
-        result = handleSaleItemUpsert(payload);
-        break;
-      case 'debts':
-        result = handleDebtUpsert(payload);
-        break;
-      case 'debt_payments':
-        result = handleDebtPaymentUpsert(payload);
-        break;
-      case 'rates':
-        result = handleRateUpsert(payload);
-        break;
-      case 'users':
-        result = handleUserUpsert(payload);
-        break;
-      case 'price_logs':
-        result = handlePriceLogUpsert(payload);
-        break;
-      default:
-        console.error('❌ Entity inconnue dans doPost:', entityRaw);
-        return jsonOut({
-          success: false,
-          error: 'Entity inconnue: ' + entityRaw,
-          server_time: nowIso()
-        });
-    }
-    
-    return jsonOut({
-      success: true,
-      result: result,
-      remote_version: nowIso(),
-      server_time: nowIso()
-    });
-    
-  } catch (error) {
-    return jsonOut({
-      success: false,
-      error: error.toString(),
-      server_time: nowIso()
-    });
+    return fn();
+  } finally {
+    lock.releaseLock();
   }
+}
+
+function doPost(e) {
+  return withScriptLock_(() => {
+    console.log(`📨 [doPost] APPELÉE`);
+    try {
+      const body = e && e.postData && e.postData.contents ? e.postData.contents : '{}';
+      const data = safeParseJson(body, {});
+      
+      console.log(`📨 [doPost] Body reçu (first 300 chars): ${body.substring(0, 300)}`);
+      console.log(`📨 [doPost] action='${data.action}', ops=${Array.isArray(data.ops) ? data.ops.length : 0}`);
+      console.log(`📨 [doPost] Données reçues: ${JSON.stringify(data).substring(0, 300)}...`);
+      
+      // Sécurité: Vérifier API key si configuré
+      const apiKey = PropertiesService.getScriptProperties().getProperty('API_KEY');
+      if (apiKey && data.key !== apiKey) {
+        return jsonOut({ success: false, error: 'API key invalide', server_time: nowIso() });
+      }
+      
+      const action = (data.action || '').toString().trim().toLowerCase();
+      
+      console.log(`📨 [doPost] Action détectée: '${action}'`);
+      
+      // ✅ PRO: Push avec propagation name/mark sur toutes unités
+      if (action === 'propush') {
+        console.log(`📨 [doPost] → Branche PROPUSH`);
+        return doProPush(data);
+      }
+      
+      // Mode batchPush (PRO)
+      if (action === 'batchpush') {
+        console.log(`📨 [doPost] → Branche BATCHPUSH`);
+        return handleBatchPush(data);
+      }
+      
+      console.log(`📨 [doPost] → Branche COMPATIBILITÉ ANCIENNE (entity-based)`);
+      
+      // Compatibilité ancienne: { entity, entity_id, op, payload }
+      const entityRaw = data.entity || '';
+      const entity = entityRaw.toString().trim().toLowerCase();
+      const { entity_id, op, payload } = data;
+      
+      logDebug('doPost entity:', entity);
+      console.log(`📨 [doPost] entity='${entity}', op='${op}', payload=${typeof payload}`);
+      
+      let result;
+      
+      switch (entity) {
+        case 'products':
+        case 'product_units':
+          // Vérifier si c'est une opération update_stock
+          // CRITIQUE: Vérifier stock_absolute (nouveau mode) OU stock_change (ancien mode pour compatibilité)
+          if (op === 'update_stock' && (payload.stock_absolute !== undefined || payload.stock_change !== undefined)) {
+            result = handleStockUpdate(payload);
+          } else {
+            result = handleProductUpsert(payload, entity);
+          }
+          break;
+        case 'sales':
+          result = handleSaleUpsert(payload);
+          break;
+        case 'sale_items':
+          result = handleSaleItemUpsert(payload);
+          break;
+        case 'debts':
+          result = handleDebtUpsert(payload);
+          break;
+        case 'debt_payments':
+          result = handleDebtPaymentUpsert(payload);
+          break;
+        case 'rates':
+          result = handleRateUpsert(payload);
+          break;
+        case 'users':
+          result = handleUserUpsert(payload);
+          break;
+        case 'price_logs':
+          result = handlePriceLogUpsert(payload);
+          break;
+        default:
+          console.error('❌ Entity inconnue dans doPost:', entityRaw);
+          return jsonOut({
+            success: false,
+            error: 'Entity inconnue: ' + entityRaw,
+            server_time: nowIso()
+          });
+      }
+      
+      return jsonOut({
+        success: true,
+        result: result,
+        remote_version: nowIso(),
+        server_time: nowIso()
+      });
+      
+    } catch (error) {
+      return jsonOut({
+        success: false,
+        error: error.toString(),
+        server_time: nowIso()
+      });
+    }
+  });
 }
 
 /**
@@ -368,6 +835,11 @@ function doGet(e) {
       return jsonOut({ success: true, server_time: nowIso() });
     }
     
+    // ✅ PRO: Pull amélioré avec détection name/mark
+    if (action === 'propull') {
+      return doProPull(p);
+    }
+    
     // Mode batchPull (PRO)
     if (action === 'batchpull') {
       return handleBatchPull(p);
@@ -381,7 +853,7 @@ function doGet(e) {
     const limit = Math.min(parseInt(p.limit || '300', 10) || 300, 500); // max 500
     const cursor = parseInt(p.cursor || '2', 10) || 2; // Défaut: ligne 2 (après header)
     
-    console.log('📥 [doGet] Requête:', { entity, full, since, cursor, limit });
+    logDebug('📥 [doGet] Requête:', { entity, full, since, cursor, limit });
     
     if (!entity) {
       return jsonOut({
@@ -392,7 +864,7 @@ function doGet(e) {
     }
     
     const sinceDate = full ? new Date(0) : (since ? new Date(since) : new Date(0));
-    console.log('📅 [doGet] Date since:', sinceDate.toISOString(), '| Full:', full);
+    logDebug('📅 [doGet] Date since:', sinceDate.toISOString(), '| Full:', full);
     
     let out;
     const startTime = new Date();
@@ -400,41 +872,45 @@ function doGet(e) {
     switch (entity) {
       case 'products':
       case 'product_units':
-        console.log(`📦 [${entity.toUpperCase()}] Récupération produits (mode paginé PRO)...`);
+        logDebug(`📦 [${entity.toUpperCase()}] Récupération produits (mode paginé PRO)...`);
+        // ⚠️ NOTE: getProductsPage() retourne des UNITS (shape=unit avec unit_level, unit_mark, sale_price_fc)
+        // Pas des PRODUCTS regroupés (shape=product avec units:[])
+        // Raison: Pagination => impossible regrouper par code dans une page
+        // Solution: Le client traite toujours comme product_units, même si entity='products'
         // TOUJOURS utiliser pagination pour products (évite timeout)
         out = getProductsPage(sinceDate, cursor, limit, p.unit_level || '');
-        console.log('✅ [PRODUCTS] Produits récupérés:', out.data?.length || 0, '| Done:', out.done, '| Next cursor:', out.next_cursor);
+        logDebug('✅ [PRODUCTS] Produits récupérés:', out.data?.length || 0, '| Done:', out.done, '| Next cursor:', out.next_cursor);
         break;
       case 'sales':
-        console.log('💰 [SALES] Récupération ventes (mode paginé PRO)...');
-        console.log('📅 [SALES] Paramètres: sinceDate=', sinceDate, '| cursor=', cursor, '| limit=', limit, '| full=', full);
+        logDebug('💰 [SALES] Récupération ventes (mode paginé PRO)...');
+        logDebug('📅 [SALES] Paramètres: sinceDate=', sinceDate, '| cursor=', cursor, '| limit=', limit, '| full=', full);
         // TOUJOURS utiliser pagination pour sales (évite timeout)
         // Passer sinceDate comme Date (pas string) pour getSalesPage
         const salesSinceDate = full ? new Date(0) : sinceDate;
-        console.log('📅 [SALES] sinceDate pour getSalesPage:', salesSinceDate.toISOString(), '| getTime():', salesSinceDate.getTime());
+        logDebug('📅 [SALES] sinceDate pour getSalesPage:', salesSinceDate.toISOString(), '| getTime():', salesSinceDate.getTime());
         out = getSalesPage(salesSinceDate, cursor, limit);
-        console.log('✅ [SALES] Ventes récupérées:', out.data?.length || 0, '| Done:', out.done, '| Next cursor:', out.next_cursor);
+        logDebug('✅ [SALES] Ventes récupérées:', out.data?.length || 0, '| Done:', out.done, '| Next cursor:', out.next_cursor);
         if (out.data && out.data.length === 0) {
-          console.log('⚠️ [SALES] Aucune vente retournée - Vérifier que la feuille "Ventes" contient des données');
+          logDebug('⚠️ [SALES] Aucune vente retournée - Vérifier que la feuille "Ventes" contient des données');
         }
         break;
       case 'debts':
-        console.log('💳 [DEBTS] Récupération dettes (mode paginé PRO)...');
+        logDebug('💳 [DEBTS] Récupération dettes (mode paginé PRO)...');
         // TOUJOURS utiliser pagination pour debts (évite timeout)
         out = getDebtsPage(sinceDate, cursor, limit);
-        console.log('✅ [DEBTS] Dettes récupérées:', out.data?.length || 0, '| Done:', out.done, '| Next cursor:', out.next_cursor);
+        logDebug('✅ [DEBTS] Dettes récupérées:', out.data?.length || 0, '| Done:', out.done, '| Next cursor:', out.next_cursor);
         break;
       case 'rates':
-        console.log('💱 [RATES] Récupération taux...');
+        logDebug('💱 [RATES] Récupération taux...');
         const ratesResult = getRatesSince(sinceDate);
         out = { data: ratesResult, next_cursor: null, done: true };
-        console.log('✅ [RATES] Taux récupérés:', ratesResult.length);
+        logDebug('✅ [RATES] Taux récupérés:', ratesResult.length);
         break;
       case 'users':
-        console.log('👥 [USERS] Récupération utilisateurs...');
+        logDebug('👥 [USERS] Récupération utilisateurs...');
         const usersResult = getUsersSince(sinceDate);
         out = { data: usersResult, next_cursor: null, done: true };
-        console.log('✅ [USERS] Utilisateurs récupérés:', usersResult.length);
+        logDebug('✅ [USERS] Utilisateurs récupérés:', usersResult.length);
         break;
       default:
         console.error('❌ [doGet] Entity inconnue:', entityRaw);
@@ -446,8 +922,8 @@ function doGet(e) {
     }
     
     const duration = new Date() - startTime;
-    console.log('⏱️ [doGet] Durée totale:', duration, 'ms');
-    console.log('📊 [doGet] Résultat final: count =', out.data?.length || 0);
+    logDebug('⏱️ [doGet] Durée totale:', duration, 'ms');
+    logDebug('📊 [doGet] Résultat final: count =', out.data?.length || 0);
     
     return jsonOut({
       success: true,
@@ -470,59 +946,203 @@ function doGet(e) {
 }
 
 /**
+ * ✅ ENDPOINT PRO: Pull amélioré avec détection des modifications name/mark
+ * GET ?action=proPull&since={ISO date}&includeConflicts=1
+ * Retourne les changements de produit avec stratégie LWW (Last Write Wins)
+ */
+function doProPull(p) {
+  try {
+    const sinceStr = (p.since || new Date(0).toISOString()).toString();
+    const sinceDate = toDate(sinceStr) || new Date(0);
+    const includeConflicts = p.includeConflicts === '1' || p.includeConflicts === true;
+    
+    console.log(`[doProPull] 📥 Début pull PRO depuis: ${sinceDate.toISOString()}`);
+    
+    // Récupérer les modifications
+    const pullChanges = getPullChanges(sinceDate);
+    
+    // Appliquer la résolution de conflits
+    const syncResult = syncWithConflictResolution(pullChanges, {});
+    
+    return jsonOut({
+      success: true,
+      data: {
+        products: syncResult.applied,
+        conflicts: includeConflicts ? syncResult.conflicts : [],
+        meta: {
+          ...pullChanges.meta,
+          applied: syncResult.totalApplied,
+          conflicts: syncResult.totalConflicts
+        }
+      },
+      server_time: nowIso()
+    });
+    
+  } catch (error) {
+    console.error('[doProPull] ❌ Erreur:', error.toString());
+    return jsonOut({
+      success: false,
+      error: error.toString(),
+      server_time: nowIso()
+    });
+  }
+}
+
+/**
+ * ✅ ENDPOINT PRO: Push amélioré avec propagation name/mark sur toutes unités
+ * POST { action: 'proPush', updates: [{uuid, name, mark, unit, ...}, ...] }
+ * Propage name/mark sur TOUS les UUIDs identiques dans toutes les feuilles
+ */
+function doProPush(data) {
+  try {
+    const updates = Array.isArray(data.updates) ? data.updates : [];
+    console.log(`[doProPush] 📤 Début push PRO avec ${updates.length} mise(s) à jour`);
+    
+    if (updates.length === 0) {
+      return jsonOut({
+        success: true,
+        applied: [],
+        propagated: [],
+        server_time: nowIso()
+      });
+    }
+    
+    const applied = [];
+    const propagated = [];
+    
+    for (const update of updates) {
+      const { uuid, name, mark, unit, ...payload } = update;
+      
+      // Extraire le code pour la propagation (par Code au lieu d'UUID)
+      const code = update.code || update.product_code || update.Code_produit;
+      
+      if (!uuid && !code) {
+        console.warn('[doProPush] ⚠️  UUID et Code manquants dans update');
+        continue;
+      }
+      
+      // Si name ou mark changent → propager sur toutes les unités (par Code, plus robuste)
+      if (name || mark) {
+        const countPropagated = code ? propagateNameMarkByCode(code, name, mark) : 0;
+        propagated.push({
+          uuid,
+          code,
+          name,
+          mark,
+          countPropagated
+        });
+        console.log(`[doProPush] ✅ Propagé name/mark pour Code "${code}" (${countPropagated} unité(s))`);
+      }
+      
+      applied.push({
+        uuid,
+        status: 'applied',
+        nameChanged: !!name,
+        markChanged: !!mark
+      });
+    }
+    
+    return jsonOut({
+      success: true,
+      applied,
+      propagated,
+      server_time: nowIso()
+    });
+    
+  } catch (error) {
+    console.error('[doProPush] ❌ Erreur:', error.toString());
+    return jsonOut({
+      success: false,
+      error: error.toString(),
+      server_time: nowIso()
+    });
+  }
+}
+
+/**
  * Gère l'upsert d'un produit/unité dans les feuilles Stock (Carton/Milliers/Piece)
- * AMÉLIORÉ: Génération automatique d'UUID si absent
+ * ✅ AMÉLIORÉ PRO v2:
+ *  - Accepte PLUSIEURS noms de champs (name, product_name, nom, etc.)
+ *  - Normalise Mark (DZ vs dz vs dozen → DZ)
+ *  - ✅ TOUJOURS match par code+mark normalisés (même pour CARTON)
+ *  - ✅ Écrit _updated_at (onEdit ne s'exécute pas pour scripts)
+ *  - ✅ Génère UUID auto si absent
  */
 function handleProductUpsert(payload, entityType) {
-  let { code, name, unit_level, unit_mark, stock_initial, stock_current,
-          purchase_price_usd, sale_price_fc, sale_price_usd,
-          auto_stock_factor, qty_step, extra1, extra2, last_update, uuid } = payload;
-  
-  console.log(`📦 [handleProductUpsert] Début upsert: code='${code}', unit_level='${unit_level}', uuid='${uuid || 'absent'}'`);
-  
-  // CRITIQUE: Normaliser unit_level (gérer majuscules/minuscules)
-  const unitLevelNormalized = (unit_level || '').toString().trim().toUpperCase();
-  // Normaliser MILLIERS → MILLIER
-  let unitLevelFinal = unitLevelNormalized;
-  if (unitLevelFinal === 'MILLIERS') {
-    unitLevelFinal = 'MILLIER';
+  // VÉRIFICATION: payload ne doit pas être undefined ou null (objet vide {} est OK)
+  if (payload === undefined || payload === null) {
+    console.log(`❌ [handleProductUpsert] ERREUR: payload est undefined ou null`);
+    throw new Error('[handleProductUpsert] payload manquant');
   }
   
+  // payload peut être un objet vide {} - c'est acceptable
+  
+  // ✅ Accepter plusieurs noms de champs venant de l'app
+  const code = pickFirst(payload, ['code', 'product_code', 'Code produit']);
+  const name = pickFirst(payload, ['name', 'product_name', 'nom', 'productName', 'Nom du produit']);
+  const unit_level = pickFirst(payload, ['unit_level', 'unite', 'unit', 'Unite', 'mode_stock']);
+  const unit_mark_raw = pickFirst(payload, ['unit_mark', 'mark', 'MARK', 'Mark']);
+
+  console.log(`📦 [handleProductUpsert] Extraction champs:`);
+  console.log(`   code='${code}' (from ${code ? 'payload' : 'VIDE'})`);
+  console.log(`   name='${name}' (from ${name ? 'payload' : 'VIDE'})`);
+  console.log(`   unit_level='${unit_level}'`);
+  console.log(`   pickFirst pour name: Cherche dans ['name', 'product_name', 'nom', 'productName', 'Nom du produit']`);
+
+  const stock_initial = pickFirst(payload, ['stock_initial', 'stockInit']);
+  const stock_current = pickFirst(payload, ['stock_current', 'stock', 'stockCurrent']);
+
+  const purchase_price_usd = pickFirst(payload, ['purchase_price_usd', 'buy_usd', "Prix d'achat (USD)"]);
+  const sale_price_fc = pickFirst(payload, ['sale_price_fc', 'price_fc', 'Prix de vente (FC)', 'Prix de vente détail (FC)']);
+  const sale_price_usd = pickFirst(payload, ['sale_price_usd', 'price_usd', 'Prix ventes (USD)']);
+
+  const auto_stock_factor = pickFirst(payload, ['auto_stock_factor', 'automation_stock', 'Automatisation Stock']);
+  const last_update = pickFirst(payload, ['last_update', 'updated_at', 'Date de dernière mise à jour']);
+  const uuid = pickFirst(payload, ['uuid', '_uuid']);
+  const unit_uuid = pickFirst(payload, ['unit_uuid', '_unit_uuid']); // ✅ NEW: Extract unit UUID
+
+  console.log(`📦 [handleProductUpsert] Début upsert:`);
+  console.log(`   code='${code}', name='${name}', unit_level='${unit_level}', unit_mark='${unit_mark_raw}'`);
+  console.log(`   uuid='${uuid || 'absent'}', type=${typeof payload}`);
+  console.log(`   🔍 Payload details: ${JSON.stringify(payload).substring(0, 200)}...`);
+
+  // ✅ Normaliser code + unit_level + mark
+  const codeNormalized = normalizeCode(code);
+  const unitLevelFinal = normalizeUnitLevel(unit_level);
+  const markNormalized = normalizeMark(unit_mark_raw);
+
+  if (!codeNormalized) throw new Error('[handleProductUpsert] code produit vide');
+  if (!['CARTON','MILLIER','PIECE'].includes(unitLevelFinal)) {
+    throw new Error('[handleProductUpsert] unit_level invalide: ' + unit_level);
+  }
+
   // Détermine la feuille selon unit_level
-  let sheetName;
-  if (unitLevelFinal === 'CARTON') {
-    sheetName = SHEETS.CARTON;
-  } else if (unitLevelFinal === 'MILLIER') {
-    sheetName = SHEETS.MILLIERS;
-  } else if (unitLevelFinal === 'PIECE') {
-    sheetName = SHEETS.PIECE;
-  } else {
-    console.error(`❌ [handleProductUpsert] unit_level invalide: '${unit_level}' (normalisé: '${unitLevelFinal}')`);
-    throw new Error('unit_level invalide: ' + unit_level + ' (attendu: CARTON, MILLIER, ou PIECE)');
-  }
-  
+  const sheetName =
+    unitLevelFinal === 'CARTON' ? SHEETS.CARTON :
+    unitLevelFinal === 'MILLIER' ? SHEETS.MILLIERS :
+    SHEETS.PIECE;
+
   console.log(`   📄 Feuille cible: ${sheetName}`);
-  
+
   const sheet = getSheet(sheetName);
-  
+
   // S'assurer que les colonnes existent
   ensureColumn(sheet, 'Code produit');
   ensureColumn(sheet, 'Nom du produit');
   ensureColumn(sheet, 'Stock initial');
-  ensureColumn(sheet, 'Prix d\'achat (USD)');
+  ensureColumn(sheet, "Prix d'achat (USD)");
   ensureColumn(sheet, 'Prix de vente (FC)');
   ensureColumn(sheet, 'Prix de vente détail (FC)');
   ensureColumn(sheet, 'Mark');
   ensureColumn(sheet, 'Date de dernière mise à jour');
   ensureColumn(sheet, 'Automatisation Stock');
   ensureColumn(sheet, 'Prix ventes (USD)');
-  ensureColumn(sheet, '_uuid'); // Colonne technique pour UUID
-  
-  // Trouver les index de colonnes
+  ensureTechColumns(sheet); // ✅ tech columns
+
   const colCode = findColumnIndex(sheet, 'Code produit');
   const colNom = findColumnIndex(sheet, 'Nom du produit');
   const colStockInit = findColumnIndex(sheet, 'Stock initial');
-  const colPrixAchatUSD = findColumnIndex(sheet, 'Prix d\'achat (USD)');
+  const colPrixAchatUSD = findColumnIndex(sheet, "Prix d'achat (USD)");
   const colPrixVenteFC = findColumnIndex(sheet, 'Prix de vente (FC)');
   const colPrixVenteDetailFC = findColumnIndex(sheet, 'Prix de vente détail (FC)');
   const colMark = findColumnIndex(sheet, 'Mark');
@@ -530,85 +1150,108 @@ function handleProductUpsert(payload, entityType) {
   const colAutoStock = findColumnIndex(sheet, 'Automatisation Stock');
   const colPrixVenteUSD = findColumnIndex(sheet, 'Prix ventes (USD)');
   const colUuid = findColumnIndex(sheet, '_uuid');
-  
-  const dataRange = sheet.getDataRange();
-  const values = dataRange.getValues();
-  
-  // CRITIQUE: Normaliser le code pour comparaison (gérer nombre vs chaîne)
-  const codeNormalized = code !== null && code !== undefined ? String(code).trim() : '';
-  const markNormalized = (unit_mark || '').toString().trim();
-  
-  // Recherche par Code produit + Mark (combinaison unique) ou UUID
+  const colUnitUuid = findColumnIndex(sheet, '_unit_uuid'); // ✅ NEW: Unit UUID
+  const colUpdatedAt = findColumnIndex(sheet, '_updated_at'); // ✅ tech
+  const colDeviceId = findColumnIndex(sheet, '_device_id'); // ✅ tech
+
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  const values = lastRow > 1 ? sheet.getRange(2, 1, lastRow - 1, lastCol).getValues() : [];
+
+  // ✅ RECHERCHE COHÉRENTE: UUID (priorité) sinon (code + mark normalisé)
   let rowIndex = -1;
-  let existingUuid = null;
-  
-  for (let i = 1; i < values.length; i++) {
-    const rowCodeRaw = values[i][colCode - 1];
-    const rowCodeNormalized = rowCodeRaw !== null && rowCodeRaw !== undefined ? String(rowCodeRaw).trim() : '';
-    const rowUuid = colUuid > 0 ? (values[i][colUuid - 1] || '').toString().trim() : '';
-    const rowMark = colMark > 0 ? (values[i][colMark - 1] || '').toString().trim() : '';
-    
-    // Match par UUID (prioritaire)
+  let existingUuid = '';
+
+  for (let i = 0; i < values.length; i++) {
+    const rowCode = normalizeCode(values[i][colCode - 1]);
+    const rowUuid = colUuid > 0 ? normalizeCode(values[i][colUuid - 1]) : '';
+    const rowMark = colMark > 0 ? normalizeMark(values[i][colMark - 1]) : '';
+
+    // PRIORITÉ 1: UUID si fourni
     if (uuid && rowUuid && rowUuid === uuid) {
-      rowIndex = i + 1;
+      rowIndex = i + 2;
       existingUuid = rowUuid;
-      console.log(`   ✅ Produit trouvé par UUID à la ligne ${rowIndex}: uuid='${uuid}'`);
+      console.log(`   ✅ Produit trouvé par UUID à la ligne ${rowIndex}`);
       break;
     }
-    
-    // Match par Code + Mark (pour les unités spécifiques)
-    if (codeNormalized && rowCodeNormalized === codeNormalized) {
-      // Pour CARTON, pas besoin de vérifier le mark
-      if (unitLevelFinal === 'CARTON' || rowMark === markNormalized) {
-        rowIndex = i + 1;
+
+    // PRIORITÉ 2: code SEUL dans la feuille courante
+    // ⚠️ IMPORTANT: L'unité est déjà implicite (chaque feuille = une unité)
+    // Code ne change JAMAIS une fois créé
+    // Mark est MODIFIABLE donc n'est pas critère de recherche (sauf si fourni AND unit_mark aussi fourni)
+    if (rowCode === codeNormalized) {
+      // Si mark est fourni ET plusieurs lignes pour le même code, affiner la recherche
+      if (markNormalized && markNormalized !== '') {
+        if (rowMark === markNormalized) {
+          rowIndex = i + 2;
+          existingUuid = rowUuid;
+          console.log(`   ✅ Produit trouvé par Code+Mark à la ligne ${rowIndex}`);
+          break;
+        }
+      } else {
+        // Pas de mark fourni, prendre la première ligne avec ce code
+        rowIndex = i + 2;
         existingUuid = rowUuid;
-        console.log(`   ✅ Produit trouvé par Code+Mark à la ligne ${rowIndex}: code='${codeNormalized}', mark='${markNormalized}'`);
+        console.log(`   ✅ Produit trouvé par Code à la ligne ${rowIndex}`);
         break;
       }
     }
   }
+
+  const now = nowIso();
   
-  const now = new Date().toISOString();
-  
-  // NOUVEAU: Générer un UUID automatiquement si absent
+  // ✅ Générer un UUID automatiquement si absent
   let finalUuid = uuid || existingUuid;
   if (!finalUuid) {
     finalUuid = generateFullUUID();
     console.log(`   🆔 UUID généré automatiquement: ${finalUuid}`);
   }
-  
-  // Préparer les valeurs selon la feuille
+
+  // Préparer les valeurs de la ligne
   const rowData = [];
   const maxCol = Math.max(colCode, colNom, colStockInit, colPrixAchatUSD, 
                           colPrixVenteFC, colPrixVenteDetailFC, colMark, 
-                          colDateUpdate, colAutoStock, colPrixVenteUSD, colUuid);
-  
-  // Initialiser toutes les colonnes avec les valeurs existantes si mise à jour
+                          colDateUpdate, colAutoStock, colPrixVenteUSD, colUuid, colUpdatedAt, colDeviceId);
+
+  // Initialiser avec valeurs existantes si update
   if (rowIndex > 0) {
-    // Copier les valeurs existantes pour ne pas les écraser
     for (let i = 0; i < maxCol; i++) {
-      rowData[i] = values[rowIndex - 2] ? values[rowIndex - 2][i] : '';
+      rowData[i] = (values[rowIndex - 2][i] ?? '');
     }
   } else {
     for (let i = 0; i < maxCol; i++) {
       rowData[i] = '';
     }
   }
+
+  // ✅ Écriture SAFE: ne pas écraser avec undefined
+  if (colCode > 0) rowData[colCode - 1] = codeNormalized;
   
-  // Remplir/mettre à jour les valeurs (seulement si définies dans le payload)
-  if (colCode > 0 && (code !== undefined)) rowData[colCode - 1] = codeNormalized || rowData[colCode - 1] || '';
-  if (colNom > 0 && (name !== undefined)) rowData[colNom - 1] = name || rowData[colNom - 1] || '';
-  
+  // ✅ TOUJOURS écrire le nom quand fourni ET non-vide
+  // ⚠️ Si nom vide/undefined: NE PAS écraser le nom existant (keep update mode)
+  if (colNom > 0 && name !== undefined && name !== null && String(name).trim() !== '') {
+    rowData[colNom - 1] = String(name).trim();
+    console.log(`   ✅ Nom ÉCRIT: '${String(name).trim()}'`);
+  } else if (rowIndex <= 0) {
+    // CREATE mode: Si pas de nom, laisser vide
+    if (colNom > 0) rowData[colNom - 1] = '';
+    console.log(`   ⚠️ Nom non écrit (CREATE mode, pas de nom): name='${name}'`);
+  } else {
+    console.log(`   ⚠️ Nom NOT écrit (UPDATE mode, garder l'existant): name='${name}'`);
+  }
+  // UPDATE mode: Si nom vide → ne pas toucher au nom existant (déjà en rowData)
+
+  // ✅ TOUJOURS écrire le mark quand fourni (même s'il est vide)
+  if (colMark > 0 && unit_mark_raw !== undefined) rowData[colMark - 1] = markNormalized;
+
   // Stock: utiliser stock_current en priorité, sinon stock_initial
   if (colStockInit > 0) {
-    const stockValue = stock_current !== undefined ? stock_current : (stock_initial !== undefined ? stock_initial : null);
-    if (stockValue !== null) {
-      rowData[colStockInit - 1] = toNumber(stockValue);
-    }
+    const stockValue = (stock_current !== undefined) ? stock_current : stock_initial;
+    if (stockValue !== undefined) rowData[colStockInit - 1] = toNumber(stockValue);
   }
-  
+
   if (colPrixAchatUSD > 0 && purchase_price_usd !== undefined) rowData[colPrixAchatUSD - 1] = toNumber(purchase_price_usd);
-  
+
   // Prix de vente FC selon la feuille
   if (sale_price_fc !== undefined) {
     if (sheetName === SHEETS.PIECE && colPrixVenteDetailFC > 0) {
@@ -617,33 +1260,39 @@ function handleProductUpsert(payload, entityType) {
       rowData[colPrixVenteFC - 1] = toNumber(sale_price_fc);
     }
   }
-  
-  if (colMark > 0 && unit_mark !== undefined) rowData[colMark - 1] = markNormalized || '';
-  if (colDateUpdate > 0) rowData[colDateUpdate - 1] = last_update || now;
+
   if (colAutoStock > 0 && auto_stock_factor !== undefined) rowData[colAutoStock - 1] = toNumber(auto_stock_factor) || 1;
   if (colPrixVenteUSD > 0 && sale_price_usd !== undefined) rowData[colPrixVenteUSD - 1] = toNumber(sale_price_usd);
+
+  // ✅ TECH columns
   if (colUuid > 0) rowData[colUuid - 1] = finalUuid;
-  
+  if (colUnitUuid > 0 && unit_uuid !== undefined && unit_uuid !== null) rowData[colUnitUuid - 1] = String(unit_uuid || ''); // ✅ NEW: Write unit UUID
+  if (colUpdatedAt > 0) rowData[colUpdatedAt - 1] = now; // ✅ IMPORTANT (onEdit ne s'exécute pas pour scripts)
+  if (colDeviceId > 0 && payload.device_id !== undefined) rowData[colDeviceId - 1] = String(payload.device_id || '');
+  if (colDateUpdate > 0) rowData[colDateUpdate - 1] = last_update || now;
+
   if (rowIndex > 0) {
-    // Mise à jour
     console.log(`   📝 Mise à jour ligne ${rowIndex}`);
     sheet.getRange(rowIndex, 1, 1, rowData.length).setValues([rowData]);
   } else {
-    // Insertion
     console.log(`   ➕ Nouvelle ligne`);
     sheet.appendRow(rowData);
     rowIndex = sheet.getLastRow();
   }
-  
+
   console.log(`   ✅ Upsert terminé: ligne ${rowIndex}, feuille ${sheetName}, uuid=${finalUuid}`);
-  
+
   return { row: rowIndex, sheet: sheetName, uuid: finalUuid };
 }
 
 /**
  * Gère la mise à jour du stock (opération update_stock)
- * CRITIQUE: Écrase la colonne "Stock initial" (colonne C) avec la valeur ABSOLUE du stock local
- * Au lieu d'un changement relatif, on utilise stock_absolute pour garantir la cohérence
+ * ✅ AMÉLIORÉ PRO v2:
+ * - CARTON: match par code uniquement (ignoré mark)
+ * - Autres: match par code+mark NORMALISÉS
+ * - UUID: priorité maximale si fourni
+ * - ✅ Écrit _updated_at (onEdit ne s'exécute pas pour scripts)
+ * - Mark normalisé (dz → DZ)
  */
 function handleStockUpdate(payload) {
   console.log(`📦 [handleStockUpdate] ==========================================`);
@@ -651,49 +1300,55 @@ function handleStockUpdate(payload) {
   console.log(`📦 [handleStockUpdate] ==========================================`);
   console.log(`📋 [handleStockUpdate] Payload reçu:`, JSON.stringify(payload));
   
-  const { product_code, unit_level, unit_mark, stock_absolute, stock_change, invoice_number } = payload;
+  const product_code = pickFirst(payload, ['product_code', 'code', 'Code produit']);
+  const unit_level = pickFirst(payload, ['unit_level', 'unite', 'unit', 'Unite', 'mode_stock']);
+  const unit_mark = pickFirst(payload, ['unit_mark', 'mark', 'MARK', 'Mark']);
+  const stock_absolute = payload.stock_absolute;
+  const stock_change = payload.stock_change;
+  const invoice_number = payload.invoice_number;
+  const uuid = pickFirst(payload, ['uuid', '_uuid']);
   
   console.log(`📋 [handleStockUpdate] Détails extraits:`);
   console.log(`   Product code: ${product_code}`);
   console.log(`   Unit level (brut): ${unit_level}`);
   console.log(`   Unit mark: '${unit_mark || ''}'`);
+  console.log(`   UUID: '${uuid || ''}'`);
   console.log(`   Stock absolute: ${stock_absolute !== undefined ? stock_absolute : '(non fourni)'}`);
   console.log(`   Stock change: ${stock_change !== undefined ? stock_change : '(non fourni)'}`);
   console.log(`   Invoice number: ${invoice_number || '(vide)'}`);
   
-  // CRITIQUE: Normaliser unit_level pour déterminer la bonne feuille
-  const unitLevelRaw = (unit_level || '').toString().trim();
-  let unitLevelNormalized = unitLevelRaw.toUpperCase();
-  // Normaliser MILLIERS → MILLIER (pour correspondre à la feuille "Milliers")
-  if (unitLevelNormalized === 'MILLIERS') {
-    unitLevelNormalized = 'MILLIER';
-  }
+  // ✅ Normaliser unit_level pour déterminer la bonne feuille
+  const unitLevelFinal = normalizeUnitLevel(unit_level);
   
-  console.log(`   Unit level normalisé: ${unitLevelNormalized}`);
+  console.log(`   Unit level normalisé: ${unitLevelFinal}`);
   
   // Détermine la feuille selon unit_level normalisé
   let sheetName;
-  if (unitLevelNormalized === 'CARTON') {
+  if (unitLevelFinal === 'CARTON') {
     sheetName = SHEETS.CARTON;
-  } else if (unitLevelNormalized === 'MILLIER') {
+  } else if (unitLevelFinal === 'MILLIER') {
     sheetName = SHEETS.MILLIERS;
-  } else if (unitLevelNormalized === 'PIECE') {
+  } else if (unitLevelFinal === 'PIECE') {
     sheetName = SHEETS.PIECE;
   } else {
-    throw new Error('unit_level invalide pour update_stock: ' + unit_level + ' (normalisé: ' + unitLevelNormalized + ')');
+    throw new Error('unit_level invalide pour update_stock: ' + unit_level + ' (normalisé: ' + unitLevelFinal + ')');
   }
   
   const sheet = getSheet(sheetName);
   
   // S'assurer que les colonnes existent
   ensureColumn(sheet, 'Code produit');
-  ensureColumn(sheet, 'Stock initial'); // Colonne C = Stock initial
+  ensureColumn(sheet, 'Stock initial');
   ensureColumn(sheet, 'Mark');
+  ensureTechColumns(sheet); // ✅ tech columns
   
   // Trouver les index de colonnes
   const colCode = findColumnIndex(sheet, 'Code produit');
-  const colStockInit = findColumnIndex(sheet, 'Stock initial'); // Colonne C
+  const colStockInit = findColumnIndex(sheet, 'Stock initial');
   const colMark = findColumnIndex(sheet, 'Mark');
+  const colUuid = findColumnIndex(sheet, '_uuid');
+  const colUpdatedAt = findColumnIndex(sheet, '_updated_at'); // ✅ tech
+  const colDeviceId = findColumnIndex(sheet, '_device_id'); // ✅ tech
   
   if (colCode === -1 || colStockInit === -1) {
     throw new Error('Colonnes requises non trouvées dans ' + sheetName);
@@ -702,86 +1357,87 @@ function handleStockUpdate(payload) {
   const dataRange = sheet.getDataRange();
   const values = dataRange.getValues();
   
-  // Recherche par Code produit et Mark
-  // CRITIQUE: Normaliser le mark pour correspondre à Sheets (DZ → DZ, autres → uppercase)
-  let markNorm = (unit_mark || '').toString().trim();
-  const markLower = markNorm.toLowerCase();
-  // Normaliser DZ (douzaine)
-  if (markLower === 'dz' || markLower === 'dzn' || markLower === 'douz' || markLower === 'douzain' || markLower === 'douzaine' || markLower === 'dizaine' || markLower === 'dozen') {
-    markNorm = 'DZ';
-  } else if (markNorm) {
-    // Autres marks → uppercase
-    markNorm = markNorm.toUpperCase();
-  }
-  
-  // CRITIQUE: Normaliser product_code pour comparaison (gérer nombre vs chaîne)
-  // Dans Sheets, le code peut être stocké comme nombre (3) ou chaîne ("3")
-  const productCodeNormalized = String(product_code || '').trim();
+  // ✅ Normaliser mark pour la recherche
+  const markNorm = normalizeMark(unit_mark);
+  const productCodeNormalized = normalizeCode(product_code);
+  const isCarton = (unitLevelFinal === 'CARTON');
+  const markProvided = !!markNorm;  // ✅ NOUVEAU: flag si mark est fourni
   
   console.log(`🔍 [handleStockUpdate] Recherche du produit:`);
   console.log(`   Code produit recherché: '${product_code}' (normalisé: '${productCodeNormalized}')`);
-  console.log(`   Mark recherché: '${markNorm}'`);
+  console.log(`   Mark recherché: '${markNorm}' (fourni: ${markProvided})`);
+  console.log(`   UUID recherché: '${uuid || '(non fourni)'}'`);
   console.log(`   Nombre de lignes à vérifier: ${values.length - 1}`);
   
   let rowIndex = -1;
+  
+  // ✅ RECHERCHE PRIORITAIRE: UUID, puis logique intelligente pour mark
   for (let i = 1; i < values.length; i++) {
     const rowCodeRaw = values[i][colCode - 1];
-    // CRITIQUE: Normaliser le code de la ligne (gérer nombre vs chaîne)
-    const rowCodeNormalized = rowCodeRaw !== null && rowCodeRaw !== undefined ? String(rowCodeRaw).trim() : '';
+    const rowCodeNormalized = normalizeCode(rowCodeRaw);
+    const rowUuid = colUuid > 0 ? normalizeCode(values[i][colUuid - 1]) : '';
+    const rowMarkRaw = colMark > 0 ? values[i][colMark - 1] : '';
+    const rowMarkNorm = normalizeMark(rowMarkRaw);
     
-    const rowMarkRaw = colMark > 0 ? (values[i][colMark - 1] || '').toString().trim() : '';
-    // Normaliser le mark de la ligne pour comparaison
-    let rowMarkNorm = rowMarkRaw;
-    const rowMarkLower = rowMarkNorm.toLowerCase();
-    if (rowMarkLower === 'dz' || rowMarkLower === 'dzn' || rowMarkLower === 'douz' || rowMarkLower === 'douzain' || rowMarkLower === 'douzaine' || rowMarkLower === 'dizaine' || rowMarkLower === 'dozen') {
-      rowMarkNorm = 'DZ';
-    } else if (rowMarkNorm) {
-      rowMarkNorm = rowMarkNorm.toUpperCase();
-    }
-    
-    // Comparaison avec codes normalisés (chaînes)
-    if (rowCodeNormalized === productCodeNormalized && rowMarkNorm === markNorm) {
+    // PRIORITÉ 1: UUID si fourni
+    if (uuid && rowUuid === uuid) {
       rowIndex = i + 1;
-      console.log(`   ✅ Produit trouvé à la ligne ${rowIndex}:`);
-      console.log(`      Code Sheets: '${rowCodeRaw}' (normalisé: '${rowCodeNormalized}')`);
-      console.log(`      Mark Sheets: '${rowMarkRaw}' (normalisé: '${rowMarkNorm}')`);
+      console.log(`   ✅ Produit trouvé par UUID à la ligne ${rowIndex}`);
       break;
     }
     
-    // Log des 3 premières lignes pour debug
-    if (i <= 3) {
-      console.log(`   [Ligne ${i + 1}] Code: '${rowCodeRaw}' (normalisé: '${rowCodeNormalized}'), Mark: '${rowMarkRaw}' (normalisé: '${rowMarkNorm}')`);
+    // PRIORITÉ 2: code match
+    if (!rowCodeNormalized || rowCodeNormalized !== productCodeNormalized) {
+      continue;
+    }
+    
+    // ✅ NOUVELLE LOGIQUE: intelligente pour mark
+    if (markProvided) {
+      // Mark fourni => code+mark obligatoire pour tous (CARTON inclus)
+      if (rowMarkNorm === markNorm) {
+        rowIndex = i + 1;
+        console.log(`   ✅ Produit trouvé par Code+Mark à la ligne ${rowIndex}: code='${productCodeNormalized}', mark='${markNorm}'`);
+        break;
+      }
+    } else {
+      // Mark non fourni => accepter code seul, mais préférer mark vide
+      if (!rowMarkNorm) {
+        rowIndex = i + 1;
+        console.log(`   ✅ Produit trouvé par Code (mark vide) à la ligne ${rowIndex}: code='${productCodeNormalized}'`);
+        break;
+      }
+      // Fallback: si on ne trouve pas mieux, accepter n'importe quel mark (warn)
+      if (rowIndex === -1) {
+        rowIndex = i + 1;
+        console.log(`   ⚠️ Fallback: acceptant Code à la ligne ${rowIndex} avec mark='${rowMarkNorm}' (mark différent de demandé)`);
+      }
     }
   }
   
   if (rowIndex === -1) {
     console.error(`❌ [handleStockUpdate] Produit non trouvé dans ${sheetName}:`);
     console.error(`   Code produit: ${product_code}`);
-    console.error(`   Unité: ${unitLevelNormalized}`);
+    console.error(`   Unité: ${unitLevelFinal}`);
     console.error(`   Mark: '${markNorm}'`);
-    throw new Error(`Produit non trouvé pour update_stock: code=${product_code}, unit=${unitLevelNormalized}, mark=${markNorm} dans ${sheetName}`);
+    throw new Error(`Produit non trouvé pour update_stock: code=${product_code}, unit=${unitLevelFinal}, mark=${markNorm} dans ${sheetName}`);
   }
   
   console.log(`✅ [handleStockUpdate] Produit trouvé dans ${sheetName} à la ligne ${rowIndex}`);
-  console.log(`   Code produit: ${product_code}`);
-  console.log(`   Unité: ${unitLevelNormalized}, Mark: '${markNorm}'`);
   
   // Récupérer le stock actuel dans Sheets (pour log)
   const currentStockInSheets = toNumber(values[rowIndex - 1][colStockInit - 1]) || 0;
   console.log(`   Stock actuel dans Sheets (colonne C): ${currentStockInSheets}`);
   
-  // CRITIQUE: Utiliser stock_absolute si fourni (nouveau mode), sinon fallback sur stock_change (ancien mode)
+  // ✅ Utiliser stock_absolute si fourni (nouveau mode), sinon fallback sur stock_change (ancien mode)
   let newStock;
   if (stock_absolute !== undefined && stock_absolute !== null) {
     // NOUVEAU MODE: Utiliser la valeur ABSOLUE du stock local
-    // Normaliser stock_absolute (0.5 = 0.50 = 0,5 = 0,50)
     let stockAbs = stock_absolute;
     if (typeof stockAbs === 'string') {
-      // Remplacer toutes les virgules par des points (gérer 0,5, 0,50, etc.)
       stockAbs = parseFloat(stockAbs.replace(/,/g, '.')) || 0;
     }
     stockAbs = Number(stockAbs) || 0;
-    newStock = Math.round(stockAbs * 100) / 100; // Arrondir à 2 décimales
+    newStock = Math.round(stockAbs * 100) / 100;
     console.log(`📊 [handleStockUpdate] Mode ABSOLU: Écrasement avec valeur locale ${newStock} (stock Sheets avant: ${currentStockInSheets})`);
   } else if (stock_change !== undefined && stock_change !== null) {
     // ANCIEN MODE (compatibilité): Calculer avec stock_change relatif
@@ -799,15 +1455,27 @@ function handleStockUpdate(payload) {
   }
   
   console.log(`💾 [handleStockUpdate] Mise à jour de la cellule: ligne ${rowIndex}, colonne ${colStockInit} (Stock initial)`);
-  console.log(`   Valeur AVANT: ${currentStockInSheets} (type: ${typeof currentStockInSheets})`);
-  console.log(`   Valeur APRÈS: ${newStock} (type: ${typeof newStock})`);
-  console.log(`   Format: nombre avec point décimal (ex: ${newStock})`);
+  console.log(`   Valeur AVANT: ${currentStockInSheets}`);
+  console.log(`   Valeur APRÈS: ${newStock}`);
   
-  // CRITIQUE: Mettre à jour le stock dans la colonne "Stock initial" (colonne C) avec la valeur ABSOLUE
-  // Utiliser setValue avec le nombre directement (Sheets gère automatiquement le format)
+  // ✅ Mettre à jour le stock + tech columns
   try {
     sheet.getRange(rowIndex, colStockInit).setValue(newStock);
-    console.log(`   ✅ Cellule mise à jour avec succès`);
+    console.log(`   ✅ Stock écrit avec succès`);
+    
+    // ✅ Mettre à jour la date de dernière mise à jour
+    const colDateUpdate = findColumnIndex(sheet, 'Date de dernière mise à jour');
+    if (colDateUpdate > 0) {
+      const updateDate = nowIso();
+      sheet.getRange(rowIndex, colDateUpdate).setValue(updateDate);
+      console.log(`   ✅ Date de mise à jour: ${updateDate}`);
+    }
+    
+    // ✅ Mettre à jour les colonnes tech
+    if (colUpdatedAt > 0) sheet.getRange(rowIndex, colUpdatedAt).setValue(nowIso());
+    if (colDeviceId > 0 && payload.device_id !== undefined) {
+      sheet.getRange(rowIndex, colDeviceId).setValue(String(payload.device_id || ''));
+    }
     
     // Vérifier que la valeur a bien été écrite (lecture immédiate)
     const verifyValue = sheet.getRange(rowIndex, colStockInit).getValue();
@@ -824,17 +1492,7 @@ function handleStockUpdate(payload) {
     throw writeError;
   }
   
-  // Mettre à jour la date de dernière mise à jour si la colonne existe
-  const colDateUpdate = findColumnIndex(sheet, 'Date de dernière mise à jour');
-  if (colDateUpdate > 0) {
-    const updateDate = new Date().toISOString();
-    sheet.getRange(rowIndex, colDateUpdate).setValue(updateDate);
-    console.log(`   Date de mise à jour mise à jour: colonne ${colDateUpdate} = ${updateDate}`);
-  } else {
-    console.log(`   ⚠️ Colonne "Date de dernière mise à jour" non trouvée (optionnelle)`);
-  }
-  
-  console.log(`✅ [handleStockUpdate] Stock mis à jour avec succès: ${product_code} (${unitLevelNormalized}, mark=${markNorm}) dans ${sheetName}`);
+  console.log(`✅ [handleStockUpdate] Stock mis à jour avec succès: ${product_code} (${unitLevelFinal}, mark=${markNorm}) dans ${sheetName}`);
   console.log(`   ${currentStockInSheets} → ${newStock}`);
   console.log(`📦 [handleStockUpdate] ==========================================`);
   console.log(`📦 [handleStockUpdate] FIN MISE À JOUR DU STOCK`);
@@ -911,6 +1569,9 @@ function handleSaleUpsert(payload) {
 function handleSaleItemUpsert(payload) {
   const sheet = getSheet(SHEETS.VENTES);
   
+  // ✅ Tech columns
+  ensureTechColumns(sheet);
+  
   const colDate = findColumnIndex(sheet, 'Date');
   const colFacture = findColumnIndex(sheet, 'Numéro de facture');
   const colCode = findColumnIndex(sheet, 'Code produit');
@@ -923,7 +1584,9 @@ function handleSaleItemUpsert(payload) {
   const colModeStock = findColumnIndex(sheet, 'mode stock');
   const colTelephone = findColumnIndex(sheet, 'Telephone');
   const colUSD = findColumnIndex(sheet, 'USD');
-  const colUuid = ensureColumn(sheet, '_uuid');
+  const colUuid = findColumnIndex(sheet, '_uuid');
+  const colUpdatedAt = findColumnIndex(sheet, '_updated_at');  // ✅ tech
+  const colDeviceId = findColumnIndex(sheet, '_device_id');   // ✅ tech
   
   const dataRange = sheet.getDataRange();
   const values = dataRange.getValues();
@@ -948,9 +1611,16 @@ function handleSaleItemUpsert(payload) {
       rowIndex = i + 1;
       break;
     }
-    // Match par clé composite
-    if (rowFacture === searchFacture && rowCode === searchCode && 
-        Math.abs(rowQte - searchQte) < 0.01 && Math.abs(rowPrix - searchPrix) < 0.01) {
+    // Match par clé composite - Normaliser les nombres strictement
+    const rowQteN = toNumber(rowQte);
+    const rowPrixN = toNumber(rowPrix);
+    const searchQteN = toNumber(searchQte);
+    const searchPrixN = toNumber(searchPrix);
+    
+    if (rowFacture === searchFacture &&
+        rowCode === searchCode &&
+        Math.abs(rowQteN - searchQteN) < 0.01 &&
+        Math.abs(rowPrixN - searchPrixN) < 0.01) {
       rowIndex = i + 1;
       break;
     }
@@ -958,7 +1628,7 @@ function handleSaleItemUpsert(payload) {
   
   const maxCol = Math.max(colDate, colFacture, colCode, colClient, colQte, 
                           colMark, colPrixUnitaire, colUnite, colVendeur, colModeStock, 
-                          colTelephone, colUSD, colUuid);
+                          colTelephone, colUSD, colUuid, colUpdatedAt, colDeviceId);  // ✅ tech
   const rowData = [];
   for (let i = 0; i < maxCol; i++) {
     rowData[i] = '';
@@ -973,10 +1643,14 @@ function handleSaleItemUpsert(payload) {
   if (colPrixUnitaire > 0) rowData[colPrixUnitaire - 1] = payload.unit_price_fc || 0;
   if (colUnite > 0) rowData[colUnite - 1] = payload.unit_level || '';
   if (colVendeur > 0) rowData[colVendeur - 1] = payload.seller_name || '';
-  if (colModeStock > 0) rowData[colModeStock - 1] = payload.unit_level || ''; // Garder pour compatibilité
+  if (colModeStock > 0) rowData[colModeStock - 1] = payload.unit_level || '';
   if (colTelephone > 0) rowData[colTelephone - 1] = payload.client_phone || '';
   if (colUSD > 0) rowData[colUSD - 1] = payload.unit_price_usd || payload.subtotal_usd || 0;
   if (colUuid > 0) rowData[colUuid - 1] = searchUuid || '';
+  
+  // ✅ Tech columns
+  if (colUpdatedAt > 0) rowData[colUpdatedAt - 1] = nowIso();
+  if (colDeviceId > 0 && payload.device_id !== undefined) rowData[colDeviceId - 1] = String(payload.device_id || '');
   
   if (rowIndex > 0) {
     sheet.getRange(rowIndex, 1, 1, rowData.length).setValues([rowData]);
@@ -1007,6 +1681,9 @@ function handleDebtUpsert(payload) {
   ensureColumn(sheet, 'Dettes Fc en usd');
   ensureColumn(sheet, '_uuid');
   
+  // ✅ Tech columns
+  ensureTechColumns(sheet);
+  
   const colClient = findColumnIndex(sheet, 'Client');
   const colProduit = findColumnIndex(sheet, 'Produit');
   const colArgent = findColumnIndex(sheet, 'Argent');
@@ -1019,6 +1696,8 @@ function handleDebtUpsert(payload) {
   const colDescription = findColumnIndex(sheet, 'objet\\Description');
   const colDettesFCUSD = findColumnIndex(sheet, 'Dettes Fc en usd');
   const colUuid = findColumnIndex(sheet, '_uuid');
+  const colUpdatedAt = findColumnIndex(sheet, '_updated_at');  // ✅ tech
+  const colDeviceId = findColumnIndex(sheet, '_device_id');   // ✅ tech
   
   const dataRange = sheet.getDataRange();
   const values = dataRange.getValues();
@@ -1046,7 +1725,8 @@ function handleDebtUpsert(payload) {
   
   const maxCol = Math.max(colClient, colProduit, colArgent, colPrixAPayer, 
                           colPrixPaye, colReste, colDate, colFacture, 
-                          colDollars, colDescription, colDettesFCUSD, colUuid);
+                          colDollars, colDescription, colDettesFCUSD, colUuid, 
+                          colUpdatedAt, colDeviceId);  // ✅ tech
   const rowData = [];
   for (let i = 0; i < maxCol; i++) {
     rowData[i] = '';
@@ -1064,6 +1744,10 @@ function handleDebtUpsert(payload) {
   if (colDescription > 0) rowData[colDescription - 1] = payload.product_description || payload.note || '';
   if (colDettesFCUSD > 0) rowData[colDettesFCUSD - 1] = payload.debt_fc_in_usd || 0;
   if (colUuid > 0) rowData[colUuid - 1] = searchUuid || '';
+  
+  // ✅ Tech columns
+  if (colUpdatedAt > 0) rowData[colUpdatedAt - 1] = nowIso();
+  if (colDeviceId > 0 && payload.device_id !== undefined) rowData[colDeviceId - 1] = String(payload.device_id || '');
   
   if (rowIndex > 0) {
     sheet.getRange(rowIndex, 1, 1, rowData.length).setValues([rowData]);
@@ -1095,11 +1779,16 @@ function handleRateUpsert(payload) {
   ensureColumn(sheet, 'DATE');
   ensureColumn(sheet, '_uuid');
   
+  // ✅ Tech columns
+  ensureTechColumns(sheet);
+  
   const colTaux = findColumnIndex(sheet, 'Taux');
   const colUSD = findColumnIndex(sheet, 'USD');
   const colFC = findColumnIndex(sheet, 'Fc');
   const colDate = findColumnIndex(sheet, 'DATE');
   const colUuid = findColumnIndex(sheet, '_uuid');
+  const colUpdatedAt = findColumnIndex(sheet, '_updated_at');  // ✅ tech
+  const colDeviceId = findColumnIndex(sheet, '_device_id');   // ✅ tech
   
   const dataRange = sheet.getDataRange();
   const values = dataRange.getValues();
@@ -1128,7 +1817,8 @@ function handleRateUpsert(payload) {
   }
   
   const rate = payload.rate_fc_per_usd || 2800;
-  const maxCol = Math.max(colTaux, colUSD, colFC, colDate, colUuid);
+  const maxCol = Math.max(colTaux, colUSD, colFC, colDate, colUuid, 
+                          colUpdatedAt, colDeviceId);  // ✅ tech
   const rowData = [];
   for (let i = 0; i < maxCol; i++) {
     rowData[i] = '';
@@ -1139,6 +1829,10 @@ function handleRateUpsert(payload) {
   if (colFC > 0) rowData[colFC - 1] = rate * 100; // 100 USD en FC
   if (colDate > 0) rowData[colDate - 1] = searchDate || new Date().toISOString();
   if (colUuid > 0) rowData[colUuid - 1] = searchUuid || '';
+  
+  // ✅ Tech columns
+  if (colUpdatedAt > 0) rowData[colUpdatedAt - 1] = nowIso();
+  if (colDeviceId > 0 && payload.device_id !== undefined) rowData[colDeviceId - 1] = String(payload.device_id || '');
   
   if (rowIndex > 0) {
     sheet.getRange(rowIndex, 1, 1, rowData.length).setValues([rowData]);
@@ -1167,6 +1861,9 @@ function handleUserUpsert(payload) {
   ensureColumn(sheet, 'admi');
   ensureColumn(sheet, '_uuid');
   
+  // ✅ Tech columns
+  ensureTechColumns(sheet);
+  
   const colNom = findColumnIndex(sheet, 'Nom');
   const colModePasse = findColumnIndex(sheet, 'Mode passe');
   const colNumero = findColumnIndex(sheet, 'Numero');
@@ -1177,6 +1874,8 @@ function handleUserUpsert(payload) {
   const colUrlProfile = findColumnIndex(sheet, 'Urlprofile');
   const colAdmi = findColumnIndex(sheet, 'admi');
   const colUuid = findColumnIndex(sheet, '_uuid');
+  const colUpdatedAt = findColumnIndex(sheet, '_updated_at');  // ✅ tech
+  const colDeviceId = findColumnIndex(sheet, '_device_id');   // ✅ tech
   
   const dataRange = sheet.getDataRange();
   const values = dataRange.getValues();
@@ -1203,7 +1902,8 @@ function handleUserUpsert(payload) {
   }
   
   const maxCol = Math.max(colNom, colModePasse, colNumero, colValide, 
-                          colDateCreation, colToken, colMarque, colUrlProfile, colAdmi, colUuid);
+                          colDateCreation, colToken, colMarque, colUrlProfile, colAdmi, colUuid,
+                          colUpdatedAt, colDeviceId);  // ✅ tech
   const rowData = [];
   for (let i = 0; i < maxCol; i++) {
     rowData[i] = '';
@@ -1229,6 +1929,10 @@ function handleUserUpsert(payload) {
     rowData[colUuid - 1] = searchUuid || existingUuid || '';
   }
   
+  // ✅ Tech columns
+  if (colUpdatedAt > 0) rowData[colUpdatedAt - 1] = nowIso();
+  if (colDeviceId > 0 && payload.device_id !== undefined) rowData[colDeviceId - 1] = String(payload.device_id || '');
+  
   if (rowIndex > 0) {
     sheet.getRange(rowIndex, 1, 1, rowData.length).setValues([rowData]);
   } else {
@@ -1252,12 +1956,17 @@ function handlePriceLogUpsert(payload) {
   ensureColumn(sheet, 'Numero de facture');
   ensureColumn(sheet, '_uuid');
   
+  // ✅ Tech columns
+  ensureTechColumns(sheet);
+  
   const colDate = findColumnIndex(sheet, 'Date');
   const colPrix = findColumnIndex(sheet, 'Prix');
   const colNumeroProduit = findColumnIndex(sheet, 'Numero du produit');
   const colTotal = findColumnIndex(sheet, 'Total');
   const colFacture = findColumnIndex(sheet, 'Numero de facture');
   const colUuid = findColumnIndex(sheet, '_uuid');
+  const colUpdatedAt = findColumnIndex(sheet, '_updated_at');  // ✅ tech
+  const colDeviceId = findColumnIndex(sheet, '_device_id');   // ✅ tech
   
   const dataRange = sheet.getDataRange();
   const values = dataRange.getValues();
@@ -1290,7 +1999,8 @@ function handlePriceLogUpsert(payload) {
     }
   }
   
-  const maxCol = Math.max(colDate, colPrix, colNumeroProduit, colTotal, colFacture, colUuid);
+  const maxCol = Math.max(colDate, colPrix, colNumeroProduit, colTotal, colFacture, colUuid,
+                          colUpdatedAt, colDeviceId);  // ✅ tech
   const rowData = [];
   for (let i = 0; i < maxCol; i++) {
     rowData[i] = '';
@@ -1302,6 +2012,10 @@ function handlePriceLogUpsert(payload) {
   if (colTotal > 0) rowData[colTotal - 1] = payload.line_total_fc || 0;
   if (colFacture > 0) rowData[colFacture - 1] = payload.invoice_number || '';
   if (colUuid > 0) rowData[colUuid - 1] = searchUuid || '';
+  
+  // ✅ Tech columns
+  if (colUpdatedAt > 0) rowData[colUpdatedAt - 1] = nowIso();
+  if (colDeviceId > 0 && payload.device_id !== undefined) rowData[colDeviceId - 1] = String(payload.device_id || '');
   
   if (rowIndex > 0) {
     sheet.getRange(rowIndex, 1, 1, rowData.length).setValues([rowData]);
@@ -1740,7 +2454,12 @@ function getDebtsSince(sinceDate) {
 }
 
 /**
- * Récupère une page de produits (pagination PRO)
+ * Récupère une page de produits-units (pagination PRO)
+ * ⚠️ IMPORTANT: Retourne des UNITS (shape flat), pas des PRODUCTS regroupés!
+ * - Shape retourné: [{code, name, unit_level, unit_mark, sale_price_fc, ...}]
+ * - Pas de regroupement par code (impossible avec pagination)
+ * - Raison: Chaque ligne Sheets = une combinaison (code + unit_level)
+ * 
  * @param {Date} sinceDate - Date depuis laquelle récupérer
  * @param {number} cursor - Ligne de départ (2 = première ligne de données)
  * @param {number} limit - Nombre max de lignes à lire
@@ -1755,7 +2474,7 @@ function getProductsPage(sinceDate, cursor, limit, unitLevelParam) {
     lvl === 'PIECE' ? SHEETS.PIECE :
     SHEETS.CARTON; // défaut si pas fourni
   
-  console.log('📄 [getProductsPage] Feuille:', sheetName, '| Cursor:', cursor, '| Limit:', limit, '| Unit level:', lvl);
+  logDebug('📄 [getProductsPage] Feuille:', sheetName, '| Cursor:', cursor, '| Limit:', limit, '| Unit level:', lvl);
   
   const sheet = getSheet(sheetName);
   ensureTechColumns(sheet);
@@ -1779,7 +2498,7 @@ function getProductsPage(sinceDate, cursor, limit, unitLevelParam) {
   }
   
   const maxCol = Math.max(
-    colDateUpdate, colCode, colNom, colStockInit, colPrixAchatUSD,
+    colDateUpdate, colUpdatedAt, colCode, colNom, colStockInit, colPrixAchatUSD,
     colPrixVenteFC, colPrixVenteDetailFC, colMark, colAutoStock, colPrixVenteUSD, colUuid
   );
   
@@ -1793,7 +2512,7 @@ function getProductsPage(sinceDate, cursor, limit, unitLevelParam) {
   const endRow = Math.min(lastRow, startRow + limit - 1);
   const numRows = endRow - startRow + 1;
   
-  console.log('📊 [getProductsPage] Lecture lignes', startRow, 'à', endRow, '(', numRows, 'lignes)');
+  logDebug('📊 [getProductsPage] Lecture lignes', startRow, 'à', endRow, '(', numRows, 'lignes)');
   
   const rows = sheet.getRange(startRow, 1, numRows, maxCol).getValues();
   
@@ -1851,7 +2570,7 @@ function getProductsPage(sinceDate, cursor, limit, unitLevelParam) {
   const done = endRow >= lastRow;
   const next_cursor = done ? null : (endRow + 1);
   
-  console.log('✅ [getProductsPage] Traité:', processedCount, 'produit(s) | Skippé:', skippedCount, '| Done:', done, '| Next cursor:', next_cursor);
+  logDebug('✅ [getProductsPage] Traité:', processedCount, 'produit(s) | Skippé:', skippedCount, '| Done:', done, '| Next cursor:', next_cursor);
   
   return { data, next_cursor, done };
 }
@@ -1903,8 +2622,8 @@ function getSalesPage(sinceDate, cursor, limit) {
     return { data: [], next_cursor: null, done: true };
   }
   
-  const maxCol = Math.max(colDate, colFacture, colCode, colClient, colQte, colMark,
-                          colPrixUnitaire, colVendeur, colModeStock, colTelephone, colUSD, colUuid);
+  const maxCol = Math.max(colDate, colUpdatedAt, colFacture, colCode, colClient, colQte, colMark,
+                          colPrixUnitaire, colUnite, colVendeur, colModeStock, colTelephone, colUSD, colUuid);
   
   const lastRow = sheet.getLastRow();
   console.log('📊 [getSalesPage] Dernière ligne dans Sheets:', lastRow);
@@ -2463,64 +3182,70 @@ function getUsersSince(sinceDate) {
  */
 function handleBatchPull(p) {
   const lock = LockService.getScriptLock();
-  lock.waitLock(15000);
+  lock.waitLock(20000);
+
   try {
     const sinceMap = safeParseJson(p.since || '{}', {});
     const entities = (p.entities ? p.entities.toString().split(',') : Object.keys(sinceMap))
       .map(x => x.trim().toLowerCase())
       .filter(Boolean);
-    
-    // PRO: batchPull uniquement pour entités légères (users, rates)
-    // products/sales/debts doivent être paginés séparément
-    const list = entities.length ? entities : ['users','rates'];
+
+    // Par défaut, batchPull = entités légères
+    const list = entities.length ? entities : ['users', 'rates'];
+
     const data = {};
     const meta = {};
     const serverTime = nowIso();
-    
+
     console.log('📥 [handleBatchPull] Entités:', list.join(', '));
-    console.log('   ⚠️ [handleBatchPull] Products/Sales/Debts doivent être paginés séparément (évite timeout)');
-    
+    console.log('⚠️ [handleBatchPull] Products/Sales/Debts doivent idéalement être paginés (évite timeout)');
+
     for (const entity of list) {
-      // Ignorer les grosses entités dans batchPull
+      // Par défaut: since par entité
+      const sinceStr = sinceMap[entity] || new Date(0).toISOString();
+      const sinceDate = toDate(sinceStr) || new Date(0);
+
+      // Règle PRO: grosses entités => pagination séparée
       if (['products', 'product_units', 'sales', 'debts'].includes(entity)) {
-        console.log(`   ⏭️ [handleBatchPull] ${entity} ignoré (utiliser pagination séparée)`);
         data[entity] = [];
-        meta[entity] = { count: 0, max_updated_at: sinceMap[entity] || new Date(0).toISOString() };
+        meta[entity] = {
+          count: 0,
+          max_updated_at: sinceStr,
+          note: 'Utiliser pagination: ?entity=' + entity + '&full=1&cursor=2&limit=300' + (entity.includes('product') ? '&unit_level=CARTON|MILLIER|PIECE' : ''),
+        };
         continue;
       }
-      
-      const sinceStr = sinceMap[entity] || new Date(0).toISOString();
-      const sinceDate = new Date(sinceStr);
+
       let rows = [];
-      
       switch (entity) {
         case 'rates':
           rows = getRatesSince(sinceDate);
           break;
+
         case 'users':
           rows = getUsersSince(sinceDate);
           break;
+
         default:
           rows = [];
       }
-      
-      // max_updated_at: on prend la valeur _remote_updated_at si fournie par vos getters
-      let maxUpdated = null;
-      for (const r of rows) {
-        const d = toDate(r._remote_updated_at || r.last_update || r.created_at || r.sold_at || null);
-        if (d && (!maxUpdated || d > maxUpdated)) maxUpdated = d;
-      }
-      
+
+      const maxUpdatedAt = computeMaxUpdatedAt(rows, sinceStr);
+
       data[entity] = rows;
       meta[entity] = {
         count: rows.length,
-        max_updated_at: maxUpdated ? maxUpdated.toISOString() : sinceStr
+        max_updated_at: maxUpdatedAt
       };
-      
-      console.log(`   ✅ [handleBatchPull] ${entity}: ${rows.length} item(s)`);
     }
-    
-    return jsonOut({ success: true, server_time: serverTime, data, meta });
+
+    return jsonOut({
+      success: true,
+      data,
+      meta,
+      server_time: serverTime
+    });
+
   } finally {
     lock.releaseLock();
   }
@@ -2537,6 +3262,11 @@ function handleBatchPush(data) {
     const ops = Array.isArray(data.ops) ? data.ops : [];
     const deviceId = (data.device_id || '').toString() || 'UNKNOWN';
     const serverTime = nowIso();
+    
+    console.log(`📨 [handleBatchPush] Reçu ${ops.length} opération(s)`);
+    if (ops.length > 0) {
+      console.log(`📨 [handleBatchPush] Première opération: ${JSON.stringify(ops[0]).substring(0, 250)}...`);
+    }
     
     if (!ops.length) {
       return jsonOut({ success: true, server_time: serverTime, applied: [], conflicts: [] });
@@ -2624,6 +3354,17 @@ function handleBatchPush(data) {
         const target = lvl === 'CARTON' ? SHEETS.CARTON : 
                       (lvl === 'MILLIER' ? SHEETS.MILLIERS : SHEETS.PIECE);
         addTo(target, it);
+      } else if (entity === 'stock_moves') {
+        // Mouvements de stock: router selon unit_level vers la bonne feuille
+        const lvlRaw = (pl.unit_level || '').toString().trim();
+        let lvl = lvlRaw.toUpperCase();
+        // Normaliser MILLIERS → MILLIER
+        if (lvl === 'MILLIERS') {
+          lvl = 'MILLIER';
+        }
+        const target = lvl === 'CARTON' ? SHEETS.CARTON : 
+                      (lvl === 'MILLIER' ? SHEETS.MILLIERS : SHEETS.PIECE);
+        addTo(target, it);
       } else if (entity === 'sales' || entity === 'sale_items') {
         addTo(SHEETS.VENTES, it);
       } else if (entity === 'debts' || entity === 'debt_payments') {
@@ -2670,6 +3411,8 @@ function handleBatchPush(data) {
         const pl = op.payload || {};
         const opId = op.op_id;
         const uuid = (pl.uuid || pl._uuid || '').toString().trim();
+        
+        console.log(`   📦 [handleBatchPush] op_id=${opId}, payload=${JSON.stringify(pl).substring(0, 150)}...`);
         
         // Vérifier conflit si update
         if (uuid && colUuid > 0) {
@@ -2726,6 +3469,37 @@ function handleBatchPush(data) {
                 result = handleStockUpdate(normalizedPayload);
               } else {
                 result = handleProductUpsert(pl, entity);
+              }
+              break;
+            case 'stock_moves':
+              // ✅ NOUVEAU: Gérer les mouvements de stock (deltas à appliquer)
+              // Format: { product_code, unit_level, unit_mark, delta, ... }
+              // Convertir delta en stock_change pour réutiliser handleStockUpdate
+              {
+                const unitLevelRaw = (pl.unit_level || '').toString().trim();
+                let unitLevelNormalized = unitLevelRaw.toUpperCase();
+                if (unitLevelNormalized === 'MILLIERS') {
+                  unitLevelNormalized = 'MILLIER';
+                }
+                const productCodeNormalized = String(pl.product_code || '').trim();
+                const delta = typeof pl.delta === 'number' ? pl.delta : (parseFloat(pl.delta) || 0);
+                
+                const payloadForStockUpdate = {
+                  product_code: productCodeNormalized,
+                  unit_level: unitLevelNormalized,
+                  unit_mark: pl.unit_mark || '',
+                  stock_change: delta,  // Convertir delta en stock_change
+                  uuid: pl.uuid || '',
+                  device_id: pl.device_id || 'AUTO_STOCK'
+                };
+                
+                console.log(`   📊 [handleBatchPush] Mouvement de stock à appliquer:`);
+                console.log(`      product_code: '${productCodeNormalized}'`);
+                console.log(`      unit_level: '${unitLevelNormalized}'`);
+                console.log(`      unit_mark: '${pl.unit_mark || ''}'`);
+                console.log(`      delta: ${delta}`);
+                
+                result = handleStockUpdate(payloadForStockUpdate);
               }
               break;
             case 'sale_items':
@@ -2796,5 +3570,156 @@ function testConnection() {
       success: false,
       error: error.toString()
     };
+  }
+}
+
+/**
+ * ✅ PRO: Menu d'administration pour les opérations de maintenance
+ * Ajoute un menu personnalisé "LaGrace Admin" dans Sheets
+ */
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('LaGrace Admin')
+    .addItem('🆔 Backfill All UUIDs', 'menuBackfillUUIDs')
+    .addItem('📥 Pull Changes (PRO)', 'menuPullChanges')
+    .addItem('🔄 Sync Status', 'menuSyncStatus')
+    .addSeparator()
+    .addItem('📋 Show Tech Columns', 'menuShowTechColumns')
+    .addItem('✅ Validate Schema', 'menuValidateSchema')
+    .addToUi();
+}
+
+/**
+ * Menu action: Backfill tous les UUIDs manquants
+ */
+function menuBackfillUUIDs() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const count = backfillAllUUIDs();
+    ui.alert(`✅ Succès! ${count} UUID(s) généré(s)`);
+  } catch (error) {
+    ui.alert(`❌ Erreur: ${error.toString()}`);
+  }
+}
+
+/**
+ * Menu action: Afficher les changements depuis une date
+ */
+function menuPullChanges() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const result = ui.prompt('Depuis quand? (ISO format, ex: 2025-01-01T00:00:00Z, ou tapez "today"):');
+    if (result.getSelectedButton() === ui.Button.OK) {
+      let sinceStr = result.getResponseText();
+      if (sinceStr.toLowerCase() === 'today') {
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        sinceStr = today.toISOString();
+      }
+      const sinceDate = toDate(sinceStr) || new Date(0);
+      const changes = getPullChanges(sinceDate);
+      
+      const message = `📥 Pull Changes\n\n` +
+                     `Total changements: ${changes.meta.total}\n` +
+                     `Depuis: ${sinceDate.toISOString()}\n` +
+                     `À: ${changes.meta.pulledAt}\n\n` +
+                     `Produits modifiés:\n${changes.products.map(p => `- ${p.code} (${p.unit}): ${p.name}/${p.mark}`).join('\n')}`;
+      ui.alert(message);
+    }
+  } catch (error) {
+    ui.alert(`❌ Erreur: ${error.toString()}`);
+  }
+}
+
+/**
+ * Menu action: Afficher l'état de la synchronisation
+ */
+function menuSyncStatus() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const sheets = [SHEETS.CARTON, SHEETS.MILLIERS, SHEETS.PIECE];
+    let summary = '🔄 Sync Status\n\n';
+    
+    for (const sheetName of sheets) {
+      const sheet = getSheet(sheetName);
+      const lastRow = sheet.getLastRow();
+      const colUuid = findColumnIndex(sheet, '_uuid');
+      const colUpdatedAt = findColumnIndex(sheet, '_updated_at');
+      
+      let uuidCount = 0;
+      let withUpdateAt = 0;
+      
+      if (lastRow > 1 && colUuid > 0) {
+        const values = sheet.getRange(2, colUuid, lastRow - 1, 1).getValues();
+        uuidCount = values.filter(v => v[0]).length;
+      }
+      
+      if (lastRow > 1 && colUpdatedAt > 0) {
+        const values = sheet.getRange(2, colUpdatedAt, lastRow - 1, 1).getValues();
+        withUpdateAt = values.filter(v => v[0]).length;
+      }
+      
+      summary += `\n${sheetName}:\n` +
+                `  Total lignes: ${lastRow - 1}\n` +
+                `  Avec _uuid: ${uuidCount}/${lastRow - 1}\n` +
+                `  Avec _updated_at: ${withUpdateAt}/${lastRow - 1}\n`;
+    }
+    
+    ui.alert(summary);
+  } catch (error) {
+    ui.alert(`❌ Erreur: ${error.toString()}`);
+  }
+}
+
+/**
+ * Menu action: Afficher les colonnes techniques
+ */
+function menuShowTechColumns() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const sheets = [SHEETS.CARTON, SHEETS.MILLIERS, SHEETS.PIECE];
+    let info = '📋 Tech Columns\n\n';
+    
+    for (const sheetName of sheets) {
+      const sheet = getSheet(sheetName);
+      const header = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+      const techCols = header.filter((h, i) => String(h || '').startsWith('_')).map((h, i) => {
+        const colIndex = header.indexOf(h) + 1;
+        return `  ${h} (col ${colIndex})`;
+      });
+      
+      info += `\n${sheetName}:\n${techCols.length ? techCols.join('\n') : '  (aucune colonne tech)'}\n`;
+    }
+    
+    ui.alert(info);
+  } catch (error) {
+    ui.alert(`❌ Erreur: ${error.toString()}`);
+  }
+}
+
+/**
+ * Menu action: Valider le schéma
+ */
+function menuValidateSchema() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const sheets = [SHEETS.CARTON, SHEETS.MILLIERS, SHEETS.PIECE];
+    let validation = '✅ Validation Schema\n\n';
+    
+    for (const sheetName of sheets) {
+      const sheet = getSheet(sheetName);
+      const requiredCols = ['_uuid', '_updated_at', '_version'];
+      const missing = requiredCols.filter(col => findColumnIndex(sheet, col) < 0);
+      
+      if (missing.length > 0) {
+        validation += `⚠️ ${sheetName}: Colonnes manquantes: ${missing.join(', ')}\n`;
+      } else {
+        validation += `✅ ${sheetName}: OK\n`;
+      }
+    }
+    
+    ui.alert(validation);
+  } catch (error) {
+    ui.alert(`❌ Erreur: ${error.toString()}`);
   }
 }

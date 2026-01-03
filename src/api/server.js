@@ -3,15 +3,15 @@ import cors from 'cors';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import path from 'path';
-import { existsSync } from 'fs';
+import fs, { existsSync } from 'fs';
 import { resolve } from 'path';
 import os from 'os';
 import { spawn } from 'child_process';
-import { ensureDirs, getDbPath, getProjectRoot } from '../core/paths.js';
+import { pathToFileURL } from 'url';
+import { ensureDirs, getDbPath, getProjectRoot, getResourcesRoot, getPrintDir } from '../core/paths.js';
 import { logger } from '../core/logger.js';
 import { initSchema, getDb } from '../db/sqlite.js';
 import { syncWorker } from '../services/sync/sync.worker.js';
-import { createPrinterModule } from '../../print/module.js';
 import { setSocketIO } from './socket.js';
 import dotenv from 'dotenv';
 
@@ -26,33 +26,68 @@ import ratesRoutes from './routes/rates.routes.js';
 import analyticsRoutes from './routes/analytics.routes.js';
 import syncRoutes from './routes/sync.routes.js';
 import licenseRoutes from './routes/license.routes.js';
-// printRoutes remplacé par printerModule.router
+import autoStockRouter, { startAutoCheck, stopAutoCheck } from './routes/router.autostock.js';
 
 // Middlewares
 import { errorHandler, notFound } from './middlewares/errors.js';
 
-// Charger les variables d'environnement
-// Essayer d'abord config.env, puis .env en fallback
-const configEnvPath = resolve(process.cwd(), 'config.env');
-const dotEnvPath = resolve(process.cwd(), '.env');
-
-if (existsSync(configEnvPath)) {
-  dotenv.config({ path: configEnvPath });
-  console.log(`✅ Variables d'environnement chargées depuis: config.env`);
-} else if (existsSync(dotEnvPath)) {
-  dotenv.config({ path: dotEnvPath });
-  console.log(`✅ Variables d'environnement chargées depuis: .env`);
-} else {
-  dotenv.config(); // Par défaut
-  console.warn(`⚠️  Aucun fichier config.env ou .env trouvé, utilisation des variables d'environnement système`);
+// ✅ Fonction pour expanser les variables d'environnement Windows (%APPDATA%, etc.)
+function expandWinVars(value) {
+  if (!value || typeof value !== 'string') return value;
+  return value.replace(/%([^%]+)%/g, (_, name) => process.env[name] || `%${name}%`);
 }
+
+// ✅ FONCTIONS UTILITAIRES
+const getAppRoot = () => process.env.APP_ROOT || process.cwd();
+
+const isElectronRuntime = () =>
+  process.env.LAGRACE_IS_ELECTRON === '1' ||  // ✅ Flag dédié (posé par main.cjs avant import)
+  process.env.ELECTRON_RUN_AS_NODE === '1' ||  // Fallback Electron classique
+  process.env.ELECTRON_RUN_AS_NODE === 'true';
+
+// ✅ Dossier de données écrivable (APPDATA/userData sur Windows, home sur Linux/Mac)
+// Utilisé pour les fichiers runtime (printer output, db, caches, etc.)
+const getDataRoot = () => {
+  return process.env.LAGRACE_DATA_DIR || resolve(process.env.APPDATA || os.homedir(), 'LA GRACE POS');
+};
+
+// ✅ Charger config.env/env depuis plusieurs emplacements (prod + dev)
+const candidates = [
+  resolve(getResourcesRoot(), 'config.env'),  // ✅ resources/config.env (extraResources en prod)
+  resolve(getAppRoot(), 'config.env'),        // ✅ si config.env dans asar
+  resolve(process.cwd(), 'config.env'),       // fallback dev
+  resolve(getResourcesRoot(), '.env'),
+  resolve(getAppRoot(), '.env'),
+  resolve(process.cwd(), '.env'),
+];
+
+const found = candidates.find(p => existsSync(p));
+
+if (found) {
+  dotenv.config({ path: found });
+  console.log(`✅ Variables d'environnement chargées depuis: ${found}`);
+} else {
+  dotenv.config();
+  console.warn(`⚠️  Aucun config.env/.env trouvé aux emplacements: ${candidates.join(' | ')}`);
+  console.warn(`⚠️  Utilisation des variables d'environnement système`);
+}
+
+// ✅ Expanser les variables Windows (%APPDATA%, etc.)
+for (const key of Object.keys(process.env)) {
+  process.env[key] = expandWinVars(process.env[key]);
+}
+
+// Log des variables importantes pour le debug
+console.log(`[INIT] APP_ROOT=${getAppRoot()}`);
+console.log(`[INIT] RESOURCES_ROOT=${getResourcesRoot()}`);
+console.log(`[INIT] process.cwd()=${process.cwd()}`);
+
 
 // === AI LaGrace - Configuration automatique ===
 const AI_ENABLED = process.env.AI_LAGRACE_ENABLED !== 'false';
 let AI_AUTOSTART = process.env.AI_LAGRACE_AUTOSTART !== 'false';
-// Détection Electron - vérifier uniquement ELECTRON_RUN_AS_NODE, pas argv
-const IS_ELECTRON = process.env.ELECTRON_RUN_AS_NODE === 'true';
-if (IS_ELECTRON) {
+// ✅ NE PAS figer IS_ELECTRON dans une const - utiliser isElectronRuntime() directement
+if (isElectronRuntime()) {
   // Electron gère l'IA seul (démarre via npm run dev concurrently)
   AI_AUTOSTART = false;
 } else if (AI_ENABLED) {
@@ -60,7 +95,10 @@ if (IS_ELECTRON) {
   AI_AUTOSTART = false;
 }
 
-logger.info(`[AI] Détection: IS_ELECTRON=${IS_ELECTRON}, AI_ENABLED=${AI_ENABLED}, AI_AUTOSTART=${AI_AUTOSTART}`);
+logger.info(`[AI] Détection: isElectron=${isElectronRuntime()}, AI_ENABLED=${AI_ENABLED}, AI_AUTOSTART=${AI_AUTOSTART}`);
+
+// DIST_DIR sera défini dans startBackend()
+let DIST_DIR = null;
 
 const AI_DIR = resolve(getProjectRoot(), 'ai-lagrace');
 const AI_MAIN = resolve(AI_DIR, 'main.py');
@@ -74,7 +112,8 @@ function checkPython() {
       ? resolve(getProjectRoot(), '.venv', 'Scripts', 'python.exe')
       : resolve(getProjectRoot(), '.venv', 'bin', 'python');
     
-    const check = spawn(pythonExe, ['--version'], { shell: true });
+    // ✅ Utiliser shell: false pour plus de sécurité
+    const check = spawn(pythonExe, ['--version'], { shell: false });
     check.on('close', (code) => resolveCheck(code === 0));
     check.on('error', () => resolveCheck(false));
   });
@@ -115,9 +154,10 @@ async function startAI() {
   logger.info(`[AI] Python: ${pythonExe}`);
 
   aiStopping = false;
+  // ✅ Utiliser shell: false pour éviter les problèmes avec espaces dans les chemins
   aiProcess = spawn(pythonExe, ['main.py', '--quiet'], {
     cwd: AI_DIR,
-    shell: true,
+    shell: false,
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
     env: {
@@ -167,12 +207,11 @@ function stopAI() {
   aiProcess = null;
 }
 
-// Créer les dossiers nécessaires
-ensureDirs();
+// ✅ IMPORTANT: ensureDirs() et initSchema() sont maintenant appelés dans startBackend()
+// Cela garantit que APP_ROOT/RESOURCES_ROOT sont correctement posés en production
 
-// Initialiser la base de données
-initSchema();
-
+// ✅ App et serveur créés mais PAS listen() ici
+// Cela sera fait dans startBackend()
 const app = express();
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
@@ -237,8 +276,8 @@ app.use(cors({
 }));
 
 app.options('*', cors()); // Gérer les requêtes preflight OPTIONS
+// ✅ app.use(express.static()) sera fait dans startBackend() avec staticDir
 app.use(express.json());
-app.use(express.static('dist')); // Servir l'UI React buildée
 
 // Routes API
 app.get('/api/health', (req, res) => {
@@ -259,7 +298,7 @@ app.get('/api/ai/status', (req, res) => {
 
 // Route pour démarrer l'IA (pour navigateur web)
 app.post('/api/ai/start', (req, res) => {
-  if (IS_ELECTRON) {
+  if (isElectronRuntime()) {
     return res.status(400).json({ 
       success: false, 
       message: 'IA gérée par Electron, utiliser les contrôles Electron' 
@@ -279,7 +318,7 @@ app.post('/api/ai/start', (req, res) => {
 
 // Route pour arrêter l'IA (pour navigateur web)
 app.post('/api/ai/stop', (req, res) => {
-  if (IS_ELECTRON) {
+  if (isElectronRuntime()) {
     return res.status(400).json({ 
       success: false, 
       message: 'IA gérée par Electron, utiliser les contrôles Electron' 
@@ -320,18 +359,23 @@ app.use('/api/rates', ratesRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/sync', syncRoutes);
 app.use('/api/license', licenseRoutes);
+app.use('/api/autostock', autoStockRouter);
 
-// Module d'impression (remplace printRoutes)
-const printerModule = createPrinterModule({
-  io,
-  logger,
-  printDir: path.join(getProjectRoot(), 'printer'),
-  templatesDir: path.join(getProjectRoot(), 'printer', 'templates'),
-  assetsDir: path.join(getProjectRoot(), 'printer', 'assets'),
+// ⚠️ app.locals.db sera assignée dans startBackend() APRÈS initSchema()
+// (pour éviter que la DB ne s'ouvre au mauvais chemin en production EXE)
+
+// Module d'impression sera créé dans startBackend() après les imports dynamiques
+let printerModule = null;
+let printerModuleReady = false;
+
+// Middleware pour la route d'impression (qui sera activée après le chargement)
+app.use('/api/print', (req, res, next) => {
+  if (!printerModuleReady || !printerModule) {
+    return res.status(503).json({ error: 'Printer module not ready' });
+  }
+  // Passer au router du module d'impression
+  return printerModule.router(req, res, next);
 });
-
-// Intégrer les routes d'impression du module
-app.use('/api/print', printerModule.router);
 
 // WebSocket - Synchronisation temps réel multi-utilisateurs
 io.on('connection', (socket) => {
@@ -459,92 +503,273 @@ io.on('connection', (socket) => {
   });
 });
 
-// Route catch-all : servir index.html pour SPA routing (doit être avant notFound)
-// Cela permet au client React Router de gérer les routes
-app.get('*', (req, res, next) => {
-  // Ne pas servir index.html pour les routes API
-  if (req.path.startsWith('/api')) {
-    return next();
-  }
-  
-  // Servir index.html pour toutes les autres routes (SPA routing)
-  const indexPath = path.join(process.cwd(), 'dist', 'index.html');
-  res.sendFile(indexPath, (err) => {
-    if (err) {
-      // Si index.html n'existe pas (mode dev), retourner 404
-      next();
+// ✅ FONCTION EXPORTABLE: startBackend()
+// Ceci remplace httpServer.listen()
+export async function startBackend({
+  port = Number(process.env.PORT || 3030),
+  host = process.env.HOST || '0.0.0.0',
+  staticDir = null,
+  isElectron = false,
+  appRoot = null,
+  resourcesPath = null,
+} = {}) {
+  // ✅ Configuration Electron
+  if (isElectron) {
+    process.env.ELECTRON_RUN_AS_NODE = 'true';
+    process.env.AI_LAGRACE_AUTOSTART = 'false'; // IA gérée par Electron
+    
+    // ✅ IMPORTANT: Définir les chemins pour que les imports relatifs fonctionnent en prod
+    if (appRoot) {
+      process.env.APP_ROOT = appRoot;
     }
-  });
-});
+    if (resourcesPath) {
+      process.env.RESOURCES_ROOT = resourcesPath;
+    }
+    
+    // ✅ IMPORTANT: Définir le dossier de données écrivable (userData Electron)
+    if (process.env.LAGRACE_DATA_DIR === undefined && typeof window === 'undefined') {
+      // Ne pas écraser si déjà défini, et seulement en contexte Node
+      process.env.LAGRACE_DATA_DIR = resolve(process.env.APPDATA || os.homedir(), 'LA GRACE POS');
+    }
+  }
 
-// Middleware d'erreur (doit être en dernier)
-app.use(notFound);
-app.use(errorHandler);
-
-// Démarrer le serveur avec gestion d'erreur pour port déjà utilisé
-httpServer.listen(PORT, HOST, () => {
-  const networkInterfaces = os.networkInterfaces();
-  const addresses = [];
+  // ✅ IMPORTANT: Créer les dossiers et initialiser la DB APRÈS avoir posé les env vars
+  // Cela garantit que les chemins sont corrects en production (EXE)
+  ensureDirs();
+  initSchema();
   
-  // Collecter toutes les adresses IP disponibles
-  Object.keys(networkInterfaces).forEach((interfaceName) => {
-    networkInterfaces[interfaceName].forEach((iface) => {
-      if (iface.family === 'IPv4' && !iface.internal) {
-        addresses.push(`http://${iface.address}:${PORT}`);
+  // ✅ Assigner la DB à app.locals APRÈS initSchema() pour éviter les problèmes de chemin en prod
+  app.locals.db = getDb();
+
+  // ✅ DIAGNOSTIC: Vérifier que les chemins sont corrects
+  console.log('[PATHS] DATA_ROOT=', getProjectRoot());
+  console.log('[PATHS] RESOURCES_ROOT=', getResourcesRoot());
+  console.log('[PATHS] DB_PATH=', getDbPath());
+  console.log('[PATHS] PRINT_DIR=', getPrintDir());
+  if (getProjectRoot() === process.env.APPDATA || getProjectRoot().includes('Program Files')) {
+    console.warn('⚠️  ALERTE: getProjectRoot() pointe vers Program Files - check LAGRACE_DATA_DIR!');
+  }
+
+  // ✅ Charger le module d'impression dynamiquement (depuis RESOURCES_ROOT/print)
+  try {
+    const resourcesRoot = getResourcesRoot();
+    const printModuleFile = path.join(resourcesRoot, 'print', 'module.js');
+
+    if (!existsSync(printModuleFile)) {
+      throw new Error(`print/module.js introuvable: ${printModuleFile}`);
+    }
+
+    const mod = await import(pathToFileURL(printModuleFile).href);
+    // ✅ Tolérer export default si la structure change
+    const createPrinterModule =
+      mod.createPrinterModule || mod.default?.createPrinterModule || mod.default;
+
+    if (!createPrinterModule) {
+      throw new Error('createPrinterModule() introuvable dans print/module.js');
+    }
+
+    const printDir = getPrintDir(); // ✅ writable (userData)
+
+    // ✅ templates/assets: idéalement depuis resources/print/*
+    const templatesDir = path.join(resourcesRoot, 'print', 'templates');
+    const assetsDir = path.join(resourcesRoot, 'print', 'assets');
+
+    // ✅ Vérifier l'existence des dossiers templates/assets
+    if (!existsSync(templatesDir)) logger.warn(`[PRINT] templatesDir manquant: ${templatesDir}`);
+    if (!existsSync(assetsDir)) logger.warn(`[PRINT] assetsDir manquant: ${assetsDir}`);
+
+    printerModule = createPrinterModule({
+      io,
+      logger,
+      printDir,        // writable
+      templatesDir,    // read-only packagé
+      assetsDir,       // read-only packagé
+    });
+
+    printerModuleReady = true;
+    logger.info('✅ Printer module chargé');
+  } catch (error) {
+    printerModuleReady = false;
+    printerModule = null;
+    logger.error('❌ Erreur chargement printer module:', error);
+    logger.warn('⚠️  Impression indisponible (le backend continue)');
+  }
+
+  // ✅ Définir DIST_DIR avec staticDir
+  // En production (EXE), utiliser resources/ui au lieu de dist/ui
+  const defaultUiDir = (process.env.NODE_ENV === 'production')
+    ? resolve(getResourcesRoot(), 'ui')   // ✅ EXE: resources/ui
+    : resolve(getAppRoot(), 'dist', 'ui'); // ✅ dev build local
+  
+  DIST_DIR = staticDir || defaultUiDir;
+
+  logger.info(`[PATHS] APP_ROOT=${getAppRoot()}`);
+  logger.info(`[PATHS] RESOURCES_ROOT=${getResourcesRoot()}`);
+  logger.info(`[PATHS] DIST_DIR=${DIST_DIR}`);
+  logger.info(`[PATHS] UI existant: ${existsSync(DIST_DIR)}`);
+
+  // ✅ Servir l'UI statique (priorité à staticDir, sinon DIST_DIR en fallback)
+  const uiDir = (staticDir && existsSync(staticDir)) ? staticDir : DIST_DIR;
+
+  if (uiDir && existsSync(uiDir)) {
+    // ✅ VÉRIFIER QUE LES ASSETS EXISTENT
+    const assetsDir = resolve(uiDir, 'assets');
+    const indexHtml = resolve(uiDir, 'index.html');
+    const hasAssets = existsSync(assetsDir);
+    const hasIndex = existsSync(indexHtml);
+    
+    logger.info(`[STATIC] 🎨 Assets dir: ${assetsDir} (existe: ${hasAssets})`);
+    logger.info(`[STATIC] 📄 index.html: ${indexHtml} (existe: ${hasIndex})`);
+    
+    // ✅ Lister les fichiers du répertoire UI pour diagnostic
+    if (existsSync(uiDir)) {
+      const files = fs.readdirSync(uiDir).slice(0, 20); // Les 20 premiers fichiers
+      logger.info(`[STATIC] Contenu de ${uiDir}: ${files.join(', ')}`);
+    }
+    
+    if (!hasAssets) {
+      logger.warn(`⚠️  ALERTE: Le dossier assets manque! ${assetsDir}`);
+      logger.warn(`⚠️  Les fichiers JS/CSS (index-*.js) ne seront PAS trouvés`);
+      logger.warn(`⚠️  Vérifier: extraResources dans electron-builder.json`);
+    }
+    if (!hasIndex) {
+      logger.warn(`⚠️  ALERTE: index.html manque! ${indexHtml}`);
+    }
+    
+    app.use(express.static(uiDir));
+    logger.info(`[STATIC] ✅ UI servie depuis: ${uiDir}`);
+  } else {
+    logger.error(`❌ ERREUR CRITIQUE: Aucun dossier UI valide trouvé`);
+    logger.error(`   staticDir=${staticDir} (existe: ${staticDir ? existsSync(staticDir) : 'N/A'})`);
+    logger.error(`   DIST_DIR=${DIST_DIR} (existe: ${existsSync(DIST_DIR)})`);
+    logger.warn(`⚠️  Les clients recevront index.html mais les assets JS/CSS seront manquants`);
+  }
+
+  // ✅ IMPORTANT: Route catch-all APRÈS express.static() pour SPA routing
+  // Cela permet à React Router de gérer les routes côté client
+  app.get('*', (req, res) => {
+    // Ne pas servir index.html pour les routes API et Socket.IO
+    if (req.path.startsWith('/api') || req.path.startsWith('/socket.io')) {
+      // Les routes API non trouvées passent au middleware notFound
+      return res.status(404).json({ success: false, error: 'Route non trouvée' });
+    }
+    
+    // Ne pas servir index.html pour les fichiers avec extension (.js, .css, .png, etc.)
+    if (/\.\w+$/.test(req.path)) {
+      // Les fichiers non trouvés (comme assets manquants) retournent 404
+      return res.status(404).send('Fichier non trouvé');
+    }
+    
+    // Servir index.html pour toutes les autres routes (SPA routing)
+    const indexPath = path.join(uiDir, 'index.html');
+    if (!existsSync(indexPath)) {
+      return res.status(404).send('index.html non trouvé');
+    }
+    
+    res.sendFile(indexPath, (err) => {
+      if (err) {
+        res.status(500).send('Erreur serveur');
       }
     });
   });
-  
-  logger.info(`🚀 Serveur démarré sur http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`);
-  if (addresses.length > 0) {
-    logger.info(`🌐 Accessible sur le réseau local:`);
-    addresses.forEach(addr => logger.info(`   - ${addr}`));
-  }
-  logger.info(`📁 Base de données: ${getDbPath()}`);
-  logger.info(`✅ API disponible sur http://localhost:${PORT}/api`);
-  logger.info(`🔌 WebSocket disponible pour synchronisation temps réel`);
-  
-  // Démarrer le worker de synchronisation en arrière-plan (non-bloquant)
-  if (process.env.GOOGLE_SHEETS_WEBAPP_URL) {
-    // Utiliser setImmediate pour démarrer la sync après que le serveur soit prêt
-    setImmediate(() => {
-      syncWorker.start().catch(err => {
-        logger.error('❌ Erreur démarrage worker sync:', err);
+
+  // ✅ IMPORTANT: Middleware d'erreur APRÈS le catch-all SPA
+  // Pour que le catch-all SPA s'exécute AVANT notFound
+  app.use(notFound);
+  app.use(errorHandler);
+
+  // ✅ Démarrer le serveur avec gestion d'erreur pour port déjà utilisé
+  return new Promise((resolve, reject) => {
+    httpServer.once('error', reject);
+
+    httpServer.listen(port, host, () => {
+      const networkInterfaces = os.networkInterfaces();
+      const addresses = [];
+      
+      // Collecter toutes les adresses IP disponibles
+      Object.keys(networkInterfaces).forEach((interfaceName) => {
+        networkInterfaces[interfaceName].forEach((iface) => {
+          if (iface.family === 'IPv4' && !iface.internal) {
+            addresses.push(`http://${iface.address}:${port}`);
+          }
+        });
       });
-      logger.info('🔄 Worker de synchronisation démarré (arrière-plan)');
+      
+      logger.info(`🚀 Serveur démarré sur http://${host === '0.0.0.0' ? 'localhost' : host}:${port}`);
+      if (addresses.length > 0) {
+        logger.info(`🌐 Accessible sur le réseau local:`);
+        addresses.forEach(addr => logger.info(`   - ${addr}`));
+      }
+      logger.info(`📁 Base de données: ${getDbPath()}`);
+      logger.info(`✅ API disponible sur http://localhost:${port}/api`);
+      logger.info(`🔌 WebSocket disponible pour synchronisation temps réel`);
+      
+      // Démarrer le worker de synchronisation en arrière-plan (non-bloquant)
+      if (process.env.GOOGLE_SHEETS_WEBAPP_URL) {
+        // Utiliser setImmediate pour démarrer la sync après que le serveur soit prêt
+        setImmediate(() => {
+          syncWorker.start().catch(err => {
+            logger.error('❌ Erreur démarrage worker sync:', err);
+          });
+          logger.info('🔄 Worker de synchronisation démarré (arrière-plan)');
+        });
+      } else {
+        logger.warn('⚠️  GOOGLE_SHEETS_WEBAPP_URL non configuré, synchronisation désactivée');
+      }
+      
+      // ✅ Démarrer le module d'impression (avec protection)
+      if (printerModuleReady && printerModule?.start) {
+        printerModule.start();
+        logger.info('🖨️  Module d\'impression démarré');
+        logger.info(`📁 Dossier impression: ${getPrintDir()}`);
+      } else {
+        logger.warn('🖨️  Module d\'impression non démarré (module absent ou non initialisé)');
+      }
+
+      // Démarrer l'auto-check (vérification automatique du stock toutes les 2 secondes)
+      startAutoCheck(getDb());
+      logger.info('🔄 AutoCheck démarré (vérification stock toutes les 2 secondes)');
+
+      // Démarrer l'AI (après le serveur pour que Socket.IO soit prêt)
+      // Sauf si c'est Electron (IA gérée par main.cjs)
+      if (!isElectron) {
+        setTimeout(() => {
+          startAI().catch((err) => logger.error('[AI] Erreur démarrage:', err));
+        }, 2000);
+      }
+
+      // ✅ Retourner l'objet avec stop()
+      resolve({
+        port,
+        host,
+        app,
+        io,
+        httpServer,
+        async stop() {
+          stopAutoCheck(); // Arrêter l'auto-check avant de fermer le serveur
+          return new Promise((r) => httpServer.close(() => r()));
+        },
+      });
     });
-  } else {
-    logger.warn('⚠️  GOOGLE_SHEETS_WEBAPP_URL non configuré, synchronisation désactivée');
-  }
-  
-  // Démarrer le module d'impression
-  printerModule.start();
-  logger.info('🖨️  Module d\'impression démarré');
-  logger.info(`📁 Dossier impression: ${path.join(getProjectRoot(), 'printer')}`);
 
-  // Démarrer l'AI (après le serveur pour que Socket.IO soit prêt)
-  setTimeout(() => {
-    startAI().catch((err) => logger.error('[AI] Erreur démarrage:', err));
-  }, 2000);
-});
+    httpServer.on('error', (error) => {
+      if (error.code === 'EADDRINUSE') {
+        logger.error(`❌ Erreur: Le port ${port} est déjà utilisé.`);
+        logger.error(`💡 Solutions:`);
+        logger.error(`   1. Arrêter l'autre processus utilisant le port ${port}`);
+        logger.error(`   2. Utiliser un autre port en définissant PORT (ex: PORT=3031)`);
+        logger.error(`   3. Sur Windows: netstat -ano | findstr :${port}`);
+        logger.error(`   4. Puis: taskkill /PID <PID> /F`);
+        reject(error);
+      } else {
+        logger.error('❌ Erreur serveur:', error);
+        reject(error);
+      }
+    });
+  });
+}
 
-// Gestion d'erreur pour port déjà utilisé
-httpServer.on('error', (error) => {
-  if (error.code === 'EADDRINUSE') {
-    logger.error(`❌ Erreur: Le port ${PORT} est déjà utilisé.`);
-    logger.error(`💡 Solutions:`);
-    logger.error(`   1. Arrêter l'autre processus utilisant le port ${PORT}`);
-    logger.error(`   2. Utiliser un autre port en définissant la variable d'environnement PORT (ex: PORT=3031)`);
-    logger.error(`   3. Sur Windows, exécuter: netstat -ano | findstr :${PORT} pour trouver le PID`);
-    logger.error(`   4. Puis tuer le processus: taskkill /PID <PID> /F`);
-    process.exit(1);
-  } else {
-    logger.error('❌ Erreur serveur:', error);
-    process.exit(1);
-  }
-});
-
-// Gestion des erreurs
+// Gestion des erreurs globales
 process.on('unhandledRejection', (error) => {
   logger.error('Unhandled Rejection:', error);
 });
@@ -554,6 +779,36 @@ process.on('uncaughtException', (error) => {
   process.exit(1);
 });
 
+// ✅ Export par défaut toujours le app pour compatibilité
+export default app;
+
+// ✅ Mode développement: auto-démarrer le serveur
+// Lance si invoqué directement : node server.js OR electron server.js (ELECTRON_RUN_AS_NODE=1)
+(async () => {
+  const isDirect = process.argv[1]?.includes('server.js');
+  
+  if (isDirect) {
+    console.log('[SERVER] Mode développement - démarrage automatique du serveur...');
+    console.log('[SERVER] Runtime:', isElectronRuntime() ? 'Electron (ELECTRON_RUN_AS_NODE=1)' : 'Node.js');
+    
+    // Assurer que les répertoires existent
+    ensureDirs();
+    
+    await startBackend({
+      port: PORT,
+      host: HOST,
+      staticDir: null,  // Pas de static en dev (Vite fournit l'UI)
+      isElectron: isElectronRuntime(),
+    });
+    
+    console.log(`✅ Serveur Express prêt sur http://${HOST}:${PORT}`);
+  }
+})().catch(err => {
+  console.error('[SERVER] Erreur démarrage:', err);
+  process.exit(1);
+});
+
+// Gestion des signaux de fermeture
 process.on('SIGINT', () => {
   stopAI();
 });
@@ -565,5 +820,3 @@ process.on('SIGTERM', () => {
 process.on('exit', () => {
   stopAI();
 });
-
-export default app;

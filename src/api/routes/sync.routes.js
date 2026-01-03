@@ -150,5 +150,31 @@ router.post('/now', optionalAuth, async (req, res) => {
   }
 });
 
+/**
+ * POST /api/sync/reset-online-and-push
+ * Force l'état online=true et pousse les opérations pending
+ * Utile quand la détection de connexion a échoué par erreur
+ */
+router.post('/reset-online-and-push', optionalAuth, async (req, res) => {
+  const { logger } = await import('../../core/logger.js');
+  try {
+    logger.info('🌐 [SYNC/RESET-ONLINE] Force connexion et push demandé');
+    
+    const result = await syncWorker.resetOnlineAndPush();
+    const outboxStats = outboxRepo.getStats();
+    
+    logger.info('✅ [SYNC/RESET-ONLINE] Terminé');
+    
+    res.json({
+      success: true,
+      ...result,
+      outbox: outboxStats
+    });
+  } catch (error) {
+    logger.error('❌ [SYNC/RESET-ONLINE] Erreur:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 export default router;
 

@@ -3,6 +3,69 @@ const path = require('path');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const http = require('http');
+const { pathToFileURL } = require('url');
+
+/**
+ * ✅ LOGGING FICHIER CRITIQUE
+ * Écrit les logs IMPORTANTS dans un fichier pour diagnostic EXE
+ * (ne pas se fier aux DevTools fermées en production)
+ */
+const LOG_DIR = path.join(app.getPath('userData'), 'logs');
+fs.mkdirSync(LOG_DIR, { recursive: true });
+const MAIN_LOG = path.join(LOG_DIR, 'main.log');
+
+function logToFile(...args) {
+  const ts = new Date().toISOString();
+  const msg = args.map(a => {
+    if (a instanceof Error) return `${a.message}\n${a.stack}`;
+    if (typeof a === 'object') return JSON.stringify(a);
+    return String(a);
+  }).join(' ');
+  fs.appendFileSync(MAIN_LOG, `[${ts}] ${msg}\n`);
+}
+
+// Double log: console + fichier pour les events critiques
+function logCritical(...args) {
+  console.log('[CRITICAL]', ...args);
+  logToFile('[CRITICAL]', ...args);
+}
+
+// Gérer les erreurs non capturées - TRÈS IMPORTANT en EXE
+process.on('uncaughtException', (error) => {
+  logCritical('🔴 UNCAUGHT EXCEPTION:', error.message);
+  if (error.stack) logToFile(error.stack);
+  console.error('🔴 UNCAUGHT EXCEPTION:', error);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  logCritical('🔴 UNHANDLED REJECTION:', reason?.message || reason);
+  if (reason?.stack) logToFile(reason.stack);
+  console.error('🔴 UNHANDLED REJECTION:', reason);
+});
+
+/**
+ * ✅ HELPERS DE RÉSOLUTION DE CHEMINS ROBUSTES
+ * Évite les erreurs "resources/app.asar/resources" en prod
+ */
+function resolveResourcesRoot() {
+  const env = (process.env.RESOURCES_ROOT || '').trim();
+  if (env) return env;
+
+  // En prod, c'est la valeur la plus fiable
+  if (process.resourcesPath && String(process.resourcesPath).trim()) {
+    return process.resourcesPath;
+  }
+
+  // Fallback sûr: parent de app.asar
+  return path.dirname(app.getAppPath());
+}
+
+function resolveAppRoot() {
+  // APP_ROOT = app.asar (ou project root en dev)
+  const env = (process.env.APP_ROOT || '').trim();
+  if (env) return env;
+  return app.getAppPath();
+}
 
 let serverProcess = null;
 let aiProcess = null;
@@ -19,13 +82,21 @@ function sendAIStatus(status, message = '') {
   }
 }
 const PORT = process.env.PORT || 3030;
-const SERVER_URL = `http://localhost:${PORT}`;
+const HOST = '127.0.0.1';  // ✅ Utiliser IPv4 explicite pour éviter les problèmes IPv6
+const SERVER_URL = `http://${HOST}:${PORT}`;
 
 // Configuration AI LaGrace
 const AI_ENABLED = process.env.AI_LAGRACE_ENABLED !== 'false'; // Activé par défaut
-// ✅ AI_AUTOSTART réactivé: l'IA démarre automatiquement dans Electron une fois le statut connecté
-const AI_AUTOSTART = AI_ENABLED && process.env.AI_LAGRACE_AUTOSTART !== 'false';
-const AI_DIR = path.join(__dirname, '..', 'ai-lagrace');
+// ✅ AI_AUTOSTART désactivé en production: l'IA est gérée par le serveur Node.js
+// En dev (npm run dev), le serveur AI est lancé par concurrently
+// En production (EXE), Python n'existe pas, donc on laisse le serveur Node.js faire
+const AI_AUTOSTART = !app.isPackaged && AI_ENABLED && process.env.AI_LAGRACE_AUTOSTART !== 'false';
+
+// ✅ CHEMIN AI: En prod, l'AI est dans resources/ai (extraResources). En dev, elle est en racine.
+const AI_DIR = app.isPackaged 
+  ? path.join(process.resourcesPath, 'ai')      // Production: resources/ai
+  : path.join(__dirname, '..', 'ai-lagrace');    // Dev: racine/ai-lagrace
+
 const AI_MAIN = path.join(AI_DIR, 'main.py');
 
 /**
@@ -309,7 +380,112 @@ function checkServerRunning() {
 }
 
 /**
- * Démarrer le serveur Node.js
+ * ✅ ROBUSTE: Démarrer le backend IN-PROCESS (importation directe du module ESM)
+ * Zéro spawn, zéro chemins virtuels app.asar
+ */
+let backendHandle = null;
+
+async function startBackendInProcess() {
+  if (backendHandle) {
+    console.log('[BACKEND-IN-PROCESS] Backend déjà en mémoire, réutilisation');
+    return backendHandle;
+  }
+
+  try {
+    console.log('[BACKEND-IN-PROCESS] Démarrage du backend IN-PROCESS...');
+
+    const appRoot = resolveAppRoot();
+    const resourcesRoot = resolveResourcesRoot();
+
+    // ✅ CRITIQUE: Code backend (server.js) = APP_ROOT (app.asar en prod, project root en dev)
+    // ✅ CRITIQUE: Assets (UI, config) = RESOURCES_ROOT (resources en prod)
+    // ⚠️ NE PAS chercher server.js dans resourcesRoot!
+    const serverJs = path.join(appRoot, 'src', 'api', 'server.js');
+    const staticDir = path.join(resourcesRoot, 'ui');
+    const srcPkg = path.join(appRoot, 'src', 'package.json');
+    
+    console.log(`[BACKEND-IN-PROCESS] APP_ROOT = ${appRoot}`);
+    console.log(`[BACKEND-IN-PROCESS] RESOURCES_ROOT = ${resourcesRoot}`);
+
+    console.log(`[BACKEND-IN-PROCESS] Mode: ${app.isPackaged ? 'PRODUCTION' : 'DEVELOPMENT'}`);
+    console.log(`[BACKEND-IN-PROCESS] RESOURCES_ROOT: ${resourcesRoot}`);
+    console.log(`[BACKEND-IN-PROCESS] Server JS: ${serverJs}`);
+    console.log(`[BACKEND-IN-PROCESS] Static Dir: ${staticDir}`);
+
+    if (!fs.existsSync(serverJs)) throw new Error(`server.js introuvable: ${serverJs}`);
+    if (!fs.existsSync(staticDir)) console.warn(`[BACKEND-IN-PROCESS] ⚠️ UI introuvable: ${staticDir}`);
+    if (!fs.existsSync(srcPkg)) {
+      console.warn(`[BACKEND-IN-PROCESS] ⚠️ src/package.json manquant -> risque ESM: ${srcPkg}`);
+      console.warn(`[BACKEND-IN-PROCESS] 💡 Recommandation: ajouter src/package.json { "type":"module" } ou renommer server.js en server.mjs`);
+    }
+
+    // ✅ CRITIQUE: Définir le flag Electron AVANT l'import pour que server.js
+    // détecte isElectronRuntime() correctement au niveau module
+    process.env.ELECTRON_RUN_AS_NODE = '1';
+    process.env.LAGRACE_IS_ELECTRON = '1';
+    process.env.AI_LAGRACE_AUTOSTART = 'false'; // Electron gère l'IA via concurrently en dev, ou pas du tout en prod
+
+    const mod = await import(pathToFileURL(serverJs).href);
+    if (!mod.startBackend) throw new Error(`server.js n'exporte pas startBackend()`);
+
+    backendHandle = await mod.startBackend({
+      port: Number(PORT),
+      host: HOST,
+      staticDir,
+      isElectron: true,
+      appRoot,
+      resourcesPath: resourcesRoot,
+    });
+
+    console.log('[BACKEND-IN-PROCESS] ✅ Backend démarré avec succès');
+    return backendHandle;
+  } catch (error) {
+    console.error('[BACKEND-IN-PROCESS] ❌ Erreur:', error.message);
+    if (error.stack) {
+      console.error('[BACKEND-IN-PROCESS] ❌ Stack:\n', error.stack);
+    }
+    backendHandle = null;
+    throw error;
+  }
+}
+
+/**
+ * Obtenir le chemin du serveur backend en fonction du mode (dev ou production)
+ * ✅ En production EXE: utilise server-entry.cjs (wrapper ESM)
+ * ✅ En dev: utilise server.js directement
+ */
+function getBackendEntry() {
+  if (!app.isPackaged) {
+    // Mode DEV: server.js directement
+    return path.join(__dirname, '../src/api/server.js');
+  }
+
+  // Mode PROD (EXE): chercher server-entry.cjs d'abord (wrapper robuste)
+  const resourcesRoot = resolveResourcesRoot();
+  const appRoot = resolveAppRoot();
+
+  const wrapperPath = path.join(appRoot, 'src', 'api', 'server-entry.cjs');
+  const serverPath = path.join(appRoot, 'src', 'api', 'server.js');
+
+  if (fs.existsSync(wrapperPath)) {
+    console.log('[BACKEND] ✅ Utilisation server-entry.cjs (wrapper ESM → CommonJS)');
+    return wrapperPath;
+  }
+  
+  if (fs.existsSync(serverPath)) {
+    console.log('[BACKEND] ⚠️  server-entry.cjs manquant, fallback sur server.js');
+    return serverPath;
+  }
+
+  // Aucun fichier trouvé
+  console.log('[BACKEND] ❌ Recherche des fichiers:');
+  console.log(`[BACKEND]   - Wrapper: ${wrapperPath} (existe: ${fs.existsSync(wrapperPath)})`);
+  console.log(`[BACKEND]   - Server: ${serverPath} (existe: ${fs.existsSync(serverPath)})`);
+  return wrapperPath; // pour message d'erreur clair après
+}
+
+/**
+ * Démarrer le serveur Node.js avec Electron en mode Node
  */
 function startServer() {
   return new Promise(async (resolve, reject) => {
@@ -328,22 +504,36 @@ function startServer() {
       return;
     }
 
-    const serverPath = path.join(__dirname, '../src/api/server.js');
+    const serverPath = getBackendEntry();
     
     // Vérifier si le fichier existe
     if (!fs.existsSync(serverPath)) {
-      reject(new Error(`Serveur non trouvé: ${serverPath}`));
+      reject(new Error(`Serveur introuvable: ${serverPath}`));
       return;
     }
 
-    // Lancer le serveur Node.js
-    serverProcess = spawn('node', [serverPath], {
-      cwd: path.join(__dirname, '..'),
+    console.log('[SERVER] Lancement du serveur via Electron (ELECTRON_RUN_AS_NODE)...');
+    console.log('[SERVER] Chemin serveur:', serverPath);
+
+    // ✅ CORRECTION: Utiliser path.dirname(serverPath) pour le cwd
+    // Cela garantit que les chemins relatifs (dotenv, fichiers config, etc.) fonctionnent
+    const cwd = path.dirname(serverPath);
+
+    // Lancer le serveur avec Electron en mode Node (pas de spawn('node'))
+    serverProcess = spawn(process.execPath, [serverPath], {
+      cwd,
+      windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
+      shell: false,  // ✅ false pour éviter les problèmes avec espaces
       env: {
         ...process.env,
-        NODE_ENV: process.env.NODE_ENV || 'production',
+        ELECTRON_RUN_AS_NODE: '1',
+        NODE_ENV: app.isPackaged ? 'production' : 'development',
         PORT: PORT.toString(),
+        HOST: '127.0.0.1',
+        APP_ROOT: resolveAppRoot(),
+        RESOURCES_ROOT: resolveResourcesRoot(),
+        LAGRACE_DATA_DIR: app.getPath('userData'),  // ✅ OBLIGATOIRE: dossier writable
         AI_LAGRACE_AUTOSTART: 'false',
       },
     });
@@ -354,47 +544,21 @@ function startServer() {
       const output = data.toString();
       console.log('[SERVER]', output);
       
-      // Détecter quand le serveur est prêt
-      if (!serverReady && (output.includes('Serveur démarré') || output.includes('listening'))) {
-        serverReady = true;
-        setTimeout(() => resolve(), 500); // Attendre un peu pour être sûr
-      }
-      
-      // Détecter si le port est déjà utilisé
-      if (output.includes('EADDRINUSE') || output.includes('port') && output.includes('déjà utilisé')) {
-        console.log('[SERVER] Port déjà utilisé, attente que le serveur existant soit prêt...');
-        // Attendre et réessayer de se connecter
-        setTimeout(async () => {
-          const running = await checkServerRunning();
-          if (running) {
-            resolve();
-          } else {
-            reject(new Error('Port déjà utilisé et serveur non accessible'));
-          }
-        }, 2000);
-      }
+      // ✅ NE PAS faire resolve() ici - c'est un piège!
+      // Les logs "Serveur démarré" ne garantissent pas que le serveur répond réellement à /api/health
+      // On laisse waitForServer() tester la vraie disponibilité
     });
 
     serverProcess.stderr.on('data', (data) => {
       const output = data.toString();
       console.error('[SERVER ERROR]', output);
       
-      // Si erreur de port déjà utilisé, attendre et vérifier
-      if (output.includes('EADDRINUSE') || output.includes('port') && output.includes('déjà utilisé')) {
-        console.log('[SERVER] Port déjà utilisé, attente que le serveur existant soit prêt...');
-        setTimeout(async () => {
-          const running = await checkServerRunning();
-          if (running) {
-            resolve();
-          } else {
-            reject(new Error('Port déjà utilisé et serveur non accessible'));
-          }
-        }, 2000);
-      }
+      // ✅ NE PAS faire resolve() sur les erreurs stderr non plus
+      // Si le port est utilisé, waitForServer() va détecter que le serveur ne répond pas
     });
 
     serverProcess.on('error', (error) => {
-      console.error('Erreur démarrage serveur:', error);
+      console.error('[SERVER ERROR] Erreur démarrage serveur:', error);
       reject(error);
     });
 
@@ -409,13 +573,16 @@ function startServer() {
       }
     });
 
-    // Timeout de sécurité
-    setTimeout(() => {
-      if (!serverReady) {
-        console.warn('Timeout attente serveur, on continue quand même...');
+    // ✅ CRITIQUE: Attendre /api/health au lieu de resolve aveugles
+    // Cela garantit que le backend est VRAIMENT prêt
+    waitForServer(40).then(ok => {
+      if (ok) {
+        console.log('[SERVER] ✅ Backend prêt sur /api/health');
         resolve();
+      } else {
+        reject(new Error('Backend n\'a pas répondu sur /api/health après 20s'));
       }
-    }, 5000);
+    }).catch(reject);
   });
 }
 
@@ -524,7 +691,7 @@ function createWindow() {
     // En mode développement, utiliser Vite dev server
     if (process.env.NODE_ENV === 'development') {
       console.log('[WINDOW] Mode dev: Chargement de http://localhost:5173...');
-      mainWindow.loadURL('http://localhost:5173').catch((error) => {
+      mainWindow.loadURL('http://127.0.0.1:5173').catch((error) => {
         console.error('[WINDOW] ❌ Erreur chargement Vite:', error);
         // Fallback vers le serveur backend
         console.log('[WINDOW] Fallback: Chargement de ' + SERVER_URL);
@@ -534,11 +701,11 @@ function createWindow() {
       console.log('[WINDOW] Mode prod: Chargement de ' + SERVER_URL);
       mainWindow.loadURL(SERVER_URL).catch((error) => {
         console.error('[WINDOW] ❌ Erreur chargement serveur:', error);
-        // Fallback vers dist/index.html si disponible
-        const indexPath = path.join(__dirname, '../dist/index.html');
-        if (fs.existsSync(indexPath)) {
-          console.log('[WINDOW] Fallback: Chargement de ' + indexPath);
-          mainWindow.loadFile(indexPath);
+        // Fallback vers UI en resources pour EXE
+        const uiIndex = path.join(resolveResourcesRoot(), 'ui', 'index.html');
+        if (fs.existsSync(uiIndex)) {
+          console.log('[WINDOW] Fallback: loadFile UI:', uiIndex);
+          mainWindow.loadFile(uiIndex);
         }
       });
     }
@@ -576,7 +743,7 @@ function createWindow() {
           setTimeout(() => {
             if (mainWindow && !mainWindow.isDestroyed()) {
               console.log('[WINDOW] Chargement de l\'URL alternative: http://localhost:5173');
-              mainWindow.loadURL('http://localhost:5173');
+              mainWindow.loadURL('http://127.0.0.1:5173');
             }
           }, 2000);
         }
@@ -607,11 +774,74 @@ function createWindow() {
  */
 app.whenReady().then(async () => {
   try {
+    // 🔍 DIAGNOSTIC: Log très détaillé du démarrage
+    console.log('\n');
+    console.log('════════════════════════════════════════════════════════════════════');
+    console.log('🚀 DÉMARRAGE DE LA GRACE POS');
+    console.log('════════════════════════════════════════════════════════════════════');
+    logCritical('🚀 DÉMARRAGE DE LA GRACE POS');
+    
+    console.log(`📅 Heure: ${new Date().toISOString()}`);
+    console.log(`💻 Platform: ${process.platform}`);
+    console.log(`📦 Version Electron: ${require('electron').app.getVersion()}`);
+    console.log(`🔒 Mode: ${app.isPackaged ? 'PRODUCTION (packaged)' : 'DEVELOPMENT'}`);
+    console.log(`📂 CWD: ${process.cwd()}`);
+    console.log(`📂 __dirname: ${__dirname}`);
+    console.log(`📂 app.getAppPath(): ${app.getAppPath()}`);
+    console.log(`📂 process.resourcesPath: ${process.resourcesPath || '(undefined)'}`);
+    console.log(`📄 Log file: ${MAIN_LOG}`);
+    console.log('════════════════════════════════════════════════════════════════════\n');
+    
+    logCritical(`Mode: ${app.isPackaged ? 'PRODUCTION' : 'DEVELOPMENT'}`);
+    logCritical(`CWD: ${process.cwd()}`);
+    logCritical(`appPath: ${app.getAppPath()}`);
+    logCritical(`resourcesPath: ${process.resourcesPath}`);
+    logCritical(`Log file: ${MAIN_LOG}`);
+    
+    // ✅ IMPORTANT: Définir les variables d'environnement AVANT l'initialisation
+    // Point clé : APP_ROOT ≠ RESOURCES_ROOT
+    // APP_ROOT = ...\resources\app.asar (prod) → où se trouve le code d'app (src/, electron/)
+    // RESOURCES_ROOT = ...\resources (prod) → où se trouvent ui/, print/, config.env, ai/, etc.
+    const appRootPath = resolveAppRoot();
+    const resourcesRootPath = resolveResourcesRoot();
+    
+    process.env.APP_ROOT = appRootPath;
+    process.env.RESOURCES_ROOT = resourcesRootPath;
+    process.env.NODE_ENV = app.isPackaged ? 'production' : 'development';
+    
+    // ✅ CRITIQUE: Dossier DATA écrivable pour DB, logs, printer (jamais dans resources!)
+    // Electron définit cela AVANT que paths.js ne soit utilisé
+    process.env.LAGRACE_DATA_DIR = app.getPath('userData');
+    
+    console.log('📍 CHEMINS DÉFINIS:');
+    console.log(`   APP_ROOT: ${process.env.APP_ROOT}`);
+    console.log(`   RESOURCES_ROOT: ${process.env.RESOURCES_ROOT}`);
+    console.log(`   LAGRACE_DATA_DIR: ${process.env.LAGRACE_DATA_DIR}`);
+    
+    // Vérification des fichiers clés
+    console.log('\n🔍 VÉRIFICATION DES FICHIERS CRITIQUES:');
+    const criticalFiles = [
+      { name: 'server.js (ESM)', path: path.join(appRootPath, 'src', 'api', 'server.js') },
+      { name: 'server-entry.cjs (wrapper)', path: path.join(appRootPath, 'src', 'api', 'server-entry.cjs') },
+      { name: 'src/package.json (ESM)', path: path.join(appRootPath, 'src', 'package.json') },
+      { name: 'UI (index.html)', path: path.join(resourcesRootPath, 'ui', 'index.html') },
+      { name: 'UI assets', path: path.join(resourcesRootPath, 'ui', 'assets') },
+      { name: 'main.cjs (app init)', path: path.join(__dirname, 'main.cjs') },
+    ];
+    
+    for (const file of criticalFiles) {
+      const exists = fs.existsSync(file.path);
+      const status = exists ? '✅' : '❌';
+      console.log(`   ${status} ${file.name}: ${file.path}`);
+      logToFile(`[CHECK] ${status} ${file.name}: ${file.path}`);
+    }
+    console.log('');
+    
     // Initialiser l'app (chemins, db, loggers, etc.)
     console.log('🚀 Initialisation Glowflixprojet...');
     const initBridge = require('./init-bridge.cjs');
     appContext = await initBridge.initializeApp();
-    console.log('✓ Glowflixprojet contexte prêt');
+    console.log('✓ Glowflixprojet contexte prêt\n');
     
     // Initialiser les handlers IPC
     const { initializeIpcHandlers } = require('./ipc-handlers.cjs');
@@ -641,16 +871,43 @@ app.whenReady().then(async () => {
         // Ignorer les erreurs, la fenêtre est déjà créée
       });
     } else {
-      // En mode production, démarrer le serveur
-      console.log('Démarrage du serveur...');
-      await startServer();
-      console.log('Serveur démarré, création de la fenêtre...');
+      // En mode production, démarrer le serveur (in-process de préférence)
+      console.log('\n📦 MODE PRODUCTION: démarrage du backend...');
+      try {
+        // ✅ RECOMMANDÉ: In-process (plus robuste, zéro spawn)
+        console.log('[BACKEND] 🔄 Tentative démarrage in-process...');
+        await startBackendInProcess();
+        
+        // ✅ CRITIQUE: Attendre /api/health après démarrage
+        console.log('[BACKEND] 🔍 Validation du backend sur /api/health...');
+        const ok = await waitForServer(40); // ~20 secondes
+        if (!ok) throw new Error('Backend non accessible sur /api/health après démarrage');
+        console.log('[BACKEND] ✅ Backend in-process DÉMARRÉ et VALIDÉ\n');
+      } catch (inProcessError) {
+        // ⚠️ Fallback: spawn avec Electron en mode Node
+        console.warn('[BACKEND] ⚠️  In-process échoué, fallback spawn:', inProcessError.message);
+        console.warn('[BACKEND] Stack:', inProcessError.stack);
+        try {
+          await startServer();
+          
+          // ✅ CRITIQUE: Attendre /api/health après spawn aussi
+          console.log('[BACKEND] 🔍 Validation du backend spawn sur /api/health...');
+          const ok = await waitForServer(40);
+          if (!ok) throw new Error('Backend spawn non accessible sur /api/health');
+          console.log('[BACKEND] ✅ Backend spawn DÉMARRÉ et VALIDÉ\n');
+        } catch (spawnError) {
+          console.error('[BACKEND] ❌ Spawn aussi échoué:', spawnError.message);
+          console.error('[BACKEND] Stack:', spawnError.stack);
+          throw spawnError;
+        }
+      }
       
       try {
+        console.log('[WINDOW] 🪟 Création de la fenêtre BrowserWindow...');
         createWindow();
-        console.log('✅ Fenêtre créée avec succès');
+        console.log('[WINDOW] ✅ Fenêtre créée avec succès\n');
       } catch (windowError) {
-        console.error('❌ Erreur création fenêtre:', windowError);
+        console.error('[WINDOW] ❌ Erreur création fenêtre:', windowError);
         mainWindow = null;
       }
     }
@@ -666,8 +923,19 @@ app.whenReady().then(async () => {
     });
     
   } catch (error) {
-    console.error('❌ ERREUR CRITIQUE lors du démarrage:', error);
-    console.error('Stack:', error.stack);
+    console.error('\n');
+    console.error('════════════════════════════════════════════════════════════════════');
+    console.error('❌ ERREUR CRITIQUE lors du démarrage');
+    console.error('════════════════════════════════════════════════════════════════════');
+    console.error(`Message: ${error.message}`);
+    console.error(`Stack:\n${error.stack}`);
+    console.error('════════════════════════════════════════════════════════════════════\n');
+    
+    // ✅ ÉCRIRE DANS LE FICHIER DE LOG
+    logCritical('❌ ERREUR CRITIQUE lors du démarrage');
+    logCritical(`Message: ${error.message}`);
+    if (error.stack) logToFile(error.stack);
+    logCritical(`Voir le fichier de log complet: ${MAIN_LOG}`);
     
     // ✅ IMPORTANT: NE PAS quitter immédiatement si possible
     // Essayer de créer une fenêtre vide pour montrer l'erreur
@@ -677,13 +945,14 @@ app.whenReady().then(async () => {
         mainWindow.webContents.on('did-finish-load', () => {
           mainWindow.webContents.executeJavaScript(`
             document.body.innerHTML = '<h1 style="color:red; font-family:monospace;">❌ ERREUR DE DÉMARRAGE</h1>' +
-            '<pre style="color:#ccc; font-family:monospace; margin:20px; white-space:pre-wrap; word-wrap:break-word;">${error.message}</pre>';
+            '<pre style="color:#ccc; font-family:monospace; margin:20px; white-space:pre-wrap; word-wrap:break-word;">${error.message}\n\nVoir les logs: ${MAIN_LOG}</pre>';
           `);
         });
         mainWindow.loadURL('data:text/html,<h1>❌ Erreur de démarrage</h1>');
       }
     } catch (e) {
       console.error('Impossible de créer une fenêtre d\'erreur:', e);
+      logCritical('Impossible de créer fenêtre erreur:', e.message);
       // Seulement quitter si vraiment impossible de continuer
       process.exit(1);
     }

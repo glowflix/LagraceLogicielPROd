@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""
+Script pour montrer comment diagnostiquer le problème de synchronisation du nom
+"""
+
+print("""
+╔════════════════════════════════════════════════════════════════════════════╗
+║                     GUIDE DIAGNOSTIC COMPLET                              ║
+║              Synchronisation du NOM depuis l'app vers Google Sheets        ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+📋 SITUATION ACTUELLE:
+════════════════════════════════════════════════════════════════════════════
+✅ Database: 1 PRODUCT_PATCH pending pour produit "1" 
+   - Name: "crist"
+   - Unit level: "CARTON"
+   - Status: "pending" (pas encore envoyé)
+
+❌ Google Sheets: Produit "1" a le NOM VIDE
+   - Code: 1
+   - Name: [VIDE] <- Problème ici
+   - Stock: 44396
+   - UUID: 1d6f6b3b-f378-471c-94e4-41ee1d069095
+
+⚠️  CAUSE RACINE:
+════════════════════════════════════════════════════════════════════════════
+isOnline = false (connexion détectée comme perdue)
+↓
+pushPendingOperations() refuse de pousser quand isOnline=false
+↓
+PRODUCT_PATCH reste en "pending" au lieu d'être envoyé à Sheets
+
+🔧 SOLUTION IMMÉDIATE:
+════════════════════════════════════════════════════════════════════════════
+
+OPTION 1: Redémarrer l'app (réinitialise isOnline = true)
+───────────────────────────────────────────────────────────
+  1. Ctrl+C pour arrêter npm run dev
+  2. npm run dev
+  3. Attendre 10-15 secondes
+  4. PRODUCT_PATCH devrait être envoyé automatiquement
+  5. Vérifier Google Sheets après ~30 secondes
+
+OPTION 2: Forcer l'envoi via API (si le serveur tourne)
+────────────────────────────────────────────────────────
+  curl -X POST http://localhost:3000/api/sync/reset-online-and-push
+
+OPTION 3: Vérifier les logs en détail
+──────────────────────────────────────
+  Chercher dans le terminal "npm run dev":
+  
+  🔍 Logs clés à chercher:
+  ════════════════════════════════════════════════════════════════════════════
+  
+  1️⃣ PRODUCT_PATCH créé:
+     💡 Log à voir: "📤 [PATCH-ENQUEUE-UNIT] Produit 1/CARTON"
+     
+  2️⃣ Tentative de push:
+     💡 Log à voir: "📤 [pushProductPatches]" ou "📤 [PUSH-SYNC]"
+     
+  3️⃣ Problème de connexion:
+     💡 Log à voir: "⚠️ [INTERNET] Connexion Internet perdue"
+     💡 Si vous voyez ce log = le push est bloqué
+     
+  4️⃣ Réception par Google Apps Script:
+     💡 Log à voir: "📤 [PUSH-SYNC] Pushing X opération(s) to Sheets"
+     💡 Log à voir: "[handleProductUpsert] name='crist'"
+     
+  5️⃣ Succès dans Sheets:
+     💡 Log à voir: "✅ Upsert terminé: ligne X, feuille CARTON"
+
+🎯 FLUX COMPLET (si tout fonctionne):
+════════════════════════════════════════════════════════════════════════════
+
+  USER MODIFIE LE NOM
+         ↓
+  products.routes.js PUT /api/products/1
+         ↓
+  [📤 [PATCH-ENQUEUE-UNIT] Produit 1/CARTON: name='nouveau-nom']
+         ↓
+  outbox.repo.js crée PRODUCT_PATCH
+         ↓
+  sync_operations table: status='pending'
+         ↓
+  sync.worker startPushSyncLoop() (toutes les 15 secondes)
+         ↓
+  SI isOnline=true: pushProductPatches()
+         ↓
+  [📤 [pushProductPatches] sheetsUrl='...]
+  [PRODUCT-PATCH 0] Parsing payload...
+         ↓
+  sheetsClient.post() vers Google Sheets
+         ↓
+  Code.gs doPost() reçoit les données
+  [📤 [doPost] action='batchPush', received X operation(s)]
+         ↓
+  Code.gs handleProductUpsert()
+  [📦 [handleProductUpsert] Extraction champs: name='nouveau-nom']
+         ↓
+  Écrit dans Sheets ligne du produit 1, colonne "Nom du produit"
+  [✅ Nom ÉCRIT: 'nouveau-nom']
+         ↓
+  Google Sheets: Produit 1 a maintenant le nom "nouveau-nom" ✅
+
+⚡ COMMANDES DE TEST:
+════════════════════════════════════════════════════════════════════════════
+
+Pour tester manuellement si la synchronisation fonctionne:
+
+1. Démarrer l'app: npm run dev
+
+2. Dans une autre console, attendre 10 secondes puis:
+   python test-product-sync-trace.py
+   
+   OU avec curl:
+   curl -X POST http://localhost:3000/api/sync/reset-online-and-push
+
+3. Regarder les logs du "npm run dev" pour voir le flux complet
+
+4. Vérifier Google Sheets après 30 secondes
+
+📊 ÉTAT ATTENDU:
+════════════════════════════════════════════════════════════════════════════
+✅ Si le nom "crist" (ou "TEST-SYNC-xxxxx") apparaît dans Google Sheets:
+   → Synchronisation fonctionne!
+   → Les modifications futures seront aussi synchronisées
+
+❌ Si le nom reste vide après 1 minute:
+   → Chercher dans les logs: "[INTERNET] Connexion Internet perdue"
+   → OU chercher: erreur d'authentification Google Sheets
+   → OU chercher: "handleProductUpsert] Erreur" 
+
+🛠️ DÉBOGAGE AVANCÉ:
+════════════════════════════════════════════════════════════════════════════
+
+Si la synchronisation ne fonctionne toujours pas:
+
+1. Vérifier que Google Apps Script URL est correcte:
+   echo $GOOGLE_SHEETS_WEBAPP_URL
+   
+2. Vérifier la base de données:
+   python check-pending-patch.py
+   
+3. Vérifier l'état de la connexion:
+   Logs: chercher "isOnline =" ou "[INTERNET]"
+   
+4. Vérifier les logs de Google Apps Script:
+   https://script.google.com/home/projects/[PROJECT_ID]/executions
+   Chercher les erreurs dans "doPost" ou "handleProductUpsert"
+
+════════════════════════════════════════════════════════════════════════════
+""")

@@ -1,0 +1,239 @@
+Oui, c’est possible : l’installer .exe doit contenir tout (UI + backend + SQLite + IA) pour que l’utilisateur n’ait ni npm, ni Node, ni Python à installer.
+
+Il faut juste distinguer :
+
+Electron/Node : déjà embarqué automatiquement par Electron → l’utilisateur n’installe rien.
+
+SQLite (better-sqlite3) : module natif .node → il faut le déballer hors asar (asarUnpack) et surtout ne jamais dépendre du Node système.
+
+IA (Python) : le PC de l’utilisateur n’a pas Python → tu dois transformer ton IA Python en un EXE et l’embarquer dans resources/.
+
+Ci-dessous, je te donne la solution “pro” (la plus stable en production).
+
+1) Embarquer l’IA dans le build (sans Python chez l’utilisateur)
+Option recommandée : PyInstaller → ai-lagrace.exe
+
+Dans ton projet (sur ton PC dev) :
+
+cd "D:\logiciel\La Grace pro\v1"
+.\.venv\Scripts\activate
+pip install pyinstaller
+
+
+Générer l’exe :
+
+pyinstaller --noconfirm --clean --onedir --name ai-lagrace ai-lagrace/main.py
+
+
+Résultat : un dossier
+
+dist/ai-lagrace/ai-lagrace.exe + dépendances
+
+--onedir est plus stable que --onefile pour les libs audio/tts/sockets.
+
+On va inclure ce dossier dans Electron via extraResources.
+
+2) Base SQLite “créée automatiquement” sur chaque PC
+
+Ton app doit créer la base au premier lancement dans un dossier stable (recommandé) :
+
+app.getPath("userData") → C:\Users\<User>\AppData\Roaming\Glowflixprojet\...
+ou
+
+C:\ProgramData\Glowflixprojet\... (si tu veux une base commune à tous les users)
+
+Tu as déjà un init qui crée C:\Glowflixprojet\db\lagrace.sqlite. Ça marche, mais parfois *C:* peut poser des soucis sur certains PC. Je conseille fortement userData.
+
+3) package.json “complet pro” (build IA + asarUnpack + resources)
+
+Voici une version prête (tu peux remplacer ton package.json par ça en adaptant les chemins icônes si besoin) :
+
+{
+  "name": "glowflixprojet-app",
+  "version": "1.0.0",
+  "description": "Système de gestion de point de vente offline-first avec synchronisation Google Sheets",
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "postinstall": "electron-builder install-app-deps",
+
+    "dev:ui": "vite",
+    "dev:backend": "cross-env ELECTRON_RUN_AS_NODE=1 electron ./src/api/server.js",
+    "dev:backend:node": "node src/api/server.js",
+
+    "dev": "concurrently -n \"backend,ui,electron\" -c \"cyan,magenta,green\" -k \"npm run dev:backend\" \"npm run dev:ui\" \"node scripts/wait-and-launch-electron.js\"",
+
+    "build:ui": "vite build",
+
+    "build:ai": "powershell -ExecutionPolicy Bypass -Command \"if (Test-Path .venv) { .\\.venv\\Scripts\\Activate.ps1 }; python -m pip install -q pyinstaller; pyinstaller --noconfirm --clean --onedir --name ai-lagrace ai-lagrace/main.py\"",
+
+    "build:electron": "electron-builder",
+    "build": "npm run build:ui && npm run build:ai && npm run build:electron",
+
+    "preview:ui": "vite preview",
+    "migrate": "node src/db/migrate.js",
+
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "axios": "^1.6.2",
+    "bcrypt": "^5.1.1",
+    "better-sqlite3": "^12.5.0",
+    "chokidar": "^3.5.3",
+    "cors": "^2.8.5",
+    "date-fns": "^2.30.0",
+    "dayjs": "^1.11.10",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "framer-motion": "^10.16.16",
+    "googleapis": "^126.0.1",
+    "handlebars": "^4.7.8",
+    "jsonwebtoken": "^9.0.2",
+    "lucide-react": "^0.294.0",
+    "pdf-to-printer": "^5.6.0",
+    "puppeteer": "^21.6.1",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.20.0",
+    "socket.io": "^4.6.1",
+    "socket.io-client": "^4.6.1",
+    "winston": "^3.11.0",
+    "zustand": "^4.4.7"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@vitejs/plugin-react": "^4.2.1",
+    "autoprefixer": "^10.4.16",
+    "concurrently": "^8.2.2",
+    "cross-env": "^7.0.3",
+    "electron": "^28.3.3",
+    "electron-builder": "^24.13.3",
+    "postcss": "^8.4.32",
+    "tailwindcss": "^3.3.6",
+    "vite": "^5.0.8",
+    "wait-on": "^7.2.0"
+  },
+  "build": {
+    "appId": "com.lagrace.pos",
+    "productName": "LA GRACE POS",
+    "directories": {
+      "output": "dist-electron"
+    },
+
+    "asar": true,
+    "asarUnpack": [
+      "**/*.node",
+      "**/better-sqlite3/**",
+      "**/bcrypt/**"
+    ],
+
+    "files": [
+      "electron/**/*",
+      "src/**/*",
+      "dist/**/*",
+      "asset/**/*",
+      "print/**/*",
+      "package.json"
+    ],
+
+    "extraResources": [
+      {
+        "from": "dist/ai-lagrace",
+        "to": "ai",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "print",
+        "to": "print",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "asset",
+        "to": "asset",
+        "filter": ["**/*"]
+      }
+    ],
+
+    "win": {
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "icon": "asset/image/icon/photo.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  }
+}
+
+4) Modifier main.cjs : IA en dev = Python, IA en prod = EXE embarqué
+
+Tu dois arrêter de chercher .venv en production, et lancer :
+
+resources/ai/ai-lagrace.exe
+
+Exemple (dans startAI()), ajoute cette logique :
+
+function getAICommand() {
+  const isProd = app.isPackaged;
+
+  if (isProd) {
+    // ✅ EXE embarqué dans resources/ai
+    const aiExe = path.join(process.resourcesPath, "ai", "ai-lagrace.exe");
+    return { cmd: aiExe, args: ["--quiet"], cwd: path.dirname(aiExe) };
+  }
+
+  // DEV : python venv local
+  const pythonExe = process.platform === "win32"
+    ? path.join(__dirname, "..", ".venv", "Scripts", "python.exe")
+    : path.join(__dirname, "..", ".venv", "bin", "python");
+
+  return { cmd: pythonExe, args: ["main.py", "--quiet"], cwd: AI_DIR };
+}
+
+
+Et au lieu de :
+
+aiProcess = spawn(pythonExe, ['main.py', '--quiet'], { cwd: AI_DIR, ... })
+
+
+Tu fais :
+
+const { cmd, args, cwd } = getAICommand();
+
+if (!fs.existsSync(cmd)) {
+  console.log("[AI] Binaire IA introuvable:", cmd);
+  return;
+}
+
+aiProcess = spawn(cmd, args, {
+  cwd,
+  shell: false,
+  stdio: ["ignore", "pipe", "pipe"],
+  windowsHide: true,
+  env: { ...process.env }
+});
+
+
+Résultat : après installation, l’IA est déjà dedans.
+
+5) Important : backend “sans Node installé” (déjà correct)
+
+En production, tu dois lancer le backend avec Electron runtime :
+
+spawn(process.execPath, [serverPath], { env: { ELECTRON_RUN_AS_NODE: '1' } })
+
+Et ton cwd doit être un dossier réel, pas app.asar. Utilise :
+
+cwd: process.resourcesPath
+
+Ce que l’utilisateur final aura
+
+Après ton npm run build, dans dist-electron/ :
+
+LA GRACE POS Setup 1.0.0.exe (installer)
+
+En installant, il aura un logiciel qui démarre sans rien installer (pas npm, pas node, pas python).
+
+Au premier lancement : la base sqlite se

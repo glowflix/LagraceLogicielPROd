@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS product_units (
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   synced_at TEXT,
-  UNIQUE(product_id, unit_level, unit_mark),
+  UNIQUE(product_id, unit_level),
   FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
 );
 
@@ -132,7 +132,8 @@ CREATE TABLE IF NOT EXISTS sale_items (
   product_code TEXT NOT NULL,
   product_name TEXT NOT NULL,
   unit_level TEXT NOT NULL,         -- mode stock (carton/millier/piece)
-  unit_mark TEXT NOT NULL,          -- MARK
+  unit_mark TEXT NOT NULL,          -- MARK (modifiable par user, NE PAS utiliser comme clé)
+  product_unit_uuid TEXT,           -- ✅ RÉFÉRENCE STABLE à l'unité (uuid de product_units)
   qty REAL NOT NULL,                 -- QTE (support fractions 0.25/0.5/1.5)
   qty_label TEXT,                    -- ex "1/2", "DEMI DZ", "1.5"
   unit_price_fc REAL NOT NULL,      -- Prix unitaire
@@ -141,11 +142,13 @@ CREATE TABLE IF NOT EXISTS sale_items (
   subtotal_usd REAL NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY(sale_id) REFERENCES sales(id) ON DELETE CASCADE,
-  FOREIGN KEY(product_id) REFERENCES products(id)
+  FOREIGN KEY(product_id) REFERENCES products(id),
+  FOREIGN KEY(product_unit_uuid) REFERENCES product_units(uuid)
 );
 
 CREATE INDEX IF NOT EXISTS idx_sales_date ON sales(sold_at);
 CREATE INDEX IF NOT EXISTS idx_sale_items_sale ON sale_items(sale_id);
+CREATE INDEX IF NOT EXISTS idx_sale_items_unit_uuid ON sale_items(product_unit_uuid);
 
 -- =========================
 -- SALES VOID (Annulation/Suppression facture PRO)
@@ -436,17 +439,14 @@ DROP TRIGGER IF EXISTS trg_sale_items_stock_decrease_ai;
 CREATE TRIGGER IF NOT EXISTS trg_sale_items_stock_decrease_ai
 AFTER INSERT ON sale_items
 BEGIN
-  -- Ne décrémenter le stock QUE si la vente n'est PAS venue de Sheets
-  -- Les ventes SHEETS sont déjà des ventes passées, le stock a déjà été décrémenté
-  -- CRITIQUE: Réduire stock_initial ET stock_current pour correspondre à Sheets (colonne C)
+  -- ✅ RÉFÉRENCE STABLE: utiliser product_unit_uuid (uuid immuable), pas unit_mark (modifiable)
+  -- Ne décrémenter que si la vente n'est PAS venue de Sheets (déjà décrémentée)
   UPDATE product_units
   SET stock_initial = stock_initial - NEW.qty,
       stock_current = stock_current - NEW.qty,
       updated_at = datetime('now'),
       last_update = datetime('now')
-  WHERE product_id = NEW.product_id
-    AND unit_level = NEW.unit_level
-    AND unit_mark  = NEW.unit_mark
+  WHERE uuid = NEW.product_unit_uuid
     AND EXISTS (
       SELECT 1 FROM sales 
       WHERE id = NEW.sale_id 
@@ -456,34 +456,29 @@ END;
 
 DROP TRIGGER IF EXISTS trg_sale_items_stock_adjust_au;
 CREATE TRIGGER IF NOT EXISTS trg_sale_items_stock_adjust_au
-AFTER UPDATE OF qty, unit_level, unit_mark, product_id ON sale_items
+AFTER UPDATE OF qty, product_unit_uuid ON sale_items
 BEGIN
-  -- Restore OLD (seulement si pas SHEETS)
-  -- CRITIQUE: Restaurer stock_initial ET stock_current
+  -- ✅ RÉFÉRENCE STABLE: utiliser product_unit_uuid, pas unit_mark (modifiable)
+  -- Restore OLD stock
   UPDATE product_units
   SET stock_initial = stock_initial + OLD.qty,
       stock_current = stock_current + OLD.qty,
       updated_at = datetime('now'),
       last_update = datetime('now')
-  WHERE product_id = OLD.product_id
-    AND unit_level = OLD.unit_level
-    AND unit_mark  = OLD.unit_mark
+  WHERE uuid = OLD.product_unit_uuid
     AND EXISTS (
       SELECT 1 FROM sales 
       WHERE id = OLD.sale_id 
         AND origin != 'SHEETS'
     );
 
-  -- Apply NEW (seulement si pas SHEETS)
-  -- CRITIQUE: Réduire stock_initial ET stock_current
+  -- Apply NEW stock
   UPDATE product_units
   SET stock_initial = stock_initial - NEW.qty,
       stock_current = stock_current - NEW.qty,
       updated_at = datetime('now'),
       last_update = datetime('now')
-  WHERE product_id = NEW.product_id
-    AND unit_level = NEW.unit_level
-    AND unit_mark  = NEW.unit_mark
+  WHERE uuid = NEW.product_unit_uuid
     AND EXISTS (
       SELECT 1 FROM sales 
       WHERE id = NEW.sale_id 
@@ -495,16 +490,14 @@ DROP TRIGGER IF EXISTS trg_sale_items_stock_restore_ad;
 CREATE TRIGGER IF NOT EXISTS trg_sale_items_stock_restore_ad
 AFTER DELETE ON sale_items
 BEGIN
+  -- ✅ RÉFÉRENCE STABLE: utiliser product_unit_uuid, pas unit_mark (modifiable)
   -- Restaurer le stock seulement si la vente n'était PAS venue de Sheets
-  -- CRITIQUE: Restaurer stock_initial ET stock_current
   UPDATE product_units
   SET stock_initial = stock_initial + OLD.qty,
       stock_current = stock_current + OLD.qty,
       updated_at = datetime('now'),
       last_update = datetime('now')
-  WHERE product_id = OLD.product_id
-    AND unit_level = OLD.unit_level
-    AND unit_mark  = OLD.unit_mark
+  WHERE uuid = OLD.product_unit_uuid
     AND EXISTS (
       SELECT 1 FROM sales 
       WHERE id = OLD.sale_id 
@@ -550,33 +543,29 @@ AFTER INSERT ON sale_voids
 BEGIN
   UPDATE sales SET status = 'void' WHERE id = NEW.sale_id;
 
-  -- CRITIQUE: Restaurer stock_initial ET stock_current pour tous les items de la vente
-  -- Restaurer exactement la quantité vendue (sans auto_stock_factor, comme lors de la réduction)
+  -- ✅ RÉFÉRENCE STABLE: utiliser product_unit_uuid (uuid immuable), pas unit_mark (modifiable)
+  -- Restaurer stock_initial ET stock_current via l'uuid de l'unité
   UPDATE product_units
   SET stock_initial = stock_initial + (
     SELECT IFNULL(SUM(si.qty),0)
     FROM sale_items si
-    WHERE si.sale_id   = NEW.sale_id
-      AND si.product_id = product_units.product_id
-      AND si.unit_level = product_units.unit_level
-      AND si.unit_mark  = product_units.unit_mark
+    WHERE si.sale_id = NEW.sale_id
+      AND si.product_unit_uuid = product_units.uuid
   ),
   stock_current = stock_current + (
     SELECT IFNULL(SUM(si.qty),0)
     FROM sale_items si
-    WHERE si.sale_id   = NEW.sale_id
-      AND si.product_id = product_units.product_id
-      AND si.unit_level = product_units.unit_level
-      AND si.unit_mark  = product_units.unit_mark
+    WHERE si.sale_id = NEW.sale_id
+      AND si.product_unit_uuid = product_units.uuid
   ),
   updated_at = datetime('now'),
   last_update = datetime('now')
-  WHERE EXISTS (
-    SELECT 1 FROM sale_items si
-    WHERE si.sale_id   = NEW.sale_id
-      AND si.product_id = product_units.product_id
-      AND si.unit_level = product_units.unit_level
-      AND si.unit_mark  = product_units.unit_mark
+  WHERE uuid IN (
+    SELECT product_unit_uuid
+    FROM sale_items
+    WHERE sale_id = NEW.sale_id
+      AND product_unit_uuid IS NOT NULL
+      AND TRIM(product_unit_uuid) != ''
   );
 END;
 

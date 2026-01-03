@@ -37,6 +37,7 @@ export class ProductsRepository {
                  GROUP_CONCAT(
                    json_object(
                      'id', pu.id,
+                     'uuid', pu.uuid,
                      'unit_level', pu.unit_level,
                      'unit_mark', pu.unit_mark,
                      'stock_initial', pu.stock_initial,
@@ -155,62 +156,144 @@ export class ProductsRepository {
           // Récupérer le taux actuel pour calculer FC depuis USD
           const currentRate = ratesRepo.getCurrent();
           
-          // Préparer la requête avec le taux interpolé (SQLite ne supporte pas les paramètres dans ON CONFLICT)
-          const unitStmt = db.prepare(`
-            INSERT INTO product_units (
-              uuid, product_id, unit_level, unit_mark, stock_initial, stock_current,
-              purchase_price_usd, sale_price_fc, sale_price_usd,
-              auto_stock_factor, qty_step, extra1, extra2, last_update, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-            ON CONFLICT(product_id, unit_level, unit_mark) DO UPDATE SET
-              uuid = COALESCE(excluded.uuid, product_units.uuid),
-              stock_initial = excluded.stock_initial,
-              stock_current = excluded.stock_current,
-              purchase_price_usd = excluded.purchase_price_usd,
-              sale_price_usd = excluded.sale_price_usd,
-              sale_price_fc = ROUND(excluded.sale_price_usd * ${currentRate}),
-              auto_stock_factor = excluded.auto_stock_factor,
-              qty_step = excluded.qty_step,
-              extra1 = excluded.extra1,
-              extra2 = excluded.extra2,
-              last_update = excluded.last_update,
-              updated_at = datetime('now')
-          `);
+          // Helpers pour normalisation
+          const normLevel = (v) => (v ?? 'PIECE').trim().toUpperCase();
+          const normMark = (v) => (v ?? '').trim().toUpperCase();
 
           let unitIndex = 0;
           for (const unit of productData.units) {
             unitIndex++;
-            const existingUnit = db.prepare(`
-              SELECT uuid FROM product_units 
-              WHERE product_id = ? AND unit_level = ? AND unit_mark = ?
-            `).get(productId, unit.unit_level || 'PIECE', unit.unit_mark || '');
             
-            const unitUuid = existingUnit?.uuid || unit.uuid || generateUUID();
+            const unitLevel = normLevel(unit.unit_level);
+            let unitMark = normMark(unit.unit_mark);
             
-            // Utiliser TOUJOURS sale_price_usd comme source de vérité
-            const salePriceUSD = unit.sale_price_usd || 0;
-            // Calculer sale_price_fc depuis USD (ignorer sale_price_fc venant de l'input)
+            // ✅ MARK: stratégie flexible (PRO pattern avec uuid stable)
+            // Le mark n'est JAMAIS obligatoire - c'est un attribut modifiable
+            // L'identification se fait par UUID (immuable) ou (product_id, unit_level)
+            // Fallback pour compatibilité: MILLIER -> MILLIER, PIECE -> PCE
+            if (!unitMark) {
+              if (unitLevel === 'MILLIER') unitMark = 'MILLIER';
+              else if (unitLevel === 'PIECE') unitMark = 'PCE';
+              else unitMark = ''; // CARTON (ou autre) => mark vide autorisé
+            }
+            
+            // ✅ 1) Identifier l'unité existante par UUID d'abord (identité stable pour sync)
+            // UUID est l'identité stable: si fourni, on cherche TOUJOURS par uuid
+            // Sinon on cherche par ID (fallback), sinon on cherche par (level+mark)
+            let dbUnit = null;
+            
+            // PRIORITÉ 1: UUID (identité stable pour sync offline)
+            if (unit.uuid) {
+              dbUnit = db.prepare(`
+                SELECT id, uuid FROM product_units
+                WHERE uuid = ?
+              `).get(unit.uuid);
+            }
+            
+            // FALLBACK: ID (identité stable pour cette session)
+            if (!dbUnit && unit.id) {
+              dbUnit = db.prepare(`
+                SELECT id, uuid FROM product_units
+                WHERE id = ? AND product_id = ?
+              `).get(unit.id, productId);
+            }
+            
+            // DERNIER RECOURS: Chercher par (level+mark) pour nouvelles unités sans uuid
+            // ⚠️ Uniquement si pas trouvé par uuid ou id
+            if (!dbUnit) {
+              dbUnit = db.prepare(`
+                SELECT id, uuid FROM product_units
+                WHERE product_id = ? AND unit_level = ? AND unit_mark = ?
+              `).get(productId, unitLevel, unitMark);
+            }
+            
+            // ✅ 2) UUID final: TOUJOURS utiliser celui de la DB si l'unité existe
+            // ⚠️ CRITIQUE: Ne JAMAIS changer le uuid d'une unité existante (identité sync)
+            // Si on trouve l'unité par id, on garde son uuid, même si le payload envoie un autre uuid
+            const unitUuid = dbUnit?.uuid || unit.uuid || generateUUID();
+            
+            // ✅ 3) Prévenir le conflit UNIQUE(product_id, unit_level) AVANT d'écrire
+            // Chercher une autre unité (uuid différent) avec le même level
+            // ⚠️ IMPORTANT: le mark est MODIFIABLE, donc pas de contrôle sur mark
+            const collision = db.prepare(`
+              SELECT uuid FROM product_units
+              WHERE product_id = ? AND unit_level = ?
+                AND uuid <> ?
+              LIMIT 1
+            `).get(productId, unitLevel, unitUuid);
+            
+            if (collision) {
+              const err = new Error(`Cette unité existe déjà: ${unitLevel}`);
+              err.code = 'UNIT_DUPLICATE';
+              throw err;
+            }
+            
+            // ✅ 4) UPDATE-first strategy (plus robuste que ON CONFLICT)
+            const salePriceUSD = Number(unit.sale_price_usd ?? 0) || 0;
             const salePriceFC = salePriceUSD ? Math.round(salePriceUSD * currentRate) : 0;
             
-            logger.debug(`      ✓ Unité ${unitIndex}/${productData.units.length}: ${unit.unit_level || 'PIECE'}, Mark="${unit.unit_mark || ''}", Stock=${unit.stock_current || 0}, Prix USD=${salePriceUSD}, Prix FC=${salePriceFC} (calculé)`);
+            logger.debug(`      ✓ Unité ${unitIndex}/${productData.units.length}: ${unitLevel}, Mark="${unitMark}", Stock=${unit.stock_current || 0}, Prix USD=${salePriceUSD}, Prix FC=${salePriceFC} (calculé)`);
             
-            unitStmt.run(
+            // ✅ Essayer UPDATE par UUID d'abord
+            const updateResult = db.prepare(`
+              UPDATE product_units
+              SET
+                unit_mark = ?,
+                stock_initial = ?,
+                stock_current = ?,
+                purchase_price_usd = ?,
+                sale_price_fc = ?,
+                sale_price_usd = ?,
+                auto_stock_factor = ?,
+                qty_step = ?,
+                extra1 = ?,
+                extra2 = ?,
+                last_update = ?,
+                updated_at = datetime('now')
+              WHERE uuid = ? AND product_id = ?
+            `).run(
+              unitMark,
+              Number(unit.stock_initial ?? 0) || 0,
+              Number(unit.stock_current ?? 0) || 0,
+              Number(unit.purchase_price_usd ?? 0) || 0,
+              salePriceFC,
+              salePriceUSD,
+              Number(unit.auto_stock_factor ?? 1) || 1,
+              Number(unit.qty_step ?? 1) || 1,
+              unit.extra1 ?? null,
+              unit.extra2 ?? null,
+              unit.last_update || new Date().toISOString(),
               unitUuid,
-              productId,
-              unit.unit_level || 'PIECE',
-              unit.unit_mark || '',
-              unit.stock_initial || 0,
-              unit.stock_current || 0,
-              unit.purchase_price_usd || 0,
-              salePriceFC, // Calculé depuis USD, pas depuis l'input
-              salePriceUSD, // Source de vérité
-              unit.auto_stock_factor || 1,
-              unit.qty_step || 1,
-              unit.extra1 || null,
-              unit.extra2 || null,
-              unit.last_update || new Date().toISOString()
+              productId
             );
+            
+            // ✅ Si UPDATE n'a pas trouvé la ligne, faire INSERT (nouvelle unité)
+            if (updateResult.changes === 0) {
+              db.prepare(`
+                INSERT INTO product_units (
+                  uuid, product_id, unit_level, unit_mark,
+                  stock_initial, stock_current,
+                  purchase_price_usd, sale_price_fc, sale_price_usd,
+                  auto_stock_factor, qty_step, extra1, extra2, last_update, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+              `).run(
+                unitUuid,
+                productId,
+                unitLevel,
+                unitMark,
+                Number(unit.stock_initial ?? 0) || 0,
+                Number(unit.stock_current ?? 0) || 0,
+                Number(unit.purchase_price_usd ?? 0) || 0,
+                salePriceFC,
+                salePriceUSD,
+                Number(unit.auto_stock_factor ?? 1) || 1,
+                Number(unit.qty_step ?? 1) || 1,
+                unit.extra1 ?? null,
+                unit.extra2 ?? null,
+                unit.last_update || new Date().toISOString()
+              );
+            }
           }
           logger.debug(`   ✅ ${productData.units.length} unité(s) enregistrée(s) pour le produit "${productData.code}"`);
         }

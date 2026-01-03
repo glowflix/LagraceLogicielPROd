@@ -24,6 +24,33 @@ let _salesSyncRunning = false; // Mutex pour la synchronisation des ventes
 let _salesLoopTimeout = null; // Timeout de la boucle de synchronisation des ventes
 let _pushSyncRunning = false; // Mutex pour le push des opérations pending
 let _lastPushTime = 0; // Dernier push réussi
+let _productsSyncRunning = false; // Mutex pour la synchronisation dédiée des produits
+let _productsLoopTimeout = null; // Timeout de la boucle de synchronisation des produits
+
+/**
+ * ✅ HELPER ISO STRICT: Normalise TOUJOURS les dates en ISO 8601
+ * Évite les bugs Date object → string locale non parsable
+ */
+function toIso(value) {
+  if (!value) return null;
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === 'string') {
+    const d = new Date(value);
+    return isNaN(d.getTime()) ? null : d.toISOString();
+  }
+  return null;
+}
+
+/**
+ * ✅ HELPER: Calcule "since" avec marge de sécurité (60s)
+ * Évite les race conditions: "j'ai mis à jour juste avant le pull"
+ */
+function sinceIsoWithSkew(lastIso, skewMs = 60_000) {
+  const iso = toIso(lastIso);
+  if (!iso) return new Date(0).toISOString();
+  const d = new Date(iso);
+  return new Date(d.getTime() - skewMs).toISOString();
+}
 
 /**
  * Normalise l'unité depuis Sheets vers le format SQLite
@@ -70,6 +97,38 @@ function normalizeUnitFromSheets(unitValue) {
  * Worker de synchronisation qui tourne en arrière-plan
  */
 export class SyncWorker {
+  /**
+   * ✅ HELPER: Parse robuste du payload (handle à la fois payload et payload_json)
+   * Les opérations peuvent avoir:
+   * - op.payload (object)
+   * - op.payload_json (string JSON ou object)
+   * Cette fonction gère les deux cas
+   */
+  parseOpPayload(op) {
+    // Cas 1: payload est déjà un objet
+    if (op.payload && typeof op.payload === 'object') {
+      return op.payload;
+    }
+
+    // Cas 2: payload_json est une string JSON (besoin de parser)
+    if (op.payload_json && typeof op.payload_json === 'string') {
+      try {
+        return JSON.parse(op.payload_json);
+      } catch (e) {
+        syncLogger.warn(`⚠️ [parseOpPayload] JSON parse error pour op_id=${op.op_id}: ${e.message}`);
+        return {};
+      }
+    }
+
+    // Cas 3: payload_json est déjà un objet
+    if (op.payload_json && typeof op.payload_json === 'object') {
+      return op.payload_json;
+    }
+
+    // Fallback: vide
+    return {};
+  }
+
   /**
    * Démarre le worker avec import initial intelligent
    */
@@ -161,6 +220,10 @@ export class SyncWorker {
     // Démarrer la synchronisation dédiée des ventes (immédiate + toutes les 10 secondes)
     this.startSalesSyncLoop();
     
+    // ✅ Démarrer la synchronisation DÉDIÉE des produits (toutes les 10 secondes, indépendante)
+    // CORRECTION CRITIQUE: Les produits ne remontaient pas de Sheets car bloqués par ventes/push
+    this.startProductsSyncLoop();
+    
     // Démarrer la synchronisation des opérations pending (push vers Sheets)
     // IMPORTANT: Les modifications locales (prix, stock, etc.) sont pushées automatiquement
     this.startPushSyncLoop();
@@ -194,17 +257,23 @@ export class SyncWorker {
         return;
       }
       
+      // ✅ IMPORTANT: Forcer le push même si isOnline=false (car la détection peut être fausse positive)
+      // Juste afficher un avertissement
       if (!isOnline) {
-        syncLogger.debug(`⏸️ [PUSH-SYNC] Pas de connexion Internet, opérations en attente`);
-        // Afficher le nombre d'opérations en attente
-        try {
-          const stats = outboxRepo.getStats();
-          if (stats.totalPending > 0) {
-            syncLogger.info(`   📊 [PUSH-SYNC] ${stats.totalPending} opération(s) en attente de connexion`);
-          }
-        } catch (e) {}
-        setTimeout(pushLoop, PUSH_SYNC_INTERVAL_MS);
-        return;
+        syncLogger.warn(`⚠️ [PUSH-SYNC] État isOnline=false (peut être une fausse détection), tentative de push quand même...`);
+      }
+      
+      // Afficher le nombre d'opérations en attente
+      try {
+        const stats = outboxRepo.getStats();
+        if (stats.totalPending === 0 && stats.stockMovesPending === 0) {
+          syncLogger.debug(`📤 [PUSH-SYNC] Aucune opération en attente`);
+          setTimeout(pushLoop, PUSH_SYNC_INTERVAL_MS);
+          return;
+        }
+        syncLogger.info(`📤 [PUSH-SYNC] ${stats.totalPending} opération(s) locales + ${stats.stockMovesPending} stock move(s) à synchroniser`);
+      } catch (e) {
+        syncLogger.error(`❌ [PUSH-SYNC] Erreur lors de la récupération des stats:`, e.message);
       }
       
       _pushSyncRunning = true;
@@ -228,12 +297,68 @@ export class SyncWorker {
     // Démarrer après un délai initial (laisser le temps au pull de se faire d'abord)
     setTimeout(pushLoop, 10000);
   }
+
+  /**
+   * ✅ BOUCLE DÉDIÉE PRODUITS: Toutes les 10 secondes, indépendante
+   * 
+   * PROBLÈME RÉSOLU:
+   * - Les produits ne remontaient pas de Sheets si ventes/push tournaient
+   * - Dépendance sur une boucle générale surcharge
+   * 
+   * SOLUTION:
+   * - Boucle légère, toutes les 10s
+   * - Mutex pour éviter les overlaps
+   * - Tente même si isOnline=false (détection peut être fausse)
+   * - Alerte propre en cas d'erreur
+   */
+  async startProductsSyncLoop() {
+    const PRODUCTS_SYNC_INTERVAL_MS = 10000; // 10 secondes
+
+    syncLogger.info(`📦 [PRODUCTS-SYNC] Démarrage sync dédiée produits (BOUCLE INDÉPENDANTE)`);
+    syncLogger.info(`   ⚡ [PRODUCTS-SYNC] Intervalle: ${PRODUCTS_SYNC_INTERVAL_MS/1000}s`);
+    syncLogger.info(`   🔒 [PRODUCTS-SYNC] Mutex: Évite les overlaps (une seule pull à la fois)`);
+    syncLogger.info(`   🌐 [PRODUCTS-SYNC] Tente même offline (détection peut être fausse)`);
+
+    const productsLoop = async () => {
+      if (!_started) return;
+
+      if (_productsSyncRunning) {
+        syncLogger.debug(`⏭️ [PRODUCTS-SYNC] Sync produits déjà en cours, skip`);
+        _productsLoopTimeout = setTimeout(productsLoop, PRODUCTS_SYNC_INTERVAL_MS);
+        return;
+      }
+
+      // ✅ IMPORTANT: Forcer la tentative même si isOnline=false
+      // La détection de connexion peut être une fausse positive
+      if (!isOnline) {
+        syncLogger.debug(`⚠️ [PRODUCTS-SYNC] isOnline=false (peut être fausse détection), tentative quand même...`);
+      }
+
+      _productsSyncRunning = true;
+      const t0 = Date.now();
+
+      try {
+        await this.syncProductsFromSheets();
+      } catch (e) {
+        syncLogger.warn(`⚠️ [PRODUCTS-SYNC] Erreur pull produits: ${e.message}`);
+      } finally {
+        _productsSyncRunning = false;
+        const elapsed = Date.now() - t0;
+        const wait = Math.max(2000, PRODUCTS_SYNC_INTERVAL_MS - elapsed);
+        if (_started) _productsLoopTimeout = setTimeout(productsLoop, wait);
+      }
+    };
+
+    // Démarrer après 2s (laisser les autres syncs commencer d'abord)
+    setTimeout(productsLoop, 2000);
+  }
   
   /**
    * Push les opérations pending vers Google Sheets
    * Gère les patches produits, patches unités et mouvements de stock
    */
   async pushPendingOperations() {
+    const pushStartTime = Date.now();
     try {
       // Récupérer les statistiques
       const stats = outboxRepo.getStats();
@@ -246,6 +371,7 @@ export class SyncWorker {
       syncLogger.info(`📤 [PUSH-SYNC] ==========================================`);
       syncLogger.info(`📤 [PUSH-SYNC] PUSH DES MODIFICATIONS LOCALES`);
       syncLogger.info(`📤 [PUSH-SYNC] ==========================================`);
+      syncLogger.info(`   📊 État connexion: isOnline=${isOnline}`);
       syncLogger.info(`   📊 Pending: ${JSON.stringify(stats.pendingByType)}`);
       syncLogger.info(`   📊 Stock moves pending: ${stats.stockMovesPending}`);
       
@@ -278,8 +404,11 @@ export class SyncWorker {
       // CRITIQUE: Après un push réussi, déclencher un pull pour recevoir les mises à jour depuis Sheets
       // Cela libère les produits pour accepter les modifications venant de Sheets
       const pushedCount = (productPatches.length || 0) + (unitPatches.length || 0) + (stockMoves.length || 0);
+      const elapsed = Date.now() - pushStartTime;
+      syncLogger.info(`✅ [PUSH-SYNC] ${pushedCount} opération(s) envoyée(s) avec succès en ${elapsed}ms`);
+      
       if (pushedCount > 0) {
-        syncLogger.info(`   🔄 [PUSH-SYNC] ${pushedCount} opération(s) envoyée(s), déclenchement pull pour recevoir les mises à jour depuis Sheets...`);
+        syncLogger.info(`   🔄 [PUSH-SYNC] Déclenchement pull pour recevoir les mises à jour depuis Sheets...`);
         
         // Déclencher un pull après un court délai pour laisser Sheets se mettre à jour
         // CRITIQUE: Cela libère les produits pour recevoir les mises à jour depuis Sheets
@@ -296,68 +425,327 @@ export class SyncWorker {
       syncLogger.info(`📤 [PUSH-SYNC] ==========================================`);
       
     } catch (error) {
-      syncLogger.error(`❌ [PUSH-SYNC] Erreur pushPendingOperations: ${error.message}`);
+      const elapsed = Date.now() - pushStartTime;
+      syncLogger.error(`❌ [PUSH-SYNC] Erreur lors du push après ${elapsed}ms: ${error.message}`);
+      if (error.stack) syncLogger.error(`   Stack: ${error.stack.substring(0, 200)}`);
+      syncLogger.error(`   🔍 [DEBUG] isOnline=${isOnline}, code=${error.code || 'N/A'}`);
+      
+      // Si c'est une erreur de connexion, mettre à jour isOnline
+      if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND' || error.message?.includes('ECONNREFUSED')) {
+        syncLogger.warn(`⚠️ [PUSH-SYNC] Erreur de connexion détectée, marquage comme offline`);
+        isOnline = false;
+      }
     }
   }
   
   /**
    * Push les patches produits vers Sheets
+   * VERSION AMÉLIORÉE PRO: Logs très détaillés pour debug nom du produit
    * Utilise batchPush pour être compatible avec le Code.gs (handleBatchPush)
    */
   async pushProductPatches(patches) {
-    if (!patches || patches.length === 0) return;
+    if (!patches || patches.length === 0) {
+      syncLogger.debug(`📤 [pushProductPatches] Pas de patches à envoyer`);
+      return;
+    }
+    
+    const pushStartTime = Date.now();
+    const sheetsUrl = process.env.GOOGLE_SHEETS_WEBAPP_URL;
+    
+    syncLogger.info(`\n${'═'.repeat(80)}`);
+    syncLogger.info(`📤 [pushProductPatches] DÉBUT PUSH PATCHES PRODUITS`);
+    syncLogger.info(`${'═'.repeat(80)}`);
+    syncLogger.info(`   ⏱️ Heure: ${new Date().toISOString()}`);
+    syncLogger.info(`   📊 Patches à traiter: ${patches.length}`);
+    syncLogger.info(`   🌐 Sheets URL: ${sheetsUrl ? '✅ CONFIGURÉE' : '❌ VIDE'}`);
+    
+    if (!sheetsUrl) {
+      syncLogger.error(`❌ [pushProductPatches] URL Google Sheets non configurée - ARRÊT`);
+      return;
+    }
     
     const ackedOpIds = [];
+    let totalOpsCreated = 0;
     
-    // Préparer les opérations pour batchPush
-    const ops = patches.map(op => ({
-      op_id: op.op_id,
-      entity: 'products',
-      op: 'upsert',
-      payload: {
-        code: op.entity_code,
-        ...op.payload
-      }
-    }));
+    // ✅ IDEMPOTENCE FIX: Track parent_op_id → child_op_ids
+    // Quand Code.gs ack une opération enfant, on marque le parent comme "partiellement traité"
+    // Quand TOUS les enfants sont acké, on ack le parent dans l'outbox
+    const parentToChildOps = new Map(); // parent_op_id → [child_op_id1, child_op_id2, ...]
+    const ackedChildOps = new Set(); // child_op_ids qui ont été acké
     
-    try {
-      syncLogger.info(`      📤 Push ${patches.length} patch(es) produit via batchPush`);
+    // Preparer les operations pour batchPush avec fan-out logic
+    const ops = patches.flatMap((op, patchIdx) => {
+      syncLogger.info(`\n  [PATCH ${patchIdx + 1}/${patches.length}] Traitement opération op_id='${op.op_id}'`);
+      syncLogger.info(`    ├─ entity_code: '${op.entity_code}'`);
+      syncLogger.info(`    ├─ status: ${op.status}`);
+      syncLogger.info(`    └─ payload_json type: ${typeof op.payload_json}`);
       
-      // Utiliser pushBatch qui supporte le mode batch via Code.gs
-      const result = await sheetsClient.pushBatch(ops);
+      let payloadData = {};
+      let parseError = null;
       
-      if (result.success) {
-        // Marquer les opérations appliquées comme confirmées
-        for (const applied of (result.applied || [])) {
-          if (applied.op_id) {
-            ackedOpIds.push(applied.op_id);
+      // Parser le payload JSON
+      if (op.payload_json) {
+        if (typeof op.payload_json === 'string') {
+          try {
+            payloadData = JSON.parse(op.payload_json);
+            syncLogger.info(`    ✅ JSON parsed successfully`);
+            syncLogger.info(`       ├─ name: '${payloadData.name}'`);
+            syncLogger.info(`       ├─ is_active: ${payloadData.is_active}`);
+            syncLogger.info(`       └─ Keys: ${Object.keys(payloadData).join(', ')}`);
+          } catch (e) {
+            parseError = e.message;
+            syncLogger.warn(`    ❌ JSON parse error: ${e.message}`);
+            syncLogger.warn(`       Raw (first 150 chars): ${op.payload_json.substring(0, 150)}`);
+            payloadData = {};
           }
+        } else if (typeof op.payload_json === 'object') {
+          payloadData = op.payload_json;
+          syncLogger.info(`    ✅ Payload est déjà un objet`);
+          syncLogger.info(`       ├─ name: '${payloadData.name}'`);
+          syncLogger.info(`       └─ Keys: ${Object.keys(payloadData).join(', ')}`);
         }
-        
-        // Marquer les conflits comme erreurs
-        for (const conflict of (result.conflicts || [])) {
-          if (conflict.op_id) {
-            outboxRepo.markAsError(conflict.op_id, conflict.reason || 'Conflit');
-          }
-        }
-        
-        syncLogger.info(`      ✅ ${ackedOpIds.length}/${patches.length} patch(es) produit confirmé(s)`);
       } else {
-        for (const op of patches) {
-          outboxRepo.markAsError(op.op_id, result.error || 'Erreur push');
+        syncLogger.warn(`    ⚠️ payload_json is null/undefined`);
+      }
+
+      // 🔴 CRITIQUE: Extraire le NOM du produit
+      const finalName = payloadData.name !== undefined && payloadData.name !== null
+        ? String(payloadData.name).trim()
+        : '';
+      
+      syncLogger.info(`    📝 NAME EXTRACTION:`);
+      syncLogger.info(`       ├─ payload.name: ${payloadData.name === undefined ? 'undefined' : `'${payloadData.name}'`}`);
+      syncLogger.info(`       ├─ finalName: '${finalName}'`);
+      syncLogger.info(`       └─ isEmpty: ${finalName === '' ? '⚠️ YES (problème!)' : '✅ NO (bon)'}`);
+
+      let uuid = payloadData.uuid || op.entity_uuid || '';
+      let units = [];
+      let fullProduct = null;  // Déclaration avant la section de chargement
+      
+      // CRITICAL: Load full product to get all units
+      syncLogger.info(`    📦 CHARGEMENT PRODUIT:`);
+      try {
+        // Strategy multi-clés: entity_code peut être un code produit (PMI7...) ou un ID SQL (1)
+        fullProduct = productsRepo.findByCode(op.entity_code) ||
+                      (productsRepo.findById && productsRepo.findById(Number(op.entity_code))) ||
+                      (productsRepo.findByUUID && productsRepo.findByUUID(op.entity_uuid));
+        
+        if (fullProduct) {
+          uuid = fullProduct.uuid || uuid;
+          syncLogger.info(`       ✅ Produit trouvé (id=${fullProduct.id}, code=${fullProduct.code})`);
+          syncLogger.info(`       ├─ name en DB: '${fullProduct.name}'`);
+          syncLogger.info(`       ├─ uuid en DB: ${fullProduct.uuid}`);
+          syncLogger.info(`       └─ entity_code input: '${op.entity_code}' → code trouvé: '${fullProduct.code}'`);
+          
+          if (fullProduct.units && fullProduct.units.length > 0) {
+            units = fullProduct.units.map((u) => ({
+              id: u.id,
+              uuid: u.uuid,
+              unit_level: u.unit_level || 'CARTON',
+              unit_mark: u.unit_mark || ''
+            }));
+            syncLogger.info(`       ├─ Unités trouvées: ${units.length}`);
+            units.forEach((u, idx) => {
+              syncLogger.info(`       │  [${idx + 1}] ${u.unit_level}/${u.unit_mark} (uuid=${u.uuid.substring(0, 8)}...)`);
+            });
+          }
+        } else {
+          syncLogger.warn(`       ❌ Produit NOT FOUND en DB pour code='${op.entity_code}'`);
         }
-        syncLogger.warn(`      ⚠️ Erreur patches produits: ${result.error}`);
+      } catch (e) {
+        syncLogger.error(`       ❌ ERREUR lors du chargement: ${e.message}`);
       }
-    } catch (error) {
-      for (const op of patches) {
-        outboxRepo.markAsError(op.op_id, error.message);
+
+      // Fallback: use unit from payload or default to CARTON
+      if (units.length === 0) {
+        const fallbackUnit = payloadData.unit_level || 'CARTON';
+        const fallbackMark = payloadData.unit_mark || '';
+        units = [{
+          unit_level: fallbackUnit,
+          unit_mark: fallbackMark
+        }];
+        syncLogger.info(`       ⚠️ Unités non trouvées en DB → FALLBACK: ${fallbackUnit}/${fallbackMark}`);
       }
-      syncLogger.error(`      ❌ Erreur push produits: ${error.message}`);
+
+      // FAN-OUT: Create one operation per unit level
+      const productCode = payloadData.code || fullProduct?.code || op.entity_code;
+      syncLogger.info(`    🔑 CODE RESOLUTION: '${op.entity_code}' → '${productCode}'`);
+      if (fullProduct?.code && fullProduct.code !== op.entity_code) {
+        syncLogger.info(`       ℹ️ entity_code était un ID → trouvé code réel: ${fullProduct.code}`);
+      }
+      
+      const perUnitOps = units.map((unit, unitIdx) => {
+        // IMPORTANT: Créer un op_id unique par unité pour éviter l'idempotence incorrecte
+        // (Code.gs ne doit ack que le parent op_id, pas les dérivés)
+        const perUnitOpId = `${op.op_id}:${unit.unit_level}:${unit.unit_mark || ''}`;
+        
+        const operationPayload = {
+          ...payloadData,
+          code: productCode,
+          name: finalName,  // 🔴 CRITIQUE: Inclure le NOM ici!
+          is_active: payloadData.is_active !== undefined ? payloadData.is_active : 1,
+          unit_level: unit.unit_level,
+          unit_mark: unit.unit_mark,
+          unit_uuid: unit.uuid,
+          uuid: uuid,
+          parent_op_id: op.op_id  // ✅ Passer le parent_op_id pour l'ACK côté Code.gs
+        };
+
+        syncLogger.info(`       🔄 Création opération [UNIT ${unitIdx + 1}]:`);
+        syncLogger.info(`          ├─ op_id: '${perUnitOpId}'`);
+        syncLogger.info(`          ├─ parent_op_id: '${op.op_id}'`);
+        syncLogger.info(`          ├─ code: '${operationPayload.code}'`);
+        syncLogger.info(`          ├─ name: '${operationPayload.name}' ${operationPayload.name === '' ? '❌ VIDE!' : '✅'}`);
+        syncLogger.info(`          ├─ unit_level: ${operationPayload.unit_level}`);
+        syncLogger.info(`          ├─ unit_mark: '${operationPayload.unit_mark}'`);
+        syncLogger.info(`          └─ uuid: ${operationPayload.uuid.substring(0, 8)}...`);
+
+        totalOpsCreated++;
+
+        return {
+          op_id: perUnitOpId,  // ✅ Utiliser op_id unique par unité
+          entity: 'products',
+          op: 'upsert',
+          payload: operationPayload
+        };
+      });
+
+      return perUnitOps;
+    });
+
+    // ✅ Remplir la map parent → children pour tracking idempotence
+    for (const op of ops) {
+      const parentOpId = op.payload.parent_op_id;
+      if (parentOpId) {
+        if (!parentToChildOps.has(parentOpId)) {
+          parentToChildOps.set(parentOpId, []);
+        }
+        parentToChildOps.get(parentOpId).push(op.op_id);
+      }
     }
+
+    syncLogger.info(`\n  📊 RÉSUMÉ PRÉPARATION:`);
+    syncLogger.info(`     ├─ Patches traités: ${patches.length}`);
+    syncLogger.info(`     ├─ Opérations créées: ${totalOpsCreated}`);
+    syncLogger.info(`     ├─ Parent ops avec fan-out: ${parentToChildOps.size}`);
     
-    if (ackedOpIds.length > 0) {
-      outboxRepo.markAsAcked(ackedOpIds);
+    // Log les mappings parent → children pour debug
+    if (parentToChildOps.size > 0) {
+      syncLogger.info(`     └─ Mappings (parent → children):`);
+      for (const [parentId, childIds] of parentToChildOps) {
+        syncLogger.info(`        ${parentId} → [${childIds.join(', ')}]`);
+      }
     }
+
+
+    if (ops.length === 0) {
+      syncLogger.warn(`❌ Aucune opération créée - ARRÊT`);
+      return;
+    }
+
+    // Batch and push
+    syncLogger.info(`\n  📤 ENVOI PAR BATCH:`);
+    const batchSize = 50;
+    let totalSent = 0;
+    let totalAcked = 0;
+    
+    for (let i = 0; i < ops.length; i += batchSize) {
+      const batch = ops.slice(i, i + batchSize);
+      const batchNum = Math.floor(i / batchSize) + 1;
+      const totalBatches = Math.ceil(ops.length / batchSize);
+      
+      const body = {
+        action: 'batchPush',
+        ops: batch
+      };
+
+      syncLogger.info(`\n     [BATCH ${batchNum}/${totalBatches}] Ops ${i + 1}-${Math.min(i + batchSize, ops.length)} of ${ops.length}`);
+      syncLogger.info(`        └─ Taille: ${batch.length} opérations`);
+
+      try {
+        syncLogger.info(`        📨 Envoi vers Google Sheets...`);
+        
+        // Afficher les détails du premier op pour debug
+        if (i === 0 && batch.length > 0) {
+          const firstOp = batch[0];
+          syncLogger.info(`        🔍 Premier op détails:`);
+          syncLogger.info(`           ├─ entity: ${firstOp.entity}`);
+          syncLogger.info(`           ├─ op: ${firstOp.op}`);
+          syncLogger.info(`           └─ payload.name: '${firstOp.payload.name}' ${firstOp.payload.name === '' ? '❌' : '✅'}`);
+        }
+        
+        const result = await sheetsClient.pushBatch(batch, { timeout: 30000 });
+        totalSent += batch.length;
+        const ackedCount = result.acked_count || (result.success ? batch.length : 0);
+
+        syncLogger.info(`        📨 Réponse reçue:`);
+        syncLogger.info(`           ├─ success: ${result.success ? '✅ YES' : '❌ NO'}`);
+        syncLogger.info(`           ├─ acked: ${ackedCount}/${batch.length}`);
+        syncLogger.info(`           └─ error: ${result.error ? `"${result.error}"` : 'none'}`);
+        totalAcked += ackedCount;
+
+        if (result.success) {
+          // ✅ IDEMPOTENCE: Marquer les child_op_ids comme acké
+          for (const op of batch) {
+            ackedChildOps.add(op.op_id);  // Marquer cet enfant comme traité
+          }
+          
+          // ✅ Chercher les parent_op_ids dont TOUS les enfants sont acké
+          for (const [parentId, childIds] of parentToChildOps) {
+            const allChildrenAcked = childIds.every(childId => ackedChildOps.has(childId));
+            if (allChildrenAcked && !ackedOpIds.includes(parentId)) {
+              ackedOpIds.push(parentId);
+              syncLogger.info(`        ✅ Parent ${parentId} peut être acké (tous les enfants acké: ${childIds.length})`);
+            }
+          }
+          
+          syncLogger.info(`        ✅ Batch traité avec succès (${batch.length} child ops)`);
+        } else {
+          syncLogger.error(`        ❌ Batch ÉCHOUÉ: ${result.error || 'unknown error'}`);
+          // Marquer comme erreur pour retry (on marque l'op_id enfant, pas le parent)
+          for (const op of batch) {
+            try {
+              outboxRepo.markAsError(op.op_id, result.error || 'Batch failed');
+            } catch (e) {
+              syncLogger.warn(`           ⚠️ Erreur markAsError: ${e.message}`);
+            }
+          }
+        }
+      } catch (err) {
+        syncLogger.error(`        ❌ ERREUR lors de l'envoi: ${err.message}`);
+        syncLogger.error(`           Code: ${err.code || 'N/A'}`);
+        syncLogger.error(`           Stack: ${err.stack ? err.stack.substring(0, 200) : 'N/A'}`);
+        
+        // Marquer comme erreur pour retry
+        for (const op of batch) {
+          try {
+            outboxRepo.markAsError(op.op_id, `HTTP Error: ${err.message}`);
+          } catch (e) {
+            syncLogger.warn(`           ⚠️ Erreur markAsError: ${e.message}`);
+          }
+        }
+      }
+    }
+
+    // Mark acked operations as done
+    if (ackedOpIds.length > 0) {
+      syncLogger.info(`\n  ✅ FINALISATION:`);
+      try {
+        outboxRepo.markAsAcked(ackedOpIds);
+        syncLogger.info(`     └─ ${ackedOpIds.length} opération(s) marquée(s) comme 'acked'`);
+      } catch (error) {
+        syncLogger.error(`     ❌ Erreur markAsAcked: ${error.message}`);
+      }
+    }
+
+    const elapsed = Date.now() - pushStartTime;
+    syncLogger.info(`\n${'═'.repeat(80)}`);
+    syncLogger.info(`📤 [pushProductPatches] FIN PUSH`);
+    syncLogger.info(`${'═'.repeat(80)}`);
+    syncLogger.info(`   ⏱️ Temps total: ${elapsed}ms`);
+    syncLogger.info(`   📊 Envoyé: ${totalSent}/${ops.length}`);
+    syncLogger.info(`   ✅ Acked: ${totalAcked}/${totalSent}`);
+    syncLogger.info(`${'═'.repeat(80)}\n`);
   }
   
   /**
@@ -379,7 +767,7 @@ export class SyncWorker {
     // - stock_current/stock_initial
     // - auto_stock_factor
     const ops = patches.map(op => {
-      const payload = op.payload || {};
+      const payload = this.parseOpPayload(op);
       
       // CRITIQUE: Construire le payload complet pour handleProductUpsert dans Code.gs
       return {
@@ -460,16 +848,25 @@ export class SyncWorker {
   /**
    * Push les mouvements de stock vers Sheets
    * IMPORTANT: On envoie des DELTAS, pas des valeurs absolues
+   * Utilise le système de batch standard (pushBatch) pour cohérence avec les autres opérations
    */
   async pushStockMoves(moves) {
     const ackedOpIds = [];
     const ackedMoveIds = [];
     
-    // Grouper par produit/unité pour batch
+    if (!moves || moves.length === 0) {
+      syncLogger.debug('   📭 Aucun mouvement de stock à envoyer');
+      return;
+    }
+
+    // Construire les opérations au format batch standard
+    const ops = [];
     const movesByUnit = {};
+    
     for (const op of moves) {
-      const payload = op.payload;
+      const payload = this.parseOpPayload(op);
       const key = `${payload.product_code}-${payload.unit_level}-${payload.unit_mark || ''}`;
+      
       if (!movesByUnit[key]) {
         movesByUnit[key] = {
           product_code: payload.product_code,
@@ -481,50 +878,73 @@ export class SyncWorker {
       movesByUnit[key].moves.push({ op, payload });
     }
     
+    // Créer une opération batch par unité (regroupe les mouvements)
     for (const key in movesByUnit) {
       const unitMoves = movesByUnit[key];
+      const totalDelta = unitMoves.moves.reduce((sum, m) => sum + m.payload.delta, 0);
       
-      try {
-        // Calculer le delta total pour cette unité
-        const totalDelta = unitMoves.moves.reduce((sum, m) => sum + m.payload.delta, 0);
-        
-        syncLogger.info(`      📤 Push mouvement stock: ${unitMoves.product_code}/${unitMoves.unit_level} delta=${totalDelta > 0 ? '+' : ''}${totalDelta}`);
-        
-        // Préparer les données pour Sheets
-        const moveData = {
+      syncLogger.info(`      📤 Preparation mouvement stock: ${unitMoves.product_code}/${unitMoves.unit_level} delta=${totalDelta > 0 ? '+' : ''}${totalDelta}`);
+      
+      // Construire l'opération au format attendu par pushBatch
+      ops.push({
+        op_id: unitMoves.moves[0].op.op_id,  // Utiliser le premier op_id comme clé
+        entity: 'stock_moves',
+        op: 'delta_apply',
+        payload: {
           product_code: unitMoves.product_code,
           unit_level: unitMoves.unit_level,
-          unit_mark: unitMoves.unit_mark,
+          unit_mark: unitMoves.unit_mark || '',
           delta: totalDelta,
           move_ids: unitMoves.moves.map(m => m.payload.move_id),
           op_ids: unitMoves.moves.map(m => m.op.op_id)
-        };
-        
-        // Appeler l'API Sheets pour appliquer le delta de stock
-        const result = await sheetsClient.push('stock_moves', [moveData]);
-        
-        if (result.success) {
-          for (const m of unitMoves.moves) {
-            ackedOpIds.push(m.op.op_id);
-            if (m.payload.move_id) {
-              ackedMoveIds.push(m.payload.move_id);
-            }
-          }
-          syncLogger.info(`      ✅ Mouvement stock confirmé: ${unitMoves.product_code}/${unitMoves.unit_level}`);
-        } else {
-          for (const m of unitMoves.moves) {
-            outboxRepo.markAsError(m.op.op_id, result.error || 'Erreur push');
-          }
-          syncLogger.warn(`      ⚠️ Erreur mouvement stock: ${result.error}`);
         }
-      } catch (error) {
-        for (const m of unitMoves.moves) {
-          outboxRepo.markAsError(m.op.op_id, error.message);
-        }
-        syncLogger.error(`      ❌ Erreur push stock ${key}: ${error.message}`);
-      }
+      });
     }
     
+    if (ops.length === 0) {
+      syncLogger.info(`   📭 Aucune opération stock créée après regroupement`);
+      return;
+    }
+    
+    try {
+      syncLogger.info(`      📤 Push ${ops.length} mouvement(s) de stock via batchPush`);
+      
+      // Utiliser le système standard de batch
+      const result = await sheetsClient.pushBatch(ops, { timeout: 9000 });
+      
+      if (result.success || result.applied) {
+        // Marquer les opérations appliquées comme confirmées
+        const appliedIds = new Set((result.applied || []).map(a => a.op_id));
+        
+        for (const op of ops) {
+          if (appliedIds.has(op.op_id) || result.success) {
+            ackedOpIds.push(op.op_id);
+            // Marquer aussi les move_ids associés
+            if (op.payload.move_ids) {
+              ackedMoveIds.push(...op.payload.move_ids);
+            }
+          }
+        }
+        
+        syncLogger.info(`      ✅ ${ackedOpIds.length} mouvement(s) stock confirmé(s)`);
+      } else {
+        // En cas d'erreur
+        for (const op of ops) {
+          outboxRepo.markAsError(op.op_id, result.error || 'Erreur push stock');
+        }
+        syncLogger.warn(`      ⚠️ Erreur mouvements stock: ${result.error}`);
+        return;
+      }
+    } catch (error) {
+      // Marquer tous les ops en erreur
+      for (const op of ops) {
+        outboxRepo.markAsError(op.op_id, error.message);
+      }
+      syncLogger.error(`      ❌ Exception push stock: ${error.message}`);
+      return;
+    }
+    
+    // Marquer dans la BD comme ackés/synced
     if (ackedOpIds.length > 0) {
       outboxRepo.markAsAcked(ackedOpIds);
     }
@@ -535,16 +955,18 @@ export class SyncWorker {
   
   /**
    * Synchronise uniquement les produits depuis Sheets (pull)
-   * Utilisé après un push réussi pour libérer les produits et recevoir les mises à jour depuis Sheets
-   * CRITIQUE: Les produits avec des opérations "acked" ne sont plus bloqués et peuvent recevoir les mises à jour
+   * ✅ CORRECTION PRO:
+   * - Dates STRICTEMENT en ISO (pas de Date object)
+   * - Marge de sécurité 60s pour éviter les race conditions
+   * - Boucle indépendante toutes les 10s (pas bloquée par ventes/push)
    */
   async syncProductsFromSheets() {
     try {
-      syncLogger.info(`📥 [PRODUCTS-PULL] Synchronisation produits depuis Sheets (après push réussi)`);
+      syncLogger.info(`📥 [PRODUCTS-PULL] Synchronisation produits depuis Sheets`);
       
-      // Récupérer la date de dernière synchronisation
-      const sinceDate = syncRepo.getLastPullDate('products');
-      const since = sinceDate ? new Date(sinceDate) : new Date(0);
+      // ✅ CORRECTION: Date ISO strict + marge de sécurité 60s
+      const sinceIso = sinceIsoWithSkew(syncRepo.getLastPullDate('products'), 60_000);
+      syncLogger.info(`   ⏰ [PRODUCTS-PULL] Since ISO: ${sinceIso}`);
       
       // Pull paginé par unit_level (CARTON, MILLIER, PIECE)
       const productUnitLevels = ['CARTON', 'MILLIER', 'PIECE'];
@@ -554,7 +976,8 @@ export class SyncWorker {
         try {
           syncLogger.info(`   📄 [PRODUCTS-PULL] Feuille: ${unitLevel}`);
           
-          const result = await sheetsClient.pullAllPaged('products', since, {
+          // ✅ CORRECTION: Passer sinceIso au lieu de Date object
+          const result = await sheetsClient.pullAllPaged('products', sinceIso, {
             full: false, // Mode incrémental seulement
             unitLevel: unitLevel,
             maxRetries: 3,
@@ -1558,10 +1981,22 @@ export class SyncWorker {
         }
       }
     } catch (error) {
-      // Pas de connexion ou timeout
-      if (isOnline && (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND' || error.code === 'ETIMEDOUT' || error.message?.includes('timeout'))) {
+      // ✅ IMPORTANT: Seulement marquer comme offline si c'est une vraie erreur de connexion
+      // Les timeouts occasionnels ne doivent pas marquer la connexion comme perdue
+      // Seulement les erreurs ECONNREFUSED, ENOTFOUND sont vraies déconnexions
+      const isRealConnectionError = 
+        error.code === 'ECONNREFUSED' || 
+        error.code === 'ENOTFOUND' || 
+        error.code === 'ERR_TLS_CERT_ALTNAME_INVALID';
+      
+      if (isRealConnectionError && isOnline) {
         syncLogger.warn('⚠️ [INTERNET] Connexion Internet perdue, synchronisation en attente');
         isOnline = false;
+      } else if (!isRealConnectionError) {
+        // Timeout ou autre erreur temporaire - ne pas marquer comme offline
+        if (isOnline) {
+          syncLogger.debug(`⚠️ [INTERNET] Erreur temporaire de connexion (${error.code}), mais isOnline=true`);
+        }
       }
     }
   }
@@ -1583,8 +2018,14 @@ export class SyncWorker {
       clearTimeout(_salesLoopTimeout);
       _salesLoopTimeout = null;
     }
+    // ✅ Arrêter la boucle dédiée des produits
+    if (_productsLoopTimeout) {
+      clearTimeout(_productsLoopTimeout);
+      _productsLoopTimeout = null;
+    }
     syncLogger.info('Worker de synchronisation arrêté');
     syncLogger.info('💰 [SALES-SYNC] Synchronisation dédiée des ventes arrêtée');
+    syncLogger.info('📦 [PRODUCTS-SYNC] Synchronisation dédiée des produits arrêtée');
   }
 
   /**
@@ -1733,7 +2174,7 @@ export class SyncWorker {
       if (stockUpdates.length > 0) {
         syncLogger.info(`📦 [PUSH] ${stockUpdates.length} opération(s) update_stock trouvée(s):`);
         stockUpdates.forEach((op, idx) => {
-          const payload = JSON.parse(op.payload_json || JSON.stringify(op.payload || {}));
+          const payload = this.parseOpPayload(op);
           syncLogger.info(`   [${idx + 1}] Produit: ${payload.product_code}`);
           syncLogger.info(`       Unité: ${payload.unit_level}, Mark: ${payload.unit_mark || '(vide)'}`);
           if (payload.stock_absolute !== undefined) {
@@ -1752,7 +2193,7 @@ export class SyncWorker {
         entity: op.entity,
         entity_id: op.entity_id,
         op: op.op,
-        payload: JSON.parse(op.payload_json || JSON.stringify(op.payload || {}))
+        payload: this.parseOpPayload(op)
       }));
 
       syncLogger.info(`📤 [PUSH] Envoi du batch vers Google Sheets...`);
@@ -2619,16 +3060,31 @@ export class SyncWorker {
         const existing = productsRepo.findByCode(code);
         const isNew = !existing;
         
+        // 🆔 AUTO-GÉNÉRER UUID SI MANQUANT (même pour les anciens produits)
+        let productUuid = product.uuid;
+        if (!productUuid || productUuid.trim() === '') {
+          productUuid = generateUUID();
+          syncLogger.info(`   🆔 [${code}] UUID auto-généré (manquait): ${productUuid}`);
+        } else if (existing && !existing.uuid) {
+          // Si le produit existe localement mais sans UUID, le lui attribuer
+          productUuid = existing.uuid || product.uuid;
+          if (!productUuid || productUuid.trim() === '') {
+            productUuid = generateUUID();
+            syncLogger.info(`   🆔 [${code}] UUID réparé (produit existant sans UUID): ${productUuid}`);
+          }
+        }
+        
         // RÈGLE CRITIQUE: Ne pas écraser un produit/unité en pending (modifications locales non synchronisées)
         // Utiliser le nouveau système d'outbox pour vérifier les opérations pending
         const hasProductPending = outboxRepo.hasProductPending(code);
         
         if (hasProductPending && !isNew) {
           // Le produit existe et a des modifications locales en pending
-          // Ne pas écraser les modifications locales
+          // NE PAS ÉCRASER LE NOM - préserver la version locale
           skippedPendingCount++;
           syncLogger.warn(`      ⏸️  Produit "${code}" IGNORÉ (modifications locales en pending)`);
-          syncLogger.warn(`         💡 Les modifications locales seront synchronisées vers Sheets avant d'accepter les mises à jour depuis Sheets`);
+          syncLogger.warn(`         💡 Modifications locales seront synchronisées vers Sheets`);
+          syncLogger.warn(`         📝 Nom local conservé (update Sheets sera traité après push)`);
           continue;
         }
         
@@ -2701,6 +3157,7 @@ export class SyncWorker {
         const upsertItemStart = Date.now();
         productsRepo.upsert({
           ...product,
+          uuid: productUuid,
           units: unitsToUpsert,
           is_active: 1,
           _origin: 'SHEETS'
@@ -4075,6 +4532,25 @@ export class SyncWorker {
       syncLogger.info('✅ [SYNC NOW] Synchronisation manuelle terminée avec succès');
     } catch (error) {
       syncLogger.error('❌ [SYNC NOW] Erreur synchronisation manuelle:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Force l'état online = true et pousse les opérations pending
+   * Utile après une perte de connexion détectée par erreur
+   */
+  async resetOnlineAndPush() {
+    syncLogger.info('🌐 [RESET-ONLINE] Force connexion Internet active');
+    isOnline = true;
+    
+    syncLogger.info('📤 [RESET-ONLINE] Début push des opérations pending...');
+    try {
+      await this.pushPendingOperations();
+      syncLogger.info('✅ [RESET-ONLINE] Push terminé avec succès');
+      return { success: true, message: 'Online status reset and push completed' };
+    } catch (error) {
+      syncLogger.error('❌ [RESET-ONLINE] Erreur lors du push:', error.message);
       throw error;
     }
   }

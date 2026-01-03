@@ -2,20 +2,49 @@
   "appId": "com.lagrace.pos",
   "productName": "LA GRACE POS",
   "directories": {
-    "output": "dist-electron"
+    "output": "dist/release"
   },
   "publish": null,
+  "asar": true,
+  "asarUnpack": [
+    "**/*.node",
+    "node_modules/better-sqlite3/**",
+    "node_modules/bcrypt/**"
+  ],
   "files": [
     "electron/**/*",
     "src/**/*",
-    "dist/**/*",
     "asset/**/*",
-    "print/**/*",
-    "node_modules/**/*",
-    "package.json",
-    "!node_modules/**/*.{md,ts,map}",
-    "!**/test/**/*",
-    "!**/tests/**/*"
+    "package.json"
+  ],
+  "extraResources": [
+    {
+      "from": "dist/ui",
+      "to": "ui",
+      "filter": ["**/*"]
+    },
+    {
+      "from": "print",
+      "to": "print",
+      "filter": ["**/*"]
+    },
+    {
+      "from": "src/db/schema.sql",
+      "to": "src/db/schema.sql"
+    },
+    {
+      "from": "src/package.json",
+      "to": "src/package.json"
+    },
+    {
+      "from": "config.env",
+      "to": "config.env"
+    },
+    {
+      "from": "dist/ai/ai-lagrace",
+      "to": "ai",
+      "filter": ["**/*"]
+    }
   ],
   "win": {
     "target": [
@@ -35,7 +64,9 @@
     "oneClick": false,
     "allowToChangeInstallationDirectory": true,
     "createDesktopShortcut": true,
-    "createStartMenuShortcut": true
+    "createStartMenuShortcut": true,
+    "installerIcon": "asset/image/icon/photo.ico",
+    "uninstallerIcon": "asset/image/icon/photo.ico"
   },
   "mac": {
     "target": "dmg",

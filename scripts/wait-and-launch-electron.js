@@ -6,6 +6,7 @@ import http from 'http';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, resolve } from 'path';
+import fs from 'fs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -15,6 +16,37 @@ const BACKEND_URL = 'http://localhost:3030/api/health';
 const VITE_URL = 'http://localhost:5173';
 const MAX_ATTEMPTS = 60; // 30 secondes max (500ms * 60)
 const DELAY_MS = 500;
+
+/**
+ * ✅ IMPORTANT (Fix ESM en production)
+ * Assure que src/package.json existe avec { "type": "module" }
+ * Ainsi, quand Electron Builder copie src -> resources/src, Node verra "type":"module"
+ * et acceptera les imports ESM dans resources/src/api/server.js.
+ */
+function ensureSrcEsmModuleMarker() {
+  try {
+    const srcPkgPath = resolve(projectRoot, 'src', 'package.json');
+    if (!fs.existsSync(srcPkgPath)) {
+      fs.writeFileSync(srcPkgPath, JSON.stringify({ type: 'module' }, null, 2), 'utf8');
+      console.log(`✅ Créé: ${srcPkgPath} (type: module)`);
+    } else {
+      // Optionnel: vérifier que "type":"module" est bien présent
+      const raw = fs.readFileSync(srcPkgPath, 'utf8');
+      let json = {};
+      try { json = JSON.parse(raw); } catch {}
+      if (json.type !== 'module') {
+        json.type = 'module';
+        fs.writeFileSync(srcPkgPath, JSON.stringify(json, null, 2), 'utf8');
+        console.log(`✅ Mis à jour: ${srcPkgPath} (type: module)`);
+      } else {
+        console.log(`ℹ️ OK: src/package.json (type: module)`);
+      }
+    }
+  } catch (e) {
+    console.warn('⚠️ Impossible de garantir src/package.json (type: module):', e.message);
+    console.warn('💡 Crée manuellement src/package.json avec: { "type": "module" }');
+  }
+}
 
 function checkServer(url) {
   return new Promise((resolve) => {
@@ -88,6 +120,7 @@ async function launchElectron() {
     env: {
       ...process.env,
       NODE_ENV: 'development',
+      SKIP_BACKEND_WAIT: 'true', // Signal: Ne pas démarrer le backend (il tourne déjà depuis npm run dev:backend)
     },
     stdio: 'inherit', // Hériter de stdin/stdout/stderr pour voir les logs
     shell: isWindows,
@@ -119,6 +152,9 @@ async function launchElectron() {
 // Main
 console.log('📦 Script de lancement Electron démarré');
 console.log(`   Répertoire projet: ${projectRoot}`);
+
+// ✅ CORRECTION: Assurer que src/package.json existe avant le build
+ensureSrcEsmModuleMarker();
 
 waitForServers().then((ready) => {
   if (ready) {

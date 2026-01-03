@@ -2,80 +2,67 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 
-/**
- * Retourne le répertoire racine du projet Glowflixprojet
- * Windows default: C:\Glowflixprojet
- * Sinon: ~/Glowflixprojet
- */
-export function getProjectRoot() {
-  // Windows default, sinon fallback user home
+export function getDataRoot() {
+  if (process.env.LAGRACE_DATA_DIR) return path.resolve(process.env.LAGRACE_DATA_DIR);
+  if (process.env.GLOWFLIX_ROOT_DIR) return path.resolve(process.env.GLOWFLIX_ROOT_DIR);
+
   const winDefault = "C:\\Glowflixprojet";
-  return process.env.GLOWFLIX_ROOT_DIR
-    ? path.resolve(process.env.GLOWFLIX_ROOT_DIR)
-    : (process.platform === "win32" ? winDefault : path.join(os.homedir(), "Glowflixprojet"));
+  return process.platform === "win32"
+    ? winDefault
+    : path.join(os.homedir(), "Glowflixprojet");
 }
 
-/**
- * Crée automatiquement toute l'arborescence nécessaire
- * @returns {string} Le chemin racine créé
- */
+export function getResourcesRoot() {
+  if (process.env.RESOURCES_ROOT) return path.resolve(process.env.RESOURCES_ROOT);
+  if (process.env.APP_ROOT) return path.resolve(process.env.APP_ROOT);
+  return process.cwd();
+}
+
+// ✅ compat: l'ancien nom doit pointer vers DATA (écriture)
+export function getProjectRoot() {
+  return getDataRoot();
+}
+
 export function ensureDirs() {
-  const root = getProjectRoot();
+  const root = getDataRoot();
   const dirs = [
-    "db", 
+    "db",
     "db/migrations",
-    "data/cache", 
-    "data/imports", 
-    "data/exports", 
-    "data/backups", 
+    "data/cache",
+    "data/imports",
+    "data/exports",
+    "data/backups",
     "data/attachments",
-    "printer/ok", 
-    "printer/err", 
-    "printer/tmp", 
-    "printer/assets", 
+    "printer/ok",
+    "printer/err",
+    "printer/tmp",
+    "printer/assets",
     "printer/templates",
-    "logs", 
-    "config"
+    "logs",
+    "config",
   ];
-  
+
   for (const d of dirs) {
     const fullPath = path.join(root, d);
-    if (!fs.existsSync(fullPath)) {
-      fs.mkdirSync(fullPath, { recursive: true });
-    }
+    if (!fs.existsSync(fullPath)) fs.mkdirSync(fullPath, { recursive: true });
   }
-  
   return root;
 }
 
-/**
- * Retourne le chemin de la base de données
- */
 export function getDbPath() {
-  const root = getProjectRoot();
-  return path.join(root, "db", "glowflixprojet.db");
+  return path.join(getDataRoot(), "db", "glowflixprojet.db");
 }
 
-/**
- * Retourne le chemin du répertoire d'impression
- */
 export function getPrintDir() {
-  return process.env.GLOWFLIX_PRINT_DIR 
-    ? path.resolve(process.env.GLOWFLIX_PRINT_DIR)
-    : path.join(getProjectRoot(), "printer");
+  if (process.env.GLOWFLIX_PRINT_DIR) return path.resolve(process.env.GLOWFLIX_PRINT_DIR);
+  return path.join(getDataRoot(), "printer");
 }
 
-/**
- * Retourne le chemin des logs
- */
 export function getLogsDir() {
-  return path.join(getProjectRoot(), "logs");
+  return path.join(getDataRoot(), "logs");
 }
 
-/**
- * Retourne le chemin de configuration
- */
 export function getConfigDir() {
-  return path.join(getProjectRoot(), "config");
+  return path.join(getDataRoot(), "config");
 }
 

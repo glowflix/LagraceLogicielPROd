@@ -1,32 +1,11 @@
 {
   "name": "glowflixprojet-app",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Système de gestion de point de vente offline-first avec synchronisation Google Sheets",
   "type": "module",
   "main": "electron/main.cjs",
-  "scripts": {
-    "start": "node src/api/server.js",
-    "dev": "concurrently -n \"backend,ui,electron\" -c \"cyan,magenta,green\" -k \"node --watch src/api/server.js\" \"vite\" \"node scripts/wait-and-launch-electron.js\"",
-    "dev:ui": "vite",
-    "dev:all": "concurrently -n \"backend,frontend\" -c \"cyan,magenta\" \"npm run dev\" \"npm run dev:ui\"",
-    "dev:ai": "python ai-lagrace/main.py",
-    "electron": "electron .",
-    "electron:dev": "cross-env NODE_ENV=development electron .",
-    "dev:electron": "concurrently -n \"backend,ui,ai,electron\" -c \"cyan,magenta,yellow,green\" \"npm run start\" \"npm run dev:ui\" \"python ai-lagrace/main.py\" \"npx wait-on http://localhost:3030/api/health http://localhost:5173 && cross-env NODE_ENV=development electron .\"",
-    "dev:app": "concurrently -n \"backend,ui,ai,electron\" -c \"cyan,magenta,yellow,green\" \"node --watch src/api/server.js\" \"vite\" \"python ai-lagrace/main.py\" \"npx wait-on http://localhost:3030/api/health http://localhost:5173 && cross-env NODE_ENV=development electron .\"",
-    "build": "npm run build:ui && npm run build:electron",
-    "build:ui": "vite build",
-    "build:all": "npm run build:ui",
-    "build:electron": "electron-builder",
-    "preview:ui": "vite preview",
-    "migrate": "node src/db/migrate.js",
-    "build:exe": "pkg package.json --targets node18-win-x64 --output dist/LaGrace-POS.exe",
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "check:mcp": "node scripts/check-mcp-prerequisites.js",
-    "setup:mcp": "powershell -ExecutionPolicy Bypass -File scripts/setup-mcp-guide.ps1",
-    "open:mcp-config": "powershell -ExecutionPolicy Bypass -File scripts/open-mcp-config.ps1",
-    "setup:mcp-config": "powershell -ExecutionPolicy Bypass -File copier-config-mcp.ps1"
-  },
+  "author": "",
+  "license": "ISC",
   "keywords": [
     "pos",
     "offline-first",
@@ -35,8 +14,27 @@
     "electron",
     "react"
   ],
-  "author": "",
-  "license": "ISC",
+  "scripts": {
+    "postinstall": "electron-builder install-app-deps",
+    "clean": "rimraf dist",
+    "start": "node src/api/server.js",
+    "dev:ui": "vite",
+    "dev:backend": "cross-env ELECTRON_RUN_AS_NODE=1 electron ./src/api/server.js",
+    "dev": "npx concurrently -n \"backend,ui,electron\" -c \"cyan,magenta,green\" -k \"npm run dev:backend\" \"npm run dev:ui\" \"node scripts/wait-and-launch-electron.js\"",
+    "dev:ai": "python ai-lagrace/main.py",
+    "electron": "electron .",
+    "electron:dev": "cross-env NODE_ENV=development electron .",
+    "dev:electron": "npx concurrently -n \"backend,ui,ai,electron\" -c \"cyan,magenta,yellow,green\" -k \"npm run dev:backend\" \"npm run dev:ui\" \"python ai-lagrace/main.py\" \"node scripts/wait-and-launch-electron.js\"",
+    "dev:app": "npx concurrently -n \"backend,ui,ai,electron\" -c \"cyan,magenta,yellow,green\" -k \"npm run dev:backend\" \"npm run dev:ui\" \"python ai-lagrace/main.py\" \"node scripts/wait-and-launch-electron.js\"",
+    "build:ui": "vite build --mode production",
+    "build:ai": "powershell -ExecutionPolicy Bypass -Command \"if (Test-Path .venv) { .\\.venv\\Scripts\\Activate.ps1 }; python -m pip install -q pyinstaller; pyinstaller --noconfirm --clean --onedir --name ai-lagrace --distpath dist/ai --workpath dist/.ai-work --specpath dist/.ai-spec ai-lagrace/main.py\"",
+    "build:electron": "electron-builder",
+    "prebuild": "node scripts/ensure-esm-marker.js",
+    "build": "npm run clean && npm run build:ui && npm run build:ai && npm run build:electron",
+    "preview:ui": "vite preview",
+    "migrate": "node src/db/migrate.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
   "dependencies": {
     "axios": "^1.6.2",
     "bcrypt": "^5.1.1",
@@ -69,42 +67,73 @@
     "concurrently": "^8.2.2",
     "cross-env": "^7.0.3",
     "electron": "^28.3.3",
-    "electron-builder": "^24.9.1",
+    "electron-builder": "^26.0.12",
     "electron-rebuild": "^3.2.9",
-    "pkg": "^5.8.1",
     "postcss": "^8.4.32",
+    "rimraf": "^5.0.10",
     "tailwindcss": "^3.3.6",
     "vite": "^5.0.8",
     "wait-on": "^7.2.0"
-  },
-  "pkg": {
-    "scripts": [
-      "src/api/server.js"
-    ],
-    "assets": [
-      "src/db/schema.sql",
-      "asset/**/*"
-    ],
-    "outputPath": "dist"
   },
   "build": {
     "appId": "com.lagrace.pos",
     "productName": "LA GRACE POS",
     "directories": {
-      "output": "dist-electron"
+      "output": "dist/release",
+      "buildResources": "build"
     },
+    "asar": true,
+    "asarUnpack": [
+      "**/*.node",
+      "node_modules/better-sqlite3/**",
+      "node_modules/bcrypt/**"
+    ],
     "files": [
       "electron/**/*",
       "src/**/*",
-      "dist/**/*",
+      "dist/ui/**/*",
       "asset/**/*",
       "print/**/*",
-      "node_modules/**/*",
-      "package.json",
-      "!node_modules/**/*.{md,ts,map}",
-      "!**/test/**/*",
-      "!**/tests/**/*"
+      "package.json"
     ],
+    "extraResources": [
+      {
+        "from": "dist/ui",
+        "to": "ui"
+      },
+      {
+        "from": "config.env",
+        "to": "config.env"
+      },
+      {
+        "from": "src",
+        "to": "src"
+      },
+      {
+        "from": "dist/ai/ai-lagrace",
+        "to": "ai",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "print",
+        "to": "print",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "asset",
+        "to": "asset",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "extraMetadata": {
+      "name": "LA GRACE POS"
+    },
     "win": {
       "target": [
         {

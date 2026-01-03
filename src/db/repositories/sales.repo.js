@@ -69,10 +69,10 @@ export class SalesRepository {
           const itemStmt = db.prepare(`
             INSERT INTO sale_items (
               uuid, sale_id, product_id, product_code, product_name,
-              unit_level, unit_mark, qty, qty_label,
+              unit_level, unit_mark, product_unit_uuid, qty, qty_label,
               unit_price_fc, subtotal_fc, unit_price_usd, subtotal_usd
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `);
 
           // CRITIQUE: Le stock est réduit automatiquement par le TRIGGER SQL
@@ -127,11 +127,26 @@ export class SalesRepository {
               }
             }
             
+            // Récupérer l'unité et son UUID (RÉFÉRENCE STABLE pour les triggers)
+            const productUnit = db.prepare(`
+              SELECT id, uuid FROM product_units
+              WHERE product_id = ? AND unit_level = ?
+              LIMIT 1
+            `).get(item.product_id, unitLevelForDb);
+            
+            if (!productUnit) {
+              logger.warn(`⚠️ [sales.repo] Unité introuvable pour produit ${item.product_code} (${unitLevelForDb}), créer l'unité d'abord!`);
+              continue;
+            }
+            
+            const productUnitUuid = productUnit.uuid;
+            logger.info(`   UUID de l'unité: ${productUnitUuid}`);
+            
             // Récupérer le stock AVANT réduction pour log
             const stockBefore = db.prepare(`
               SELECT stock_initial, stock_current FROM product_units
-              WHERE product_id = ? AND unit_level = ? AND unit_mark = ?
-            `).get(item.product_id, unitLevelForDb, item.unit_mark || '');
+              WHERE id = ?
+            `).get(productUnit.id);
             
             const stockBeforeInitial = stockBefore?.stock_initial || 0;
             const stockBeforeCurrent = stockBefore?.stock_current || 0;
@@ -148,6 +163,7 @@ export class SalesRepository {
               item.product_name,
               unitLevelForDb, // Utiliser la version normalisée
               item.unit_mark || '',
+              productUnitUuid, // ✅ RÉFÉRENCE STABLE à l'unité (uuid)
               qty,
               item.qty_label || qty.toString(),
               item.unit_price_fc,
@@ -164,12 +180,11 @@ export class SalesRepository {
             if (qty > 0) {
               logger.info(`   🔄 Vérification de la réduction automatique du stock par le trigger...`);
               
-              // Attendre un peu pour que le trigger s'exécute (les triggers SQLite sont synchrones)
-              // Récupérer le nouveau stock pour confirmation
+              // Récupérer le nouveau stock pour confirmation (par uuid, identifiant stable)
               const updatedUnit = db.prepare(`
                 SELECT stock_initial, stock_current FROM product_units
-                WHERE product_id = ? AND unit_level = ? AND unit_mark = ?
-              `).get(item.product_id, unitLevelForDb, item.unit_mark || '');
+                WHERE uuid = ?
+              `).get(productUnitUuid);
               
               if (!updatedUnit) {
                 logger.warn(`⚠️ [sales.repo] Unité non trouvée après insertion pour produit ${item.product_code}, unité ${unitLevelForDb}, mark ${item.unit_mark || ''}`);
@@ -430,10 +445,10 @@ export class SalesRepository {
           const itemStmt = db.prepare(`
             INSERT INTO sale_items (
               uuid, sale_id, product_id, product_code, product_name,
-              unit_level, unit_mark, qty, qty_label,
+              unit_level, unit_mark, product_unit_uuid, qty, qty_label,
               unit_price_fc, subtotal_fc, unit_price_usd, subtotal_usd
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `);
           
           // Vérifier les UUIDs existants pour éviter les doublons
@@ -486,8 +501,10 @@ export class SalesRepository {
             }
             logger.info(`   Unité normalisée: ${unitLevel}`);
             
-            // Trouver product_id si non fourni
+            // Trouver product_id et product_unit_uuid si non fournis
             let productId = item.product_id;
+            let productUnitUuid = null;
+            
             if (!productId && item.product_code) {
               const product = findProductStmt.get(item.product_code);
               if (product) {
@@ -498,6 +515,21 @@ export class SalesRepository {
               }
             } else if (productId) {
               logger.info(`   Product ID fourni: ${productId}`);
+            }
+            
+            // ✅ Récupérer l'UUID de l'unité (RÉFÉRENCE STABLE)
+            if (productId) {
+              const productUnit = db.prepare(`
+                SELECT uuid FROM product_units
+                WHERE product_id = ? AND unit_level = ?
+                LIMIT 1
+              `).get(productId, unitLevel);
+              if (productUnit) {
+                productUnitUuid = productUnit.uuid;
+                logger.info(`   Unit UUID trouvé: ${productUnitUuid}`);
+              } else {
+                logger.warn(`⚠️ Unité "${unitLevel}" non trouvée pour le produit`);
+              }
             }
             
             // Normaliser la quantité
@@ -515,6 +547,7 @@ export class SalesRepository {
                 item.product_name || '',
                 unitLevel,
                 (item.unit_mark || '').trim(),
+                productUnitUuid, // ✅ RÉFÉRENCE STABLE à l'unité (uuid)
                 qty,
                 item.qty_label || (qty ? qty.toString() : '0'),
                 item.unit_price_fc || 0,

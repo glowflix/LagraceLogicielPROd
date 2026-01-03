@@ -45,3 +45,4 @@ AppData/
 # Cache
 .cache/
 .vite/
+node_modules

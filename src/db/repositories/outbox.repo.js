@@ -85,12 +85,16 @@ export class OutboxRepository {
       // Créer une nouvelle opération
       const opId = generateUUID();
       const deviceId = this.getDeviceId();
+      const patchJson = JSON.stringify(patch);
 
       db.prepare(`
         INSERT INTO sync_operations (op_id, op_type, entity_uuid, entity_code, payload_json, device_id, status)
         VALUES (?, 'PRODUCT_PATCH', ?, ?, ?, ?, 'pending')
-      `).run(opId, entityUuid, entityCode, JSON.stringify(patch), deviceId);
+      `).run(opId, entityUuid, entityCode, patchJson, deviceId);
 
+      logger.info(`📦 [OUTBOX-INSERT] PRODUCT_PATCH: code='${entityCode}', uuid='${entityUuid}', op_id='${opId}'`);
+      logger.info(`   Payload: ${patchJson}`);
+      logger.info(`   Status: pending, Device: ${deviceId}`);
       logger.debug(`📦 [OUTBOX] Patch produit enqueued: ${entityCode} (${opId})`);
       return opId;
     } catch (error) {

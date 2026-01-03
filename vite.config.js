@@ -100,9 +100,10 @@ export default defineConfig(({ mode }) => {
     },
 
     build: {
-      outDir: 'dist',
+      outDir: 'dist/ui',
       assetsDir: 'assets',
       copyPublicDir: true,
+      emptyOutDir: true,
 
       // Electron : sourcemap souvent OFF en prod
       sourcemap: !isProd ? true : false,
