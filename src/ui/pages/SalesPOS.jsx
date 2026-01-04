@@ -20,6 +20,7 @@ import {
   Printer,
   Layers,
   Circle,
+  AlertCircle,
 } from 'lucide-react';
 import { useStore } from '../store/useStore';
 import axios from 'axios';
@@ -27,6 +28,21 @@ import { normalizeUnit, normalizeMark, getQtyPolicy, validateAndCorrectQty } fro
 
 // En mode proxy Vite, utiliser des chemins relatifs pour compatibilité LAN
 const API_URL = import.meta.env.DEV ? '' : (import.meta.env.VITE_API_URL || '');
+
+// ✅ SAFE_POLICY: Fallback garantie pour les quantités
+const SAFE_POLICY = {
+  integerOnly: false,
+  allowDecimal: true,
+  step: 1,
+  minQty: 0,
+};
+
+// ✅ Helper: obtenir une policy "safe" (jamais undefined)
+function getSafePolicy(unitLevel, unitMark) {
+  const unitNorm = normalizeUnit(unitLevel);
+  const markNorm = normalizeMark(unitMark || '');
+  return getQtyPolicy(unitNorm, markNorm) || SAFE_POLICY;
+}
 
 // Debounce hook pour performance - flush immédiat si valeur vide
 function useDebounce(value, delay) {
@@ -59,6 +75,7 @@ const SalesPOS = () => {
   const [quickQty, setQuickQty] = useState(0); // Commencer à 0 pour permettre saisie manuelle
   const [quickQtyRaw, setQuickQtyRaw] = useState(''); // Valeur brute pour permettre saisie libre
   const [quickPrice, setQuickPrice] = useState(null);
+  const [uiError, setUiError] = useState(null); // ✅ État d'erreur UI (remplace alert)
   const [sales, setSales] = useState([
     {
       id: Date.now(),
@@ -76,6 +93,13 @@ const SalesPOS = () => {
   const searchInputRef = useRef(null);
   const qtyInputRef = useRef(null);
   const clientNameInputRef = useRef(null);
+  
+  // ✅ Helper: afficher une erreur UI (remplace alert)
+  const raiseError = (msg) => {
+    setUiError(msg);
+    // Auto-hide après 3 secondes
+    setTimeout(() => setUiError(null), 3000);
+  };
   
   // Mémoire des noms de clients
   const [clientNamesHistory, setClientNamesHistory] = useState(() => {
@@ -325,9 +349,7 @@ const SalesPOS = () => {
   // Ajouter un item à la vente active (avec règles de quantité)
   const addItemToSale = useCallback((product, unit, qty, customPriceFC = null, customPriceUSD = null) => {
     // Appliquer les règles de quantité
-    const unitNorm = normalizeUnit(unit.unit_level);
-    const markNorm = normalizeMark(unit.unit_mark || '');
-    const policy = getQtyPolicy(unitNorm, markNorm);
+    const policy = getSafePolicy(unit.unit_level, unit.unit_mark);
     const correctedQty = validateAndCorrectQty(qty, policy);
     
     // S'assurer que les prix sont toujours des nombres valides
@@ -338,45 +360,56 @@ const SalesPOS = () => {
       ? Number(customPriceUSD)
       : (unit.sale_price_usd && !isNaN(unit.sale_price_usd) ? Number(unit.sale_price_usd) : 0);
     
-    const newSales = [...sales];
-    const sale = newSales[activeSaleIndex];
+    // ✅ IMMUTABLE: créer une nouvelle vente avec nouvel item
+    setSales(prev => {
+      const next = [...prev];
+      const sale = next[activeSaleIndex];
+      const items = [...(sale.items || [])];
     
-    const existingItemIndex = sale.items.findIndex(
-      item => item.product_code === product.code &&
-      item.unit_level === unit.unit_level &&
-      item.unit_mark === (unit.unit_mark || '')
-    );
+      const existingItemIndex = items.findIndex(
+        item => item.product_code === product.code &&
+        item.unit_level === unit.unit_level &&
+        item.unit_mark === (unit.unit_mark || '')
+      );
 
-    if (existingItemIndex >= 0) {
-      // Mettre à jour la quantité si le produit existe déjà (avec règles)
-      const newQty = sale.items[existingItemIndex].qty + correctedQty;
-      const finalQty = validateAndCorrectQty(newQty, policy);
-      const unitPriceFC = sale.items[existingItemIndex].unit_price_fc || priceFC;
-      const unitPriceUSD = sale.items[existingItemIndex].unit_price_usd || priceUSD;
-      sale.items[existingItemIndex].qty = finalQty;
-      sale.items[existingItemIndex].unit_price_fc = unitPriceFC;
-      sale.items[existingItemIndex].unit_price_usd = unitPriceUSD;
-      sale.items[existingItemIndex].subtotal_fc = unitPriceFC * finalQty;
-      sale.items[existingItemIndex].subtotal_usd = unitPriceUSD * finalQty;
-    } else {
-      // Ajouter un nouvel item
-      sale.items.push({
-        product_id: product.id,
-        product_code: product.code,
-        product_name: product.name,
-        unit_level: unit.unit_level,
-        unit_mark: unit.unit_mark || '',
-        qty: correctedQty,
-        qty_label: correctedQty.toString(),
-        unit_price_fc: priceFC,
-        unit_price_usd: priceUSD,
-        subtotal_fc: priceFC * correctedQty,
-        subtotal_usd: priceUSD * correctedQty,
-        qty_step: unit.qty_step || 1,
-      });
-    }
+      if (existingItemIndex >= 0) {
+        // Mettre à jour la quantité si le produit existe déjà (avec règles)
+        const newQty = items[existingItemIndex].qty + correctedQty;
+        const finalQty = validateAndCorrectQty(newQty, policy);
+        const unitPriceFC = items[existingItemIndex].unit_price_fc || priceFC;
+        const unitPriceUSD = items[existingItemIndex].unit_price_usd || priceUSD;
+        
+        // ✅ IMMUTABLE: créer un nouvel objet item
+        items[existingItemIndex] = {
+          ...items[existingItemIndex],
+          qty: finalQty,
+          unit_price_fc: unitPriceFC,
+          unit_price_usd: unitPriceUSD,
+          subtotal_fc: unitPriceFC * finalQty,
+          subtotal_usd: unitPriceUSD * finalQty,
+        };
+      } else {
+        // Ajouter un nouvel item
+        items.push({
+          product_id: product.id,
+          product_code: product.code,
+          product_name: product.name,
+          unit_level: unit.unit_level,
+          unit_mark: unit.unit_mark || '',
+          qty: correctedQty,
+          qty_label: correctedQty.toString(),
+          unit_price_fc: priceFC,
+          unit_price_usd: priceUSD,
+          subtotal_fc: priceFC * correctedQty,
+          subtotal_usd: priceUSD * correctedQty,
+          qty_step: unit.qty_step || 1,
+        });
+      }
 
-    setSales(newSales);
+      next[activeSaleIndex] = { ...sale, items };
+      return next;
+    });
+
     setSearchQuery('');
     setSelectedProductUnits([]);
     // Réinitialiser la sélection du produit après ajout
@@ -391,7 +424,7 @@ const SalesPOS = () => {
         searchInputRef.current.focus();
       }
     }, 100);
-  }, [sales, activeSaleIndex]);
+  }, [activeSaleIndex]);
 
   // ✅ Retirer un item de la vente (IMMUTABLE)
   const removeItemFromSale = useCallback((itemIndex) => {
@@ -419,9 +452,7 @@ const SalesPOS = () => {
       }
       normalizedQty = Math.round(Number(normalizedQty) * 100) / 100;
       
-      const unitNorm = normalizeUnit(item.unit_level);
-      const markNorm = normalizeMark(item.unit_mark || '');
-      const policy = getQtyPolicy(unitNorm, markNorm) || SAFE_POLICY;
+      const policy = getSafePolicy(item.unit_level, item.unit_mark);
       const correctedQty = validateAndCorrectQty(normalizedQty, policy);
       
       const unitPriceFC = Number(item.unit_price_fc) || 0;
@@ -529,17 +560,19 @@ const SalesPOS = () => {
 
     const sale = sales[saleIndex];
     if (sale.items.length === 0) {
-      alert('Le panier est vide');
+      raiseError('Le panier est vide');
       return;
     }
 
     // Vérifier le nom du client (obligatoire)
     if (!sale.clientName || sale.clientName.trim() === '') {
-      alert('Le nom du client est obligatoire');
-      if (clientNameInputRef.current) {
-        clientNameInputRef.current.focus();
-        clientNameInputRef.current.select();
-      }
+      raiseError('Le nom du client est obligatoire');
+      setShowClientSuggestions(true);
+      setFocusedField('client');
+      requestAnimationFrame(() => {
+        clientNameInputRef.current?.focus();
+        clientNameInputRef.current?.select();
+      });
       return;
     }
 
@@ -695,7 +728,7 @@ const SalesPOS = () => {
         console.error('❌ [SalesPOS] Status:', error.response.status);
         console.error('❌ [SalesPOS] Data:', error.response.data);
       }
-      alert('Erreur lors de la finalisation de la vente');
+      raiseError('Erreur lors de la finalisation de la vente');
     } finally {
       setProcessing(false);
       console.log('🏁 [SalesPOS] Finalisation terminée, processing = false');
@@ -740,6 +773,23 @@ const SalesPOS = () => {
           </div>
         </div>
       </div>
+
+      {/* ✅ Message d'erreur UI (remplace alert) */}
+      <AnimatePresence>
+        {uiError && (
+          <motion.div
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -10 }}
+            className="card p-3 border-2 border-red-500/40 bg-red-500/10 text-red-200 text-sm shadow-lg"
+          >
+            <div className="flex items-start gap-2">
+              <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
+              <p>{uiError}</p>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <div className="space-y-4">
         {/* Onglets des clients - En haut de la page (compact) */}
@@ -904,9 +954,9 @@ const SalesPOS = () => {
                     
                     return (
                       <motion.div
-                        initial={{ opacity: 0, y: -5, scale: 0.95 }}
-                        animate={{ opacity: 1, y: 0, scale: 1 }}
-                        exit={{ opacity: 0, y: -5, scale: 0.95 }}
+                        initial={{ opacity: 0, y: -5, scale: 0.95, pointerEvents: 'none' }}
+                        animate={{ opacity: 1, y: 0, scale: 1, pointerEvents: 'auto' }}
+                        exit={{ opacity: 0, y: -5, scale: 0.95, pointerEvents: 'none' }}
                         transition={{ duration: 0.2, ease: [0.25, 0.1, 0.25, 1] }}
                         className="absolute z-[300] w-full mt-1.5 bg-gradient-to-br from-green-900/98 via-green-800/98 to-teal-900/98 backdrop-blur-lg rounded-xl border-2 border-green-500/50 shadow-2xl overflow-hidden"
                         style={{
@@ -1447,9 +1497,9 @@ const SalesPOS = () => {
                     {/* ✅ Afficher seulement si searchQuery non vide pour éviter overlay qui bloque */}
                     {searchQuery.trim().length > 0 && debouncedSearch.trim() && groupedFilteredProducts.length === 0 && (
                       <motion.div
-                        initial={{ opacity: 0, y: -5 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        exit={{ opacity: 0, y: -5 }}
+                        initial={{ opacity: 0, y: -5, pointerEvents: 'none' }}
+                        animate={{ opacity: 1, y: 0, pointerEvents: 'auto' }}
+                        exit={{ opacity: 0, y: -5, pointerEvents: 'none' }}
                         className="absolute z-[100] w-full mt-1.5 bg-dark-800/95 backdrop-blur-lg rounded-xl border-2 border-gray-600/40 shadow-xl p-4"
                         style={{
                           top: '100%',
@@ -1563,9 +1613,7 @@ const SalesPOS = () => {
 
                 {/* Quantité avec règles strictes */}
                 {(() => {
-                  const unitNorm = selectedUnit ? normalizeUnit(selectedUnit.unit_level) : null;
-                  const markNorm = selectedUnit ? normalizeMark(selectedUnit.unit_mark || '') : '';
-                  const policy = unitNorm ? getQtyPolicy(unitNorm, markNorm) : null;
+                  const policy = selectedUnit ? getSafePolicy(selectedUnit.unit_level, selectedUnit.unit_mark) : null;
                   
                   return (
                     <div>
@@ -1763,7 +1811,7 @@ const SalesPOS = () => {
                       onClick={() => {
                         const unitNorm = normalizeUnit(selectedUnit.unit_level);
                         const markNorm = normalizeMark(selectedUnit.unit_mark || '');
-                        const policy = getQtyPolicy(unitNorm, markNorm);
+                        const policy = getSafePolicy(selectedUnit.unit_level, selectedUnit.unit_mark);
                         
                         if (quickQty <= 0) return;
                         
@@ -1804,9 +1852,7 @@ const SalesPOS = () => {
                       disabled={(() => {
                         if (productInCart) return true;
                         if (quickQty <= 0) return true;
-                        const unitNorm = normalizeUnit(selectedUnit.unit_level);
-                        const markNorm = normalizeMark(selectedUnit.unit_mark || '');
-                        const policy = getQtyPolicy(unitNorm, markNorm);
+                        const policy = getSafePolicy(selectedUnit.unit_level, selectedUnit.unit_mark);
                         if (policy.integerOnly) {
                           if (!Number.isInteger(quickQty) || quickQty < 1) return true;
                         }
@@ -2151,9 +2197,7 @@ const CartItem = ({ item, itemIndex, currency, onRemove, onUpdateQty, onUpdatePr
 
       {/* Quantité - Design amélioré avec animations fluides */}
       {(() => {
-        const unitNorm = normalizeUnit(item.unit_level);
-        const markNorm = normalizeMark(item.unit_mark || '');
-        const policy = getQtyPolicy(unitNorm, markNorm);
+        const policy = getSafePolicy(item.unit_level, item.unit_mark);
         
         return (
       <div className="col-span-2 flex items-center justify-center gap-2">

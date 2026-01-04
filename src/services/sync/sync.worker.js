@@ -396,6 +396,13 @@ export class SyncWorker {
         await this.pushStockMoves(stockMoves);
       }
       
+      // 4. Push des dettes (DEBT)
+      const debts = outboxRepo.getPendingOperations('DEBT', 50);
+      if (debts.length > 0) {
+        syncLogger.info(`   💳 [DEBT] ${debts.length} dette(s) à envoyer`);
+        await this.pushDebts(debts);
+      }
+      
       // Réessayer les opérations en erreur (max 3 tentatives)
       outboxRepo.retryErrorOperations();
       
@@ -403,7 +410,7 @@ export class SyncWorker {
       
       // CRITIQUE: Après un push réussi, déclencher un pull pour recevoir les mises à jour depuis Sheets
       // Cela libère les produits pour accepter les modifications venant de Sheets
-      const pushedCount = (productPatches.length || 0) + (unitPatches.length || 0) + (stockMoves.length || 0);
+      const pushedCount = (productPatches.length || 0) + (unitPatches.length || 0) + (stockMoves.length || 0) + (debts.length || 0);
       const elapsed = Date.now() - pushStartTime;
       syncLogger.info(`✅ [PUSH-SYNC] ${pushedCount} opération(s) envoyée(s) avec succès en ${elapsed}ms`);
       
@@ -509,9 +516,15 @@ export class SyncWorker {
       }
 
       // 🔴 CRITIQUE: Extraire le NOM du produit
-      const finalName = payloadData.name !== undefined && payloadData.name !== null
+      // ✅ FIX E: Fallback à fullProduct.name si payload.name absent (ne jamais envoyer '')
+      let finalName = (payloadData.name !== undefined && payloadData.name !== null)
         ? String(payloadData.name).trim()
         : '';
+      
+      // Si finalName est vide, utiliser la valeur DB (sera chargée après)
+      if (finalName === '' && fullProduct?.name) {
+        finalName = String(fullProduct.name).trim();
+      }
       
       syncLogger.info(`    📝 NAME EXTRACTION:`);
       syncLogger.info(`       ├─ payload.name: ${payloadData.name === undefined ? 'undefined' : `'${payloadData.name}'`}`);
@@ -702,12 +715,17 @@ export class SyncWorker {
           syncLogger.info(`        ✅ Batch traité avec succès (${batch.length} child ops)`);
         } else {
           syncLogger.error(`        ❌ Batch ÉCHOUÉ: ${result.error || 'unknown error'}`);
-          // Marquer comme erreur pour retry (on marque l'op_id enfant, pas le parent)
+          // ✅ FIX D: Marquer l'erreur sur le PARENT op_id, pas sur les enfants
+          const parentIdsToError = new Set();
           for (const op of batch) {
-            try {
-              outboxRepo.markAsError(op.op_id, result.error || 'Batch failed');
-            } catch (e) {
-              syncLogger.warn(`           ⚠️ Erreur markAsError: ${e.message}`);
+            const parentId = op.payload?.parent_op_id || op.op_id.split(':')[0];
+            if (parentId && !parentIdsToError.has(parentId)) {
+              try {
+                outboxRepo.markAsError(parentId, result.error || 'Batch failed');
+                parentIdsToError.add(parentId);
+              } catch (e) {
+                syncLogger.warn(`           ⚠️ Erreur markAsError parent ${parentId}: ${e.message}`);
+              }
             }
           }
         }
@@ -716,12 +734,17 @@ export class SyncWorker {
         syncLogger.error(`           Code: ${err.code || 'N/A'}`);
         syncLogger.error(`           Stack: ${err.stack ? err.stack.substring(0, 200) : 'N/A'}`);
         
-        // Marquer comme erreur pour retry
+        // ✅ FIX D: Marquer l'erreur sur le PARENT op_id, pas sur les enfants
+        const parentIdsToError = new Set();
         for (const op of batch) {
-          try {
-            outboxRepo.markAsError(op.op_id, `HTTP Error: ${err.message}`);
-          } catch (e) {
-            syncLogger.warn(`           ⚠️ Erreur markAsError: ${e.message}`);
+          const parentId = op.payload?.parent_op_id || op.op_id.split(':')[0];
+          if (parentId && !parentIdsToError.has(parentId)) {
+            try {
+              outboxRepo.markAsError(parentId, `HTTP Error: ${err.message}`);
+              parentIdsToError.add(parentId);
+            } catch (e) {
+              syncLogger.warn(`           ⚠️ Erreur markAsError parent ${parentId}: ${e.message}`);
+            }
           }
         }
       }
@@ -913,34 +936,49 @@ export class SyncWorker {
       const result = await sheetsClient.pushBatch(ops, { timeout: 9000 });
       
       if (result.success || result.applied) {
-        // Marquer les opérations appliquées comme confirmées
-        const appliedIds = new Set((result.applied || []).map(a => a.op_id));
-        
+        // ✅ FIX C: ACK TOUS les op_ids regroupés, pas juste le premier
+        const allAckIds = [];
         for (const op of ops) {
-          if (appliedIds.has(op.op_id) || result.success) {
-            ackedOpIds.push(op.op_id);
-            // Marquer aussi les move_ids associés
-            if (op.payload.move_ids) {
-              ackedMoveIds.push(...op.payload.move_ids);
+          // Récupérer tous les op_ids regroupés (stockés dans payload.op_ids)
+          const idsToAck = op.payload.op_ids || [op.op_id];
+          allAckIds.push(...idsToAck);
+          // Marquer aussi les move_ids associés
+          if (op.payload.move_ids) {
+            ackedMoveIds.push(...op.payload.move_ids);
+          }
+        }
+        const uniqueAckIds = [...new Set(allAckIds)];
+        ackedOpIds.push(...uniqueAckIds);
+        
+        syncLogger.info(`      ✅ ${uniqueAckIds.length} opération(s) stock confirmée(s) (ack tous les op_ids regroupés)`);
+      } else {
+        // ✅ FIX C: Marquer TOUS les op_ids regroupés en erreur
+        const errorOpIds = new Set();
+        for (const op of ops) {
+          const idsToError = op.payload.op_ids || [op.op_id];
+          for (const id of idsToError) {
+            if (!errorOpIds.has(id)) {
+              outboxRepo.markAsError(id, result.error || 'Erreur push stock');
+              errorOpIds.add(id);
             }
           }
         }
-        
-        syncLogger.info(`      ✅ ${ackedOpIds.length} mouvement(s) stock confirmé(s)`);
-      } else {
-        // En cas d'erreur
-        for (const op of ops) {
-          outboxRepo.markAsError(op.op_id, result.error || 'Erreur push stock');
-        }
-        syncLogger.warn(`      ⚠️ Erreur mouvements stock: ${result.error}`);
+        syncLogger.warn(`      ⚠️ Erreur mouvements stock: ${result.error} (${errorOpIds.size} op_ids marqués en erreur)`);
         return;
       }
     } catch (error) {
-      // Marquer tous les ops en erreur
+      // ✅ FIX C: Marquer TOUS les op_ids regroupés en erreur
+      const errorOpIds = new Set();
       for (const op of ops) {
-        outboxRepo.markAsError(op.op_id, error.message);
+        const idsToError = op.payload.op_ids || [op.op_id];
+        for (const id of idsToError) {
+          if (!errorOpIds.has(id)) {
+            outboxRepo.markAsError(id, error.message);
+            errorOpIds.add(id);
+          }
+        }
       }
-      syncLogger.error(`      ❌ Exception push stock: ${error.message}`);
+      syncLogger.error(`      ❌ Exception push stock: ${error.message} (${errorOpIds.size} op_ids marqués en erreur)`);
       return;
     }
     
@@ -950,6 +988,74 @@ export class SyncWorker {
     }
     if (ackedMoveIds.length > 0) {
       outboxRepo.markStockMovesSynced(ackedMoveIds);
+    }
+  }
+
+  /**
+   * Push les dettes vers Google Sheets (Dettes tab)
+   * DEBT_PUSH operations: envoie chaque dette en upsert
+   */
+  async pushDebts(debtOps) {
+    if (!debtOps || debtOps.length === 0) {
+      syncLogger.debug('   📭 Aucune dette à envoyer');
+      return;
+    }
+
+    const ackedOpIds = [];
+    
+    try {
+      syncLogger.info(`      📤 Push ${debtOps.length} dette(s) via batchPush vers Sheets`);
+      
+      // Construire les opérations batch pour les dettes
+      const ops = debtOps.map((op) => {
+        const payload = this.parseOpPayload(op);
+        return {
+          op_id: op.op_id,
+          entity: 'debts',
+          op: 'upsert',
+          payload: {
+            uuid: payload.uuid || op.entity_uuid,
+            invoice_number: payload.invoice_number || op.entity_code,
+            client_name: payload.client_name || '',
+            client_phone: payload.client_phone || null,
+            product_description: payload.product_description || null,
+            total_fc: payload.total_fc || 0,
+            paid_fc: payload.paid_fc || 0,
+            remaining_fc: payload.remaining_fc || 0,
+            total_usd: payload.total_usd || 0,
+            debt_fc_in_usd: payload.debt_fc_in_usd || null,
+            status: payload.status || 'open',
+            note: payload.note || null
+          }
+        };
+      });
+      
+      // Envoyer via batchPush
+      const result = await sheetsClient.pushBatch(ops, { timeout: 9000 });
+      
+      if (result.success || result.applied) {
+        ackedOpIds.push(...debtOps.map(op => op.op_id));
+        syncLogger.info(`      ✅ ${debtOps.length} dette(s) envoyée(s) avec succès`);
+      } else {
+        // Marquer en erreur
+        for (const op of debtOps) {
+          outboxRepo.markAsError(op.op_id, result.error || 'Erreur push dettes');
+        }
+        syncLogger.warn(`      ⚠️ Erreur envoi dettes: ${result.error}`);
+        return;
+      }
+    } catch (error) {
+      // Marquer en erreur
+      for (const op of debtOps) {
+        outboxRepo.markAsError(op.op_id, error.message);
+      }
+      syncLogger.error(`      ❌ Exception push dettes: ${error.message}`);
+      return;
+    }
+    
+    // Marquer dans la BD comme ackés
+    if (ackedOpIds.length > 0) {
+      outboxRepo.markAsAcked(ackedOpIds);
     }
   }
   
@@ -1094,19 +1200,18 @@ export class SyncWorker {
         syncLogger.info(`   📍 [SALES-SYNC] Cursor: ${cursorStr.length > 50 ? cursorStr.substring(0, 50) + '...' : cursorStr}`);
       } else {
         // Pas de cursor = Synchronisation incrémentale ou import initial
-        const lastPullDate = syncRepo.getLastPullDate('sales');
+        // ✅ FIX A: Utiliser sinceIsoWithSkew pour ISO strict
+        const lastPullDateIso = syncRepo.getLastPullDate('sales');
         
-        if (lastPullDate) {
+        if (lastPullDateIso) {
           // Synchronisation incrémentale : seulement les ventes modifiées/ajoutées depuis lastPullDate
-          // IMPORTANT: Utiliser une date légèrement antérieure pour éviter de manquer des ventes
-          // (à cause des différences de temps entre serveurs ou des arrondis)
-          const adjustedDate = new Date(lastPullDate.getTime() - 60000); // Soustraire 1 minute pour sécurité
+          // ✅ CORRECTION: ISO strict avec marge 60s (pas de Date object)
+          sinceDate = sinceIsoWithSkew(lastPullDateIso, 60_000);
           syncMode = 'SYNC INCRÉMENTALE (mises à jour seulement)';
-          sinceDate = adjustedDate.toISOString();
           isIncrementalSync = true;
           syncLogger.info(`   🔄 [SALES-SYNC] Mode: ${syncMode}`);
-          syncLogger.info(`   📅 [SALES-SYNC] Dernière sync: ${lastPullDate.toISOString()} (${lastPullDate.toLocaleString('fr-FR')})`);
-          syncLogger.info(`   📅 [SALES-SYNC] Date ajustée (sécurité -1min): ${sinceDate} (${new Date(sinceDate).toLocaleString('fr-FR')})`);
+          syncLogger.info(`   📅 [SALES-SYNC] Dernière sync: ${lastPullDateIso}`);
+          syncLogger.info(`   📅 [SALES-SYNC] Date avec skew 60s: ${sinceDate}`);
           syncLogger.info(`   📥 [SALES-SYNC] Téléchargement des ventes modifiées/ajoutées depuis cette date`);
         } else {
           // Pas de lastPullDate = Import initial complet
@@ -3193,6 +3298,29 @@ export class SyncWorker {
     if (insertedCount + updatedCount > 0) {
       syncLogger.info(`   🎉 [SQL] ${insertedCount + updatedCount} produit(s) maintenant STOCKÉ(S) dans SQLite et DISPONIBLE(S) dans la page Produits!`);
       syncLogger.info(`   📊 [SQL] Vérification: SELECT COUNT(*) FROM products WHERE is_active = 1; devrait retourner au moins ${insertedCount + updatedCount} ligne(s)`);
+      
+      // ✅ SOCKET.IO: Émettre un event pour rafraîchir ProduitsPage.jsx en temps réel
+      // Sans cet event, la page resterait figée même si SQLite a été mis à jour
+      try {
+        const { getSocketIO } = await import('../../api/socket.js');
+        const io = getSocketIO();
+        if (io) {
+          const eventData = {
+            ts: new Date().toISOString(),
+            count: insertedCount + updatedCount,
+            inserted: insertedCount,
+            updated: updatedCount,
+            source: 'SHEETS'
+          };
+          io.emit('products:updated', eventData);
+          syncLogger.info(`   📡 [SOCKET.IO] Event 'products:updated' émis: ${insertedCount + updatedCount} produit(s) mis à jour`);
+        } else {
+          syncLogger.debug(`   ⚠️  [SOCKET.IO] Aucune instance Socket.IO disponible (mode hors ligne ou test)`);
+        }
+      } catch (ioError) {
+        syncLogger.debug(`   ⚠️  [SOCKET.IO] Erreur émission event (non bloquant): ${ioError.message}`);
+        // Ne pas bloquer la sync si problème Socket.IO
+      }
     }
     
     return { inserted: insertedCount, updated: updatedCount, skipped: skippedPendingCount };
@@ -4004,8 +4132,8 @@ export class SyncWorker {
         syncLogger.info(`      📋 [SQL] Reste: ${item.remaining_fc !== undefined ? item.remaining_fc : (item.total_fc || 0) - (item.paid_fc || 0)} FC`);
         syncLogger.info(`      📋 [SQL] Status: ${item.status || 'open'}`);
         
-        // Générer un UUID si non fourni
-        const debtUuid = item.uuid || null;
+        // Générer un UUID si non fourni (laisser undefined si pas fourni, le repo générera un UUID stable)
+        const debtUuid = item.uuid || undefined;
         
         const debtData = {
           uuid: debtUuid,
@@ -4025,7 +4153,13 @@ export class SyncWorker {
         
         syncLogger.debug(`      📋 Données complètes: ${JSON.stringify(debtData).substring(0, 400)}...`);
         
+        // VÉRIFICATION: Log du UUID avant le upsert
+        syncLogger.info(`      🔑 [UUID] AVANT upsert: item.uuid='${item.uuid || 'N/A'}', debtUuid='${debtUuid || 'N/A'}' (undefined=${debtUuid === undefined})`);
+        
         const upsertResult = debtsRepo.upsert(debtData);
+        
+        // VÉRIFICATION: Log du UUID après le upsert
+        syncLogger.info(`      🔑 [UUID] APRÈS upsert: upsertResult.uuid='${upsertResult?.uuid || 'N/A'}'`);
         
         const itemDuration = Date.now() - itemStartTime;
         if (isNew) {

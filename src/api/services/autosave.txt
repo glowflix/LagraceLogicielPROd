@@ -1,0 +1,264 @@
+import { logger } from '../../core/logger.js';
+import { getDb } from '../../db/sqlite.js';
+import { productsRepo } from '../../db/repositories/products.repo.js';
+import { syncRepo } from '../../db/repositories/sync.repo.js';
+import { outboxRepo } from '../../db/repositories/outbox.repo.js';
+import { getSocketIO } from '../socket.js';
+
+/**
+ * Service de synchronisation automatique intelligente
+ * 
+ * Architecture offline-first avec 2 phases par cycle :
+ * 1) PUSH : envoyer les opérations locales (outbox) vers Sheets
+ * 2) PULL : récupérer les changements distants depuis dernier cursor
+ * 
+ * - Sync incrémentale (cursor-based)
+ * - Gestion des conflits (outbox + remote = skip pull apply)
+ * - Transactions pour atomicité
+ * - setTimeout auto-planifié (meilleur que setInterval)
+ * - Stats détaillées + Socket events
+ */
+class AutoSyncService {
+  constructor({
+    intervalMs = 10_000,
+    pullBatchSize = 500,
+    outboxBatchSize = 200,
+  } = {}) {
+    this.intervalMs = intervalMs;
+    this.pullBatchSize = pullBatchSize;
+    this.outboxBatchSize = outboxBatchSize;
+
+    this.isRunning = false;
+    this.syncInProgress = false;
+    this.timer = null;
+
+    this.lastSyncTime = new Date(0);
+    this.statsLastSync = {
+      checked: 0,
+      pushed: 0,
+      pulled: 0,
+      applied: 0,
+      skipped: 0,
+      pending: 0,
+      conflicts: 0,
+      errors: 0,
+      duration: 0,
+    };
+  }
+
+  start() {
+    if (this.isRunning) {
+      logger.warn('⚠️  [AutoSync] Déjà en cours d\'exécution');
+      return;
+    }
+
+    this.isRunning = true;
+    logger.info(`🔄 [AutoSync] Démarrage (intervalle: ${this.intervalMs}ms, pull batch: ${this.pullBatchSize}, push batch: ${this.outboxBatchSize})`);
+
+    // Lancer immédiatement
+    this._scheduleNext(0);
+  }
+
+  stop() {
+    this.isRunning = false;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+    logger.info('⏹️  [AutoSync] Arrêté');
+  }
+
+  _scheduleNext(delayMs) {
+    if (!this.isRunning) return;
+    this.timer = setTimeout(async () => {
+      if (!this.isRunning) return;
+      await this.performSync();
+      this._scheduleNext(this.intervalMs);
+    }, delayMs);
+  }
+
+  async performSync() {
+    if (this.syncInProgress) return;
+
+    this.syncInProgress = true;
+    const traceId = `sync_${Date.now()}`;
+    const start = Date.now();
+
+    const stats = {
+      checked: 0,
+      pushed: 0,
+      pulled: 0,
+      applied: 0,
+      skipped: 0,
+      pending: 0,
+      conflicts: 0,
+      errors: 0,
+      duration: 0,
+    };
+
+    try {
+      logger.debug(`📡 [AutoSync:${traceId}] Cycle start`);
+
+      // 0) Sanity: s'il n'y a aucun produit local, skip
+      const localProducts = productsRepo.findAll();
+      if (!Array.isArray(localProducts) || localProducts.length === 0) {
+        logger.debug(`ℹ️  [AutoSync:${traceId}] Aucun produit local, skip`);
+        return;
+      }
+      stats.checked = localProducts.length;
+
+      // 1) Charger l'outbox pending (pour filtrer + push)
+      const pendingOps = outboxRepo.getPendingOperations(null, 1000);
+      const productsInOutbox = new Set(
+        pendingOps.map(op => op.entity_code).filter(Boolean)
+      );
+      stats.pending = productsInOutbox.size;
+
+      // 2) PUSH outbox (batch incrémental)
+      stats.pushed += await this._pushOutbox(traceId);
+
+      // 3) PULL remote incrémental (cursor-based)
+      const cursorKey = 'products:last_pull_cursor';
+      let lastCursor = null;
+      
+      try {
+        lastCursor = await syncRepo.getCursor(cursorKey);
+      } catch (e) {
+        logger.debug(`[AutoSync:${traceId}] Cursor non disponible, utilise lastSyncTime`);
+      }
+
+      const sinceIso = lastCursor || this.lastSyncTime.toISOString();
+      logger.debug(`[AutoSync:${traceId}] Pull depuis: ${sinceIso}`);
+
+      let remoteChanged = [];
+      try {
+        remoteChanged = await syncRepo.pullProductsSince(sinceIso, this.pullBatchSize);
+      } catch (e) {
+        logger.warn(`[AutoSync:${traceId}] Pull failed (offline?): ${e?.message || e}`);
+        // Continue même offline (données locales restent valables)
+        remoteChanged = [];
+      }
+
+      stats.pulled = Array.isArray(remoteChanged) ? remoteChanged.length : 0;
+
+      // 4) Appliquer les changements distants en transaction
+      if (stats.pulled > 0) {
+        const db = getDb();
+
+        try {
+          db.transaction(() => {
+            for (const remote of remoteChanged) {
+              const code = remote.code || remote.entity_code;
+
+              // Conflit: outbox pending + remote change => skip apply
+              if (code && productsInOutbox.has(code)) {
+                stats.conflicts++;
+                logger.warn(`⚔️  [AutoSync:${traceId}] Conflit: ${code} (outbox pending) -> skip apply`);
+                continue;
+              }
+
+              // Upsert remote en local
+              try {
+                productsRepo.upsertFromRemote(remote, db);
+                stats.applied++;
+              } catch (e) {
+                logger.error(`❌ [AutoSync:${traceId}] Upsert failed [${code}]: ${e?.message || e}`);
+                stats.errors++;
+              }
+            }
+          })();
+
+          // 5) Mettre à jour le cursor au max remote timestamp
+          const maxRemoteTs = remoteChanged
+            .map(r => new Date(r.updated_at || r._remote_updated_at || 0).getTime())
+            .reduce((a, b) => Math.max(a, b), 0);
+
+          if (maxRemoteTs > 0) {
+            try {
+              await syncRepo.setCursor(cursorKey, new Date(maxRemoteTs).toISOString());
+            } catch (e) {
+              logger.warn(`[AutoSync:${traceId}] setCursor failed: ${e?.message || e}`);
+            }
+          }
+        } catch (e) {
+          logger.error(`❌ [AutoSync:${traceId}] Transaction failed: ${e?.message || e}`);
+          stats.errors++;
+        }
+      } else {
+        stats.skipped = stats.checked;
+      }
+
+      const duration = Date.now() - start;
+      stats.duration = duration;
+      this.statsLastSync = { ...stats };
+      this.lastSyncTime = new Date();
+
+      // 6) Socket events UI
+      const io = getSocketIO();
+      if (io && (stats.applied > 0 || stats.pushed > 0)) {
+        io.emit('products:synced', {
+          traceId,
+          ...stats,
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      logger.info(
+        `🎯 [AutoSync:${traceId}] done | pushed=${stats.pushed} pulled=${stats.pulled} applied=${stats.applied} ` +
+        `pending=${stats.pending} conflicts=${stats.conflicts} errors=${stats.errors} (${duration}ms)`
+      );
+    } catch (e) {
+      stats.errors++;
+      logger.error(`❌ [AutoSync] Cycle error: ${e?.message || e}`);
+    } finally {
+      this.syncInProgress = false;
+    }
+  }
+
+  async _pushOutbox(traceId) {
+    let pushed = 0;
+
+    // Boucle: pull batches de pending ops, push, mark done, répéter
+    while (true) {
+      const ops = outboxRepo.getPendingOperations(null, this.outboxBatchSize);
+      if (!ops || ops.length === 0) break;
+
+      try {
+        logger.debug(`📤 [AutoSync:${traceId}] Outbox push batch size=${ops.length}`);
+
+        // IMPORTANT: push idempotent (op.uuid / op_id unique)
+        await syncRepo.pushOutboxBatch(ops);
+
+        // Marquer done localement
+        if (typeof outboxRepo.markBatchDone === 'function') {
+          outboxRepo.markBatchDone(ops.map(o => o.id));
+        } else if (typeof outboxRepo.markDone === 'function') {
+          for (const op of ops) {
+            outboxRepo.markDone(op.id);
+          }
+        }
+
+        pushed += ops.length;
+        logger.debug(`✅ [AutoSync:${traceId}] Outbox batch done, total pushed=${pushed}`);
+      } catch (e) {
+        logger.error(`❌ [AutoSync:${traceId}] Outbox push failed: ${e?.message || e}`);
+        // Stop push pour ce cycle (retry prochain)
+        break;
+      }
+    }
+
+    return pushed;
+  }
+
+  /**
+   * Retourne les stats du dernier sync
+   */
+  getStats() {
+    return {
+      isRunning: this.isRunning,
+      lastSyncTime: this.lastSyncTime.toISOString(),
+      ...this.statsLastSync,
+    };
+  }
+}
+
+// Exporter singleton
+export const autoSyncService = new AutoSyncService();

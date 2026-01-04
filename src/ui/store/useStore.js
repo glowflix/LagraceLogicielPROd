@@ -446,6 +446,13 @@ export const useStore = create(
           get().loadProducts();
         });
 
+        // ✅ Écouter les mises à jour batch de produits depuis Google Sheets
+        socket.on('products:updated', (data) => {
+          // Recharger les produits pour avoir les données à jour
+          // (Plus simple qu'essayer de mettre à jour les produits partiellement)
+          get().loadProducts();
+        });
+
         socket.on('sale:updated', (sale) => {
           set((state) => ({
             sales: state.sales.map((s) =>

@@ -26,7 +26,9 @@ import ratesRoutes from './routes/rates.routes.js';
 import analyticsRoutes from './routes/analytics.routes.js';
 import syncRoutes from './routes/sync.routes.js';
 import licenseRoutes from './routes/license.routes.js';
+import autosyncRoutes from './routes/autosync.routes.js';
 import autoStockRouter, { startAutoCheck, stopAutoCheck } from './routes/router.autostock.js';
+import { autoSyncService } from './services/autoSync.service.js';
 
 // Middlewares
 import { errorHandler, notFound } from './middlewares/errors.js';
@@ -86,11 +88,15 @@ console.log(`[INIT] process.cwd()=${process.cwd()}`);
 // === AI LaGrace - Configuration automatique ===
 const AI_ENABLED = process.env.AI_LAGRACE_ENABLED !== 'false';
 let AI_AUTOSTART = process.env.AI_LAGRACE_AUTOSTART !== 'false';
-// ✅ NE PAS figer IS_ELECTRON dans une const - utiliser isElectronRuntime() directement
+// ✅ EN PRODUCTION: l'IA est lancée par Electron via startAI() → AI_AUTOSTART = false ici
+// ✅ EN DÉVELOPPEMENT (web): l'IA peut être lancée via API /api/ai/start → AI_AUTOSTART = false aussi
+// ✅ JAMAIS d'autostart dans server.js, car:
+//    - En EXE Electron: Electron lance l'IA seul
+//    - En web: l'utilisateur démarre l'IA via le UI/API
 if (isElectronRuntime()) {
-  // Electron gère l'IA seul (démarre via npm run dev concurrently)
+  // Electron gère l'IA seul
   AI_AUTOSTART = false;
-} else if (AI_ENABLED) {
+} else {
   // Navigateur web: l'IA démarre à la demande (via API /api/ai/start)
   AI_AUTOSTART = false;
 }
@@ -100,10 +106,16 @@ logger.info(`[AI] Détection: isElectron=${isElectronRuntime()}, AI_ENABLED=${AI
 // DIST_DIR sera défini dans startBackend()
 let DIST_DIR = null;
 
-const AI_DIR = resolve(getProjectRoot(), 'ai-lagrace');
-const AI_MAIN = resolve(AI_DIR, 'main.py');
+// ✅ Détection: en production (packaged), l'IA est un EXE; en dev, c'est un script Python
+const AI_DIR_PROD = resolve(getResourcesRoot(), 'ai');
+const AI_DIR_DEV = resolve(getProjectRoot(), 'ai-lagrace');
+const AI_DIR = DIST_DIR ? AI_DIR_PROD : AI_DIR_DEV;  // Sera mis à jour dans startBackend()
+const AI_MAIN_PROD = resolve(AI_DIR_PROD, 'ai-lagrace', 'ai-lagrace.exe');  // EXE compilé en prod
+const AI_MAIN_DEV = resolve(AI_DIR_DEV, 'main.py');  // Script Python en dev
+
 let aiProcess = null;
 let aiStopping = false;
+let isPackaged = false;  // Sera défini depuis DIST_DIR
 
 function checkPython() {
   return new Promise((resolveCheck) => {
@@ -128,44 +140,69 @@ async function startAI() {
     logger.info('[AI] Autostart désactivé pour AI LaGrace (gérée par Electron)');
     return;
   }
+
+  // ✅ Déterminer le chemin correct selon qu'on est en prod ou dev
+  const AI_MAIN = isPackaged ? AI_MAIN_PROD : AI_MAIN_DEV;
+  const currentAIDir = isPackaged ? AI_DIR_PROD : AI_DIR_DEV;
+
   if (!existsSync(AI_MAIN)) {
-    logger.warn('[AI] AI LaGrace non installée (main.py non trouvé)');
+    logger.warn('[AI] AI LaGrace non installée');
     logger.warn(`[AI] Chemin attendu: ${AI_MAIN}`);
     return;
   }
 
-  const hasPython = await checkPython();
-  if (!hasPython) {
-    logger.warn('[AI] Python non disponible, AI LaGrace désactivée');
-    return;
+  // ✅ En production, vérifier si l'EXE existe
+  if (isPackaged) {
+    logger.info('[AI] Mode PRODUCTION détecté - utilisation de ai-lagrace.exe');
+    logger.info('[AI] DÉMARRAGE DE AI LaGrace (exe)...');
+    logger.info(`[AI] Exécutable: ${AI_MAIN}`);
+    
+    aiStopping = false;
+    aiProcess = spawn(AI_MAIN, ['--quiet'], {
+      cwd: currentAIDir,
+      shell: false,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+      env: {
+        ...process.env,
+        PYTHONUNBUFFERED: '1',
+        PYTHONIOENCODING: 'utf-8',
+      },
+    });
+  } else {
+    // ✅ En développement, vérifier Python
+    const hasPython = await checkPython();
+    if (!hasPython) {
+      logger.warn('[AI] Python non disponible, AI LaGrace désactivée');
+      return;
+    }
+
+    logger.info('[AI] Mode DÉVELOPPEMENT détecté - utilisation de main.py');
+    logger.info('[AI] ========================================');
+    logger.info('[AI] DÉMARRAGE DE AI LaGrace (serveur)...');
+    logger.info(`[AI] Répertoire: ${currentAIDir}`);
+    logger.info(`[AI] Script: ${AI_MAIN}`);
+    logger.info('[AI] ========================================');
+
+    const pythonExe = process.platform === 'win32'
+      ? resolve(getProjectRoot(), '.venv', 'Scripts', 'python.exe')
+      : resolve(getProjectRoot(), '.venv', 'bin', 'python');
+
+    logger.info(`[AI] Python: ${pythonExe}`);
+
+    aiStopping = false;
+    aiProcess = spawn(pythonExe, ['main.py', '--quiet'], {
+      cwd: currentAIDir,
+      shell: false,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+      env: {
+        ...process.env,
+        PYTHONUNBUFFERED: '1',
+        PYTHONIOENCODING: 'utf-8',
+      },
+    });
   }
-
-  logger.info('[AI] ========================================');
-  logger.info('[AI] DÉMARRAGE DE AI LaGrace (serveur)...');
-  logger.info(`[AI] Répertoire: ${AI_DIR}`);
-  logger.info(`[AI] Script: ${AI_MAIN}`);
-  logger.info('[AI] ========================================');
-
-  // ✅ CORRECTION: Utiliser le venv Python au lieu du Python système
-  const pythonExe = process.platform === 'win32'
-    ? resolve(getProjectRoot(), '.venv', 'Scripts', 'python.exe')
-    : resolve(getProjectRoot(), '.venv', 'bin', 'python');
-
-  logger.info(`[AI] Python: ${pythonExe}`);
-
-  aiStopping = false;
-  // ✅ Utiliser shell: false pour éviter les problèmes avec espaces dans les chemins
-  aiProcess = spawn(pythonExe, ['main.py', '--quiet'], {
-    cwd: AI_DIR,
-    shell: false,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    windowsHide: true,
-    env: {
-      ...process.env,
-      PYTHONUNBUFFERED: '1',
-      PYTHONIOENCODING: 'utf-8',
-    },
-  });
 
   aiProcess.stdout.on('data', (data) => {
     const output = data.toString().trim();
@@ -359,6 +396,7 @@ app.use('/api/rates', ratesRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/sync', syncRoutes);
 app.use('/api/license', licenseRoutes);
+app.use('/api/autosync', autosyncRoutes);
 app.use('/api/autostock', autoStockRouter);
 
 // ⚠️ app.locals.db sera assignée dans startBackend() APRÈS initSchema()
@@ -533,6 +571,15 @@ export async function startBackend({
     }
   }
 
+  // ✅ DÉTECTION: Vérifie si on est en production (packaged) ou développement
+  // Cela définit aussi DIST_DIR pour startAI()
+  isPackaged = resourcesPath && resourcesPath.includes('resources');
+  DIST_DIR = resourcesPath || process.cwd();  // ressources path en prod, cwd en dev
+  
+  logger.info(`[APP] Mode: ${isPackaged ? 'PRODUCTION (packaged)' : 'DÉVELOPPEMENT'}`);
+  logger.info(`[APP] DIST_DIR=${DIST_DIR}`);
+  logger.info(`[APP] AI_DIR=${isPackaged ? resolve(DIST_DIR, 'ai') : resolve(getProjectRoot(), 'ai-lagrace')}`);
+
   // ✅ IMPORTANT: Créer les dossiers et initialiser la DB APRÈS avoir posé les env vars
   // Cela garantit que les chemins sont corrects en production (EXE)
   ensureDirs();
@@ -553,10 +600,28 @@ export async function startBackend({
   // ✅ Charger le module d'impression dynamiquement (depuis RESOURCES_ROOT/print)
   try {
     const resourcesRoot = getResourcesRoot();
-    const printModuleFile = path.join(resourcesRoot, 'print', 'module.js');
+    
+    // ✅ STRATÉGIE 1: Essayer depuis resourcesRoot (EXE mode)
+    let printModuleFile = path.join(resourcesRoot, 'print', 'module.js');
+    
+    // ✅ STRATÉGIE 2: Fallback vers le chemin de développement
+    if (!existsSync(printModuleFile)) {
+      printModuleFile = path.join(getProjectRoot(), 'print', 'module.js');
+      logger.info(`[PRINT] Module non trouvé en prod, essai mode dev: ${printModuleFile}`);
+    }
 
     if (!existsSync(printModuleFile)) {
       throw new Error(`print/module.js introuvable: ${printModuleFile}`);
+    }
+
+    logger.info(`[PRINT] Chargement du module: ${printModuleFile}`);
+    
+    // ✅ IMPORTANT: Ajouter node_modules au chemin de recherche des modules
+    // Cela garantit que les imports dynamiques du print/module.js trouvent les dépendances
+    const nodeModulesPath = path.join(getProjectRoot(), 'node_modules');
+    if (!module.paths.includes(nodeModulesPath) && existsSync(nodeModulesPath)) {
+      module.paths.unshift(nodeModulesPath);
+      logger.info(`[PRINT] Ajout node_modules au module.paths: ${nodeModulesPath}`);
     }
 
     const mod = await import(pathToFileURL(printModuleFile).href);
@@ -571,8 +636,18 @@ export async function startBackend({
     const printDir = getPrintDir(); // ✅ writable (userData)
 
     // ✅ templates/assets: idéalement depuis resources/print/*
-    const templatesDir = path.join(resourcesRoot, 'print', 'templates');
-    const assetsDir = path.join(resourcesRoot, 'print', 'assets');
+    // Fallback vers dev si pas trouvé en prod
+    let templatesDir = path.join(resourcesRoot, 'print', 'templates');
+    let assetsDir = path.join(resourcesRoot, 'print', 'assets');
+    
+    if (!existsSync(templatesDir)) {
+      templatesDir = path.join(getProjectRoot(), 'print', 'templates');
+      logger.info(`[PRINT] Templates non trouvés en prod, fallback dev: ${templatesDir}`);
+    }
+    if (!existsSync(assetsDir)) {
+      assetsDir = path.join(getProjectRoot(), 'print', 'assets');
+      logger.info(`[PRINT] Assets non trouvés en prod, fallback dev: ${assetsDir}`);
+    }
 
     // ✅ Vérifier l'existence des dossiers templates/assets
     if (!existsSync(templatesDir)) logger.warn(`[PRINT] templatesDir manquant: ${templatesDir}`);
@@ -587,12 +662,19 @@ export async function startBackend({
     });
 
     printerModuleReady = true;
-    logger.info('✅ Printer module chargé');
+    logger.info('✅ Printer module chargé avec succès');
   } catch (error) {
     printerModuleReady = false;
     printerModule = null;
-    logger.error('❌ Erreur chargement printer module:', error);
-    logger.warn('⚠️  Impression indisponible (le backend continue)');
+    logger.error('❌ Erreur chargement printer module:', error.message);
+    logger.error('   Stack:', error.stack);
+    logger.warn('⚠️  Impression indisponible (le backend continue sans impression)');
+    
+    // ✅ DEBUG: Afficher les chemins essayés
+    logger.warn(`[PRINT] Chemins essayés:`);
+    logger.warn(`   - ${path.join(getResourcesRoot(), 'print', 'module.js')}`);
+    logger.warn(`   - ${path.join(getProjectRoot(), 'print', 'module.js')}`);
+    logger.warn(`[PRINT] Vérifiez que le dossier 'print' est inclus dans extraResources (electron-builder.json)`);
   }
 
   // ✅ Définir DIST_DIR avec staticDir
@@ -730,6 +812,10 @@ export async function startBackend({
       startAutoCheck(getDb());
       logger.info('🔄 AutoCheck démarré (vérification stock toutes les 2 secondes)');
 
+      // ✅ Démarrer la synchronisation automatique (toutes les 10 secondes)
+      autoSyncService.start();
+      logger.info('🔄 AutoSync démarré (synchronisation intelligente toutes les 10 secondes)');
+
       // Démarrer l'AI (après le serveur pour que Socket.IO soit prêt)
       // Sauf si c'est Electron (IA gérée par main.cjs)
       if (!isElectron) {
@@ -747,6 +833,7 @@ export async function startBackend({
         httpServer,
         async stop() {
           stopAutoCheck(); // Arrêter l'auto-check avant de fermer le serveur
+          autoSyncService.stop(); // Arrêter la sync automatique
           return new Promise((r) => httpServer.close(() => r()));
         },
       });

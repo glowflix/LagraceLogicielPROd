@@ -112,12 +112,12 @@ const Layout = ({ children }) => {
   };
 
   return (
-    <div className="min-h-screen flex">
+    <div className="min-h-screen flex relative isolate">
       {/* Sidebar */}
       <motion.aside
         initial={{ x: -100 }}
         animate={{ x: 0 }}
-        className="w-64 glass-strong border-r border-white/10 flex flex-col"
+        className="w-64 glass-strong border-r border-white/10 flex flex-col z-30 shrink-0"
       >
         {/* Logo */}
         <div className="p-6 border-b border-white/10 flex items-center gap-3">
@@ -160,7 +160,7 @@ const Layout = ({ children }) => {
                   {isActive && (
                     <motion.div
                       layoutId="activeTab"
-                      className="absolute inset-0 bg-primary-500/10 rounded-lg"
+                      className="absolute inset-0 bg-primary-500/10 rounded-lg pointer-events-none"
                       initial={false}
                       transition={{ type: 'spring', stiffness: 500, damping: 30 }}
                     />
@@ -235,7 +235,7 @@ const Layout = ({ children }) => {
       </motion.aside>
 
       {/* Main content */}
-      <main className="flex-1 overflow-auto">
+      <main className="flex-1 overflow-auto relative z-10 pointer-events-auto">
         <div className="p-6">{children}</div>
       </main>
 

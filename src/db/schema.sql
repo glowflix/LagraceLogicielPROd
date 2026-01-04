@@ -188,6 +188,10 @@ CREATE TABLE IF NOT EXISTS debts (
   FOREIGN KEY(sale_id) REFERENCES sales(id)
 );
 
+-- Éviter les doublons: invoice_number doit être unique (sauf NULL)
+CREATE UNIQUE INDEX IF NOT EXISTS idx_debts_invoice_unique ON debts(invoice_number)
+WHERE invoice_number IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS debt_payments (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   debt_id INTEGER NOT NULL,
@@ -400,26 +404,25 @@ DROP TRIGGER IF EXISTS trg_sale_items_require_unit;
 CREATE TRIGGER IF NOT EXISTS trg_sale_items_require_unit
 BEFORE INSERT ON sale_items
 BEGIN
-  -- Pour les ventes venant de Sheets, on autorise même si l'unité n'existe pas exactement
-  -- (ces ventes sont historiques et peuvent avoir des unités qui n'existent plus)
-  -- Pour les ventes locales, on vérifie que l'unité existe dans product_units
   SELECT CASE
+    -- 1) Ventes venant de Sheets : pas de validation stricte
+    WHEN (SELECT origin FROM sales WHERE id = NEW.sale_id) = 'SHEETS'
+      THEN 1
+
+    -- 2) Pour vente locale : product_unit_uuid obligatoire
+    WHEN NEW.product_unit_uuid IS NULL OR TRIM(NEW.product_unit_uuid) = ''
+      THEN RAISE(ABORT, 'product_unit_uuid requis pour vente locale')
+
+    -- 3) Vérifier que l'unité existe (uuid + product_id + level)
     WHEN (
-      -- Si la vente vient de Sheets, autoriser (pas de vérification stricte)
-      SELECT origin FROM sales WHERE id = NEW.sale_id
-    ) = 'SHEETS'
-    THEN 1 -- Autoriser pour Sheets (même si product_id est NULL ou unité n'existe pas)
-    WHEN NEW.product_id IS NULL
-    THEN 1 -- Autoriser si product_id est NULL (pour compatibilité avec ventes historiques)
-    WHEN (
-      -- Pour les ventes locales, vérifier que l'unité existe
-      SELECT COUNT(*) FROM product_units
-      WHERE product_id = NEW.product_id
-        AND unit_level = NEW.unit_level
-        AND unit_mark  = COALESCE(NEW.unit_mark, '')
+      SELECT COUNT(*)
+      FROM product_units pu
+      WHERE pu.uuid = NEW.product_unit_uuid
+        AND pu.product_id = NEW.product_id
+        AND pu.unit_level = NEW.unit_level
     ) = 0
-    THEN RAISE(ABORT, 'Unité inconnue pour ce produit (unit_level/unit_mark)')
-    ELSE 1 -- Autoriser si l'unité existe
+      THEN RAISE(ABORT, 'Unité inconnue pour ce produit (uuid/unit_level)')
+    ELSE 1
   END;
 END;
 

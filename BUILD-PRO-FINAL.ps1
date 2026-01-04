@@ -1,8 +1,24 @@
 # BUILD-PRO-FINAL.ps1 - Script de build production final avec tous les fixes appliques
+# 
+# ⚠️  IMPORTANT - FIX IMPRESSION EN EXE:
+#     Ce script inclut maintenant:
+#     1. node_modules dans le build (CRITIQUE pour l'impression)
+#     2. Toutes les dépendances: pdf-to-printer, handlebars, chokidar, etc.
+#     3. Le dossier print/ avec templates et assets
+#
+#     Sans node_modules, l'impression ne fonctionnera PAS en mode EXE!
+#
+# 📌 ATTENTION: npm install DOIT réussir sinon le build échouera
+#
 
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "  LA GRACE POS - BUILD PRODUCTION FINAL" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "⚠️  FIX IMPRESSION INCLUS" -ForegroundColor Yellow
+Write-Host "   Les dépendances npm sont incluses pour que l'impression fonctionne en EXE" -ForegroundColor Yellow
+Write-Host ""
+
 # Verifier que tous les fichiers requis existent
 Write-Host "Verification des fichiers requis..." -ForegroundColor Yellow
 

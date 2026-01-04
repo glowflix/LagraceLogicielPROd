@@ -6,7 +6,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=['vosk', 'vosk_cffi'],  # ✅ CRITICAL: Includer vosk et ses dépendances
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -42,3 +42,8 @@ coll = COLLECT(
     upx_exclude=[],
     name='ai-lagrace',
 )
+
+[ui]
+[ui]   ➜  Local:   http://localhost:5173/
+[ui]   ➜  Network: http://192.168.2.125:5173/
+[electron]    [4.0s] Backend: ⏳ | Vite: ⏳

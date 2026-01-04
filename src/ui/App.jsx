@@ -34,8 +34,8 @@ function App() {
   // Ces routes doivent être disponibles même après déconnexion
   if (location.pathname === '/login' || location.pathname === '/license') {
     return (
-      <AnimatePresence mode="wait">
-        <Routes location={location} key={location.pathname}>
+      <AnimatePresence mode="sync">
+        <Routes location={location} key={location.key}>
           <Route path="/license" element={<LicensePage />} />
           <Route path="/login" element={<LoginPage />} />
         </Routes>
@@ -50,8 +50,8 @@ function App() {
 
   return (
     <Layout>
-      <AnimatePresence mode="wait">
-        <Routes location={location} key={location.pathname}>
+      <AnimatePresence mode="sync">
+        <Routes location={location} key={location.key}>
           <Route path="/" element={<Navigate to="/dashboard" replace />} />
           <Route 
             path="/dashboard" 

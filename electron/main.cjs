@@ -13,6 +13,8 @@ const { pathToFileURL } = require('url');
 const LOG_DIR = path.join(app.getPath('userData'), 'logs');
 fs.mkdirSync(LOG_DIR, { recursive: true });
 const MAIN_LOG = path.join(LOG_DIR, 'main.log');
+const AI_STDOUT = path.join(LOG_DIR, 'ai-stdout.log');
+const AI_STDERR = path.join(LOG_DIR, 'ai-stderr.log');
 
 function logToFile(...args) {
   const ts = new Date().toISOString();
@@ -86,18 +88,23 @@ const HOST = '127.0.0.1';  // ✅ Utiliser IPv4 explicite pour éviter les probl
 const SERVER_URL = `http://${HOST}:${PORT}`;
 
 // Configuration AI LaGrace
-const AI_ENABLED = process.env.AI_LAGRACE_ENABLED !== 'false'; // Activé par défaut
-// ✅ AI_AUTOSTART désactivé en production: l'IA est gérée par le serveur Node.js
-// En dev (npm run dev), le serveur AI est lancé par concurrently
-// En production (EXE), Python n'existe pas, donc on laisse le serveur Node.js faire
-const AI_AUTOSTART = !app.isPackaged && AI_ENABLED && process.env.AI_LAGRACE_AUTOSTART !== 'false';
+const AI_ENABLED = process.env.AI_LAGRACE_ENABLED !== 'false';
 
-// ✅ CHEMIN AI: En prod, l'AI est dans resources/ai (extraResources). En dev, elle est en racine.
-const AI_DIR = app.isPackaged 
-  ? path.join(process.resourcesPath, 'ai')      // Production: resources/ai
-  : path.join(__dirname, '..', 'ai-lagrace');    // Dev: racine/ai-lagrace
+// ✅ En DEV: l'IA est déjà lancée par concurrently (npm run dev:electron / dev:app)
+// ✅ En PROD (EXE): Electron doit lancer ai-lagrace.exe
+const AI_AUTOSTART = app.isPackaged
+  ? (AI_ENABLED && process.env.AI_LAGRACE_AUTOSTART !== 'false')
+  : false;
 
-const AI_MAIN = path.join(AI_DIR, 'main.py');
+// ✅ CHEMIN AI
+const AI_DIR = app.isPackaged
+  ? path.join(process.resourcesPath, 'ai')        // Production: resources/ai
+  : path.join(__dirname, '..', 'ai-lagrace');     // Dev: project/ai-lagrace
+
+// ✅ EXE en prod directement dans resources/ai (pas de sous-dossier)
+const AI_MAIN = app.isPackaged
+  ? path.join(AI_DIR, 'ai-lagrace.exe')           // ✅ CORRECT: resources/ai/ai-lagrace.exe
+  : path.join(AI_DIR, 'main.py');                 // Dev: ai-lagrace/main.py
 
 /**
  * Vérifier si Python (venv) est disponible
@@ -227,90 +234,79 @@ async function startAI() {
     console.log('[AI] Vérification du statut AI impossible, tentative de démarrage...');
   }
 
-  if (!fs.existsSync(AI_MAIN)) {
-    console.log('[AI] AI LaGrace non installée (main.py non trouvé)');
-    console.log('[AI] Chemin attendu:', AI_MAIN);
-    return;
-  }
+  // ✅ DÉTECTION: En production (app.isPackaged), utiliser ai-lagrace.exe
+  const isDev = !app.isPackaged;
+  let aiCmd;
+  let aiArgs;
 
-  const hasPython = await checkPython();
-  if (!hasPython) {
-    console.log('[AI] Python non disponible, AI LaGrace désactivée');
-    const pythonExe = process.platform === 'win32' 
+  if (isDev) {
+    // En développement: utiliser Python + main.py
+    aiCmd = process.platform === 'win32' 
       ? path.join(__dirname, '..', '.venv', 'Scripts', 'python.exe')
       : path.join(__dirname, '..', '.venv', 'bin', 'python');
-    console.log('[AI] Chemin attendu:', pythonExe);
-    console.log('[AI] Existe?:', fs.existsSync(pythonExe));
-    console.log('[AI] Installez Python et ajoutez-le au PATH');
-    return;
-  }
-
-  // ⚠️ DERNIÈRE TENTATIVE: Vérifier s'il y a déjà une instance Python de main.py
-  try {
-    const { exec } = require('child_process');
-    const isWindows = process.platform === 'win32';
-    const cmd = isWindows ? 'tasklist /FI "IMAGENAME eq python.exe"' : 'pgrep python';
+    aiArgs = ['main.py', '--quiet'];
     
-    // Pour Windows, on ne peut pas vérifier facilement, donc on continue
-    console.log('[AI] ⚠️  Vérification de l\'unicité de l\'instance...');
-  } catch (e) {
-    // Continue
+    if (!fs.existsSync(AI_MAIN)) {
+      console.log('[AI] Script Python non trouvé:', AI_MAIN);
+      return;
+    }
+
+    const hasPython = await checkPython();
+    if (!hasPython) {
+      console.log('[AI] Python non disponible en développement');
+      return;
+    }
+  } else {
+    // En production: utiliser ai-lagrace.exe (compilé)
+    aiCmd = AI_MAIN;
+    aiArgs = ['--quiet'];
+    
+    if (!fs.existsSync(aiCmd)) {
+      console.log('[AI] ❌ ERREUR: ai-lagrace.exe non trouvée en production!');
+      console.log('[AI] Chemin attendu:', aiCmd);
+      console.log('[AI] Vérifiez que le build est correct et que ai-lagrace.exe est dans:', AI_DIR);
+      sendAIStatus('error', 'AI executable non trouvée');
+      return;
+    }
+
+    console.log('[AI] ✅ ai-lagrace.exe trouvée en production');
   }
 
   console.log('[AI] ========================================');
-  console.log('[AI] DÉMARRAGE DE AI LaGrace (Electron)...');
-  console.log('[AI] Répertoire:', AI_DIR);
-  console.log('[AI] Script:', AI_MAIN);
+  console.log(isDev ? '[AI] DÉMARRAGE DE AI LaGrace (Dev - Python)...' : '[AI] DÉMARRAGE DE AI LaGrace (Prod - EXE)...');
+  console.log('[AI] Commande:', aiCmd);
+  console.log('[AI] Arguments:', aiArgs);
   console.log('[AI] ========================================');
 
   sendAIStatus('reconnecting', 'Démarrage de l\'IA...');
 
-  // ✅ CORRECTION: Utiliser le venv Python au lieu du Python système
-  // Cela garantit que les bonnes dépendances sont utilisées (Socket.IO, TTS, etc.)
-  const pythonExe = process.platform === 'win32' 
-    ? path.join(__dirname, '..', '.venv', 'Scripts', 'python.exe')
-    : path.join(__dirname, '..', '.venv', 'bin', 'python');
-  
-  console.log('[AI] Python exécutable:', pythonExe);
+  // ✅ Ouvrir les fichiers de log AI (append mode)
+  const out = fs.openSync(AI_STDOUT, 'a');
+  const err = fs.openSync(AI_STDERR, 'a');
 
-  // ⚠️ FIX: Quoter le répertoire si elle contient des espaces
-  const quotedAIDir = AI_DIR.includes(' ') ? `"${AI_DIR}"` : AI_DIR;
+  // ✅ Écrire le header de démarrage
+  const startTime = new Date().toISOString();
+  fs.appendFileSync(AI_STDOUT, `\n\n═══════════════════════════════════════════════════════\n[${startTime}] Démarrage AI LaGrace\n═══════════════════════════════════════════════════════\n`);
+  fs.appendFileSync(AI_STDERR, `\n\n═══════════════════════════════════════════════════════\n[${startTime}] Démarrage AI LaGrace (stderr)\n═══════════════════════════════════════════════════════\n`);
 
-  aiProcess = spawn(pythonExe, ['main.py', '--quiet'], {
-    cwd: AI_DIR,  // Non quoté pour Node.js
-    shell: false,  // ❌ shell: true cause le problème avec les espaces
-    stdio: ['ignore', 'pipe', 'pipe'],
+  logToFile('[AI] SPAWN', {
+    aiCmd,
+    aiArgs,
+    cwd: path.dirname(aiCmd),
+    stdout: AI_STDOUT,
+    stderr: AI_STDERR,
+  });
+
+  aiProcess = spawn(aiCmd, aiArgs, {
+    cwd: path.dirname(aiCmd),  // ✅ IMPORTANT: cwd = répertoire où se trouve l'exe/script
+    shell: false,  // ✅ Important: false pour éviter les problèmes avec les espaces
     windowsHide: true,
+    stdio: ['ignore', out, err],  // ✅ Rediriger directement vers les fichiers
     env: {
       ...process.env,
       PYTHONUNBUFFERED: '1', // Force Python à ne pas bufferer la sortie
       PYTHONIOENCODING: 'utf-8', // Encodage UTF-8 pour Windows
     },
-  });
-
-  aiProcess.stdout.on('data', (data) => {
-    const lines = data.toString().trim().split('\n');
-    lines.forEach((line) => {
-      if (line.trim()) {
-        // Afficher avec timestamp pour le debug
-        const ts = new Date().toISOString().split('T')[1].split('.')[0];
-        console.log(`[${ts}] [AI] ${line}`);
-        // Si l'IA est prête, envoyer le statut
-        if (line.includes('AI LaGrace PRÊTE')) {
-          sendAIStatus('connected', 'IA connectée et prête.');
-        }
-      }
-    });
-  });
-
-  aiProcess.stderr.on('data', (data) => {
-    const lines = data.toString().trim().split('\n');
-    lines.forEach((line) => {
-      if (line.trim()) {
-        const ts = new Date().toISOString().split('T')[1].split('.')[0];
-        console.error(`[${ts}] [AI ERROR] ${line}`);
-      }
-    });
   });
 
   aiProcess.on('close', (code) => {
@@ -338,6 +334,7 @@ async function startAI() {
   aiProcess.on('error', (err) => {
     console.error('[AI] Erreur process:', err);
     aiProcess = null;
+    sendAIStatus('error', `Erreur process: ${err.message}`);
   });
 
   console.log('[AI] AI LaGrace démarrée avec PID:', aiProcess.pid);

@@ -1,8 +1,9 @@
 import express from 'express';
 import { syncRepo } from '../../db/repositories/sync.repo.js';
 import { outboxRepo } from '../../db/repositories/outbox.repo.js';
-import { syncWorker } from '../../services/sync/sync.worker.js';
+import { syncWorker } from '../../services/sync/sync.instance.js';
 import { authenticate, optionalAuth } from '../middlewares/auth.js';
+import { logger } from '../../core/logger.js';
 
 const router = express.Router();
 

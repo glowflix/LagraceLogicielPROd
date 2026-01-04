@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { 
   Search,
   Package,
@@ -88,7 +89,7 @@ const AnimatedCounter = ({ value, duration = 500, formatter = (v) => v, classNam
 };
 
 // Modal WhatsApp-like
-const ConfirmModal = ({ isOpen, onClose, onConfirm, title, message, productName, onCustomName }) => {
+const ConfirmModal = ({ isOpen, onClose, onConfirm, title, message, productName, onCustomName, onCancel }) => {
   const [customName, setCustomName] = useState('');
   
   if (!isOpen) return null;
@@ -146,7 +147,12 @@ const ConfirmModal = ({ isOpen, onClose, onConfirm, title, message, productName,
             </button>
             <button
               onClick={() => {
-                onClose();
+                // ✅ FIX CRITIQUE #1: Appeler onCancel pour rejeter la Promise
+                if (onCancel) {
+                  onCancel();
+                } else {
+                  onClose();
+                }
                 setCustomName('');
               }}
               className="flex-1 bg-gray-700 hover:bg-gray-600 text-gray-100 px-4 py-2 rounded-lg transition-colors flex items-center justify-center gap-2"
@@ -162,7 +168,7 @@ const ConfirmModal = ({ isOpen, onClose, onConfirm, title, message, productName,
 };
 
 const ProductsPage = () => {
-  const { products, loadProducts, currentRate, loadCurrentRate, token: storeToken, isAuthenticated } = useStore();
+  const { products, loadProducts, currentRate, loadCurrentRate, token: storeToken, isAuthenticated, socket } = useStore();
   const navigate = useNavigate();
   
   // Constante pour le token offline
@@ -261,6 +267,24 @@ const ProductsPage = () => {
         }
         
         await Promise.all([loadProducts(), loadCurrentRate()]);
+        
+        // 🔍 DIAGNOSTIC IMMÉDIAT: Vérifier si le backend renvoie bien les unités du produit 1
+        setTimeout(() => {
+          const products_check = useStore.getState().products || [];
+          const p1 = products_check.find(p => String(p.code) === "1" || p.id === 1);
+          if (p1) {
+            console.log('%c🔍 [DIAGNOSTIC] PRODUCT 1 FROM API =', 'color: #f59e0b; font-weight: bold;', p1);
+            console.log('%c📊 UNITS LENGTH =', 'color: #f59e0b; font-weight: bold;', p1.units?.length || 0);
+            if (p1.units?.length === 1) {
+              console.warn('%c⚠️  BACKEND PROBLEM: Seulement 1 unité trouvée (au lieu de 2)\n   → Vérifier la requête /api/products et le GROUP BY', 'color: #ef4444; font-weight: bold;');
+            } else if (p1.units?.length === 2) {
+              console.log('%c✅ Backend OK: 2 unités trouvées\n   → Si l\'UI affiche mal, c\'est une collision de clé React', 'color: #10b981; font-weight: bold;');
+              p1.units.forEach((u, i) => {
+                console.log(`   Unit ${i}: level=${u.unit_level}, mark=${u.unit_mark}, uuid=${u.uuid}, id=${u.id}`);
+              });
+            }
+          }
+        }, 100);
       } catch (error) {
         // En mode Electron, éviter les console.error qui peuvent causer des problèmes
         if (IS_DEV) {
@@ -286,6 +310,86 @@ const ProductsPage = () => {
       lastInputAtRef.current.clear();
     };
   }, [loadProducts, loadCurrentRate, authToken]);
+
+  // ✅ Socket.IO listener pour écouter les mises à jour de produits depuis Google Sheets
+  useEffect(() => {
+    if (!socket) return; // Socket pas encore initialisé
+    
+    const handleProductsUpdated = async (data) => {
+      if (IS_DEV) {
+        console.log('📡 [ProductsPage] Event "products:updated" reçu:', data);
+        console.log(`   → ${data.count} produit(s) mis à jour depuis Google Sheets`);
+      }
+      
+      try {
+        // Recharger les produits pour avoir les données à jour
+        await loadProducts();
+        
+        // Afficher une notification à l'utilisateur (optionnel)
+        if (IS_DEV) {
+          console.log('✅ [ProductsPage] Produits rechargés depuis le serveur');
+        }
+      } catch (error) {
+        console.error('❌ [ProductsPage] Erreur lors du rechargement des produits:', error);
+      }
+    };
+    
+    // S'abonner à l'événement 'products:updated'
+    socket.on('products:updated', handleProductsUpdated);
+    
+    if (IS_DEV) {
+      console.log('🔗 [ProductsPage] Listener Socket.IO "products:updated" enregistré');
+    }
+    
+    // Cleanup: désabonner au démontage du composant
+    return () => {
+      socket.off('products:updated', handleProductsUpdated);
+      if (IS_DEV) {
+        console.log('🔓 [ProductsPage] Listener Socket.IO "products:updated" désabonné');
+      }
+    };
+  }, [socket, loadProducts]);
+
+  // ✅ Socket.IO listener pour la synchronisation automatique intelligente
+  useEffect(() => {
+    if (!socket) return;
+
+    const handleProductsSynced = async (data) => {
+      if (IS_DEV) {
+        console.log('🔄 [AutoSync] Event "products:synced" reçu:', {
+          updated: data.updated,
+          skipped: data.skipped,
+          pending: data.pending,
+          duration: `${data.duration}ms`
+        });
+      }
+
+      // Si il y a eu des updates, recharger les produits
+      if (data.updated > 0) {
+        try {
+          await loadProducts();
+          if (IS_DEV) {
+            console.log(`✅ [AutoSync] Produits rechargés (${data.updated} mises à jour)`);
+          }
+        } catch (error) {
+          console.error('❌ [AutoSync] Erreur rechargement produits:', error);
+        }
+      }
+    };
+
+    socket.on('products:synced', handleProductsSynced);
+
+    if (IS_DEV) {
+      console.log('🔗 [ProductsPage] Listener Socket.IO "products:synced" enregistré');
+    }
+
+    return () => {
+      socket.off('products:synced', handleProductsSynced);
+      if (IS_DEV) {
+        console.log('🔓 [ProductsPage] Listener Socket.IO "products:synced" désabonné');
+      }
+    };
+  }, [socket, loadProducts]);
 
   // Fonction helper pour obtenir les headers d'authentification (optimisée)
   const getAuthHeaders = useCallback(() => {
@@ -415,26 +519,39 @@ const ProductsPage = () => {
           product.units.forEach((unit, uIndex) => {
             try {
               // Filtrer selon l'unité
-              if (activeFilter === 'CARTON' && unit.unit_level !== 'CARTON') return;
-              if (activeFilter === 'DETAIL' && unit.unit_level !== 'MILLIER') return;
-              if (activeFilter === 'PIECE' && unit.unit_level !== 'PIECE') return;
+              if (activeFilter !== 'TOUS') {
+                if (activeFilter === 'CARTON' && unit.unit_level !== 'CARTON') return;
+                if (activeFilter === 'DETAIL' && unit.unit_level !== 'MILLIER') return;
+                if (activeFilter === 'PIECE' && unit.unit_level !== 'PIECE') return;
+              }
               
               const salePriceUSD = Number(unit.sale_price_usd) || 0;
               const calculatedFC = calculateFC(salePriceUSD);
               
-              // IDs stables pour éviter les re-renders React
-              const stableProductKey = product.id ?? product.code ?? `p${pIndex}`;
-              const stableUnitKey = unit.id ?? `${unit.unit_level ?? 'U'}-${uIndex}`;
+              // ✅ CORRECTION A: Créer une clé VRAIMENT unique et déterministe
+              // Inclure: product_code + unit_level + unit_uuid (pas d'index qui peut varier)
+              const productKey = String(product.code ?? product.id ?? `p${pIndex}`);
+              const unitKey = String(unit.uuid ?? unit.id ?? `u${uIndex}`);
+              const rowId = `${productKey}:${unit.unit_level}:${unitKey}`; // Format déterministe
+              
+              // ✅ CORRECTION B: Valider unit_mark (arrêter de l'effacer si c'est 'MILLIER')
+              // unit_mark est le marking/label RÉEL de la BD (ex: 'MILLIER' peut être un vrai mark)
+              // On ne l'efface que si c'est réellement une unité-level (CARTON) qui a MILLIER dessus (cas rare)
+              let normalizedUnitMark = String(unit.unit_mark ?? '').trim();
+              // Optionnel: interdire 'MILLIER' comme mark SUR CARTON seulement (si métier l'exige)
+              if (unit.unit_level === 'CARTON' && normalizedUnitMark.toUpperCase() === 'MILLIER') {
+                normalizedUnitMark = '';
+              }
               
               rows.push({
-                id: `${stableProductKey}-${stableUnitKey}`, // ✅ stable
+                id: rowId, // ✅ Clé unique et déterministe par ligne
                 product_id: product.id,
                 product_code: product.code || '',
                 product_name: product.name || '',
                 unit_id: unit.id,
                 unit_uuid: unit.uuid ?? null,                    // ✅ utile si id absent / sync
                 unit_level: unit.unit_level || '',
-                unit_mark: unit.unit_mark || '',
+                unit_mark: normalizedUnitMark, // ✅ CORRIGÉ: valeur validée
                 stock_current: Number(unit.stock_current) || 0,
                 sale_price_usd: salePriceUSD,
                 sale_price_fc: calculatedFC,
@@ -556,68 +673,42 @@ const ProductsPage = () => {
     return -1;
   }, [filteredData]);
 
-  // Navigation : scroll vers le bas (dernier produit) - protégé pour Electron
-  const scrollToBottom = useCallback(() => {
-    try {
-      if (lastRealProductIndex === -1) return;
-      
-      // Attendre que le DOM soit prêt (important pour Electron)
-      setTimeout(() => {
-        try {
-          const tableElement = document?.querySelector('tbody');
-          if (!tableElement) return;
-          
-          const rows = tableElement.querySelectorAll('tr:not([data-navigation])');
-          if (rows[lastRealProductIndex]) {
-            rows[lastRealProductIndex].scrollIntoView({ 
-              behavior: 'auto', 
-              block: 'center' 
-            });
-          }
-        } catch (err) {
-          if (IS_DEV) {
-            console.error('Erreur scrollToBottom:', err);
-          }
-        }
-      }, 100);
-    } catch (error) {
-      if (IS_DEV) {
-        console.error('Erreur scrollToBottom:', error);
-      }
-    }
-  }, [lastRealProductIndex]);
-
-  // Navigation : scroll vers le haut - protégé pour Electron
-  const scrollToTop = useCallback(() => {
-    try {
-      const scrollContainer = scrollContainerRef.current || document?.querySelector('.overflow-x-auto');
-      if (scrollContainer) {
-        scrollContainer.scrollTo({ 
-          top: 0, 
-          behavior: 'auto' 
-        });
-      } else {
-        const tableHeader = document?.querySelector('thead');
-        if (tableHeader) {
-          tableHeader.scrollIntoView({ 
-            behavior: 'auto', 
-            block: 'start' 
-          });
-        } else if (typeof window !== 'undefined' && window.scrollTo) {
-          window.scrollTo({ top: 0, behavior: 'auto' });
-        }
-      }
-    } catch (error) {
-      if (IS_DEV) {
-        console.error('Erreur scrollToTop:', error);
-      }
-    }
-  }, []);
-
-  // État pour savoir la position de scroll
-  const [scrollPosition, setScrollPosition] = useState('top');
+  // ✅ FIX #1: Déclarer scrollContainerRef AVANT useVirtualizer (TDZ bug)
   const scrollContainerRef = useRef(null);
   const scrollCheckTimeoutRef = useRef(null);
+  const [scrollPosition, setScrollPosition] = useState('top');
+
+  // ✅ Virtualisation de table : rendre seulement les lignes visibles
+  const rowVirtualizer = useVirtualizer({
+    count: Array.isArray(filteredData) ? filteredData.length : 0,
+    getScrollElement: () => scrollContainerRef.current,
+    estimateSize: () => 56, // Hauteur estimée d'une ligne (py-3 = ~56px)
+    overscan: 10, // Buffer de lignes hors écran pour smooth scroll
+    measureElement: typeof window !== 'undefined' ? (el) => el?.getBoundingClientRect().height : undefined,
+  });
+
+  // Navigation : scroll vers le bas (dernier produit) - virtualisé
+  const scrollToBottom = useCallback(() => {
+    if (lastRealProductIndex === -1) return;
+    try {
+      rowVirtualizer.scrollToIndex(lastRealProductIndex, { align: 'center' });
+    } catch (error) {
+      if (IS_DEV) {
+        console.error('Erreur scrollToBottom (virtualisé):', error);
+      }
+    }
+  }, [lastRealProductIndex, rowVirtualizer]);
+
+  // Navigation : scroll vers le haut
+  const scrollToTop = useCallback(() => {
+    try {
+      rowVirtualizer.scrollToOffset(0);
+    } catch (error) {
+      if (IS_DEV) {
+        console.error('Erreur scrollToTop (virtualisé):', error);
+      }
+    }
+  }, [rowVirtualizer]);
 
   // Vérifier la position de scroll - protégé pour Electron
   useEffect(() => {
@@ -1120,6 +1211,9 @@ const ProductsPage = () => {
     setSaveMessage({ type: 'info', text: 'Sauvegarde en cours...' });
     
     try {
+      // ✅ FIX #3: Track creation flag en dehors de la boucle
+      let hadCreation = false;
+      
       // ✅ Boucle pour traiter tous les changements, même ceux qui arrivent pendant la sauvegarde
       while (pendingSavesRef.current.size > 0) {
         // Prendre un snapshot puis vider immédiatement (les nouveaux edits peuvent être ajoutés pendant la requête)
@@ -1159,6 +1253,7 @@ const ProductsPage = () => {
           
           // Si c'est une ligne vide, créer le produit
           if (row.is_empty) {
+            hadCreation = true; // ✅ FIX #3: tracker la création
             return handleCreateProduct(row, edits).catch(err => {
               if (IS_DEV) {
                 console.error(`❌ [ProductsPage] Erreur création produit ${rowId}:`, err);
@@ -1278,10 +1373,19 @@ const ProductsPage = () => {
       
       setSaveMessage({ type: 'success', text: 'Sauvegarde réussie' });
       
-      // Recharger les produits après un court délai pour laisser le backend se mettre à jour
-      setTimeout(async () => {
-        await loadProducts();
-      }, 500);
+      // ✅ FIX #3: hadCreation est tracké dans la boucle while, on l'utilise ici pour reload optionnel
+      if (hadCreation) {
+        // Conserver la scroll position (optionnel)
+        const sc = scrollContainerRef.current;
+        const top = sc ? sc.scrollTop : null;
+
+        setTimeout(async () => {
+          await loadProducts();
+          requestAnimationFrame(() => {
+            if (sc && top != null) sc.scrollTop = top;
+          });
+        }, 150);
+      }
       
       // Effacer le message après 2 secondes
       setTimeout(() => {
@@ -1306,13 +1410,8 @@ const ProductsPage = () => {
         // ✅ AMÉLIORATION: Message 404 plus clair
         errorMessage = '❌ Produit non trouvé. Vérifiez que le code du produit est correct.';
       } else if (error.response?.status === 409) {
-        // UNIQUE constraint violation
-        const detail = error.response?.data?.error || '';
-        if (detail.toLowerCase().includes('mark') || detail.toLowerCase().includes('unique')) {
-          errorMessage = 'Ce Mark existe déjà pour ce produit et cette unité';
-        } else {
-          errorMessage = error.response?.data?.error || 'Conflit: cette donnée existe déjà';
-        }
+        // ✅ PRO FIX E: Améliorer le message d'erreur 409 (sans spam)
+        errorMessage = 'Conflit: ce Mark est déjà utilisé pour ce produit et cette unité. Choisissez un autre Mark.';
       } else {
         errorMessage = error.response?.data?.error || errorMessage;
       }
@@ -1404,7 +1503,7 @@ const ProductsPage = () => {
     });
   }, [cancelIdleSave, isRowFocused, scheduleIdleSave, savePendingChanges]);
 
-  // ✅ PRO : si clic dehors de la ligne active, on flush AVANT les handlers (capture)
+  // ✅ PRO FIX B: si clic dehors de la ligne active, flush NON-BLOQUANT (après l'event)
   useEffect(() => {
     if (typeof document === 'undefined') return;
 
@@ -1413,8 +1512,12 @@ const ProductsPage = () => {
       if (!activeRowId) return;
 
       const inside = e.target?.closest?.(`[data-rowid="${activeRowId}"]`);
+
       if (!inside && pendingSavesRef.current.has(activeRowId)) {
-        flushRowNow(activeRowId, 'clic-dehors');
+        // ✅ PRO FIX B: déclencher après l'événement de clic (non-bloquant)
+        setTimeout(() => {
+          flushRowNow(activeRowId, 'clic-dehors');
+        }, 0);
       }
     };
 
@@ -1983,7 +2086,12 @@ const ProductsPage = () => {
         </div>
       ) : (
         <div className="card p-0">
-          <div className="overflow-x-auto" ref={scrollContainerRef}>
+          {/* ✅ FIX #2: overflow-y-auto + maxHeight pour que virtualisation fonctionne */}
+          <div 
+            ref={scrollContainerRef}
+            className="overflow-x-auto overflow-y-auto"
+            style={{ maxHeight: 'calc(100vh - 260px)' }}
+          >
             <table className="w-full">
               <thead className="bg-gradient-to-r from-primary-500/10 to-primary-600/5 border-b-2 border-primary-500/40">
                 <tr>
@@ -2046,28 +2154,49 @@ const ProductsPage = () => {
                     return null;
                   }
                 })()}
-                {Array.isArray(filteredData) && filteredData.map((row, index) => {
-                    if (!row) return null;
-                    
-                    try {
-                      const isEditingThisRow = editingCell?.rowId === row.id && !row.is_empty;
-                      const hasPendingChanges = pendingSavesRef.current.has(row.id);
-                      
-                      return (
-                        <tr
-                          key={row.id || `row-${index}`}
-                          data-rowid={row.id}
-                          className={`group ${
-                            row.is_empty ? 'opacity-30' : 'hover:bg-dark-700/50'
-                          } ${
-                            isEditingThisRow
-                              ? 'bg-primary-500/10 border-l-2 border-primary-500/50' 
-                              : hasPendingChanges
-                              ? 'bg-orange-500/5 border-l-2 border-orange-500/30'
-                              : ''
-                          } transition-colors`}
-                          onMouseLeave={() => smartBlurRow(row.id)}
-                        >
+                
+                {/* ✅ FIX #5: Calculer les spacers proprement */}
+                {(() => {
+                  const virtualItems = rowVirtualizer.getVirtualItems();
+                  const topPad = virtualItems[0]?.start ?? 0;
+                  const bottomPad = Math.max(0, rowVirtualizer.getTotalSize() - (virtualItems.at(-1)?.end ?? 0));
+                  
+                  return (
+                    <>
+                      {/* Padding top */}
+                      <tr>
+                        <td colSpan={9} style={{ height: `${topPad}px` }} />
+                      </tr>
+
+                      {/* ✅ Virtualisation: rendre seulement les lignes visibles */}
+                      {virtualItems.map((virtualRow) => {
+                        const row = filteredData[virtualRow.index];
+                        if (!row) return null;
+
+                        const index = virtualRow.index;
+                        const isEditingThisRow = editingCell?.rowId === row.id && !row.is_empty;
+                        const hasPendingChanges = pendingSavesRef.current.has(row.id);
+
+                        try {
+                          return (
+                            <tr
+                              key={row.id || `row-${index}`}
+                              data-rowid={row.id}
+                              data-index={virtualRow.index}
+                              ref={rowVirtualizer.measureElement}
+                              style={{
+                                height: `${virtualRow.size}px`,
+                              }}
+                              className={`group ${
+                                row.is_empty ? 'opacity-30' : 'hover:bg-dark-700/50'
+                              } ${
+                                isEditingThisRow
+                                  ? 'bg-primary-500/10 border-l-2 border-primary-500/50' 
+                                  : hasPendingChanges
+                                  ? 'bg-orange-500/5 border-l-2 border-orange-500/30'
+                                  : ''
+                              } transition-colors`}
+                      >
                     {/* Produit */}
                     <td className="px-4 py-3">
                       {editingCell?.rowId === row?.id && editingCell?.field === 'product_name' ? (
@@ -2239,19 +2368,41 @@ const ProductsPage = () => {
                               }
                             }}
                             onBlur={(e) => {
-                              const vNorm = String(e.currentTarget.value ?? '').trim(); // ✅ CORRECT: e.currentTarget
+                              const vNorm = String(e.currentTarget.value ?? '').trim();
 
-                              // ✅ VALIDATION: Mark ne peut pas être vide (DB constraint)
+                              // ✅ PRO FIX D: Si mark inchangé => ne pas déclencher pending/save, juste fermer l'édition
+                              const current = normalizeMark(row.unit_mark);
+                              if (normalizeMark(vNorm) === current) {
+                                // Nettoyer seulement l'édition du champ mark
+                                setEditingValues((prev) => {
+                                  const copy = { ...prev };
+                                  if (copy[row.id]) {
+                                    const rowCopy = { ...copy[row.id] };
+                                    delete rowCopy.unit_mark;
+                                    // Si vide, supprimer la ligne
+                                    if (Object.keys(rowCopy).length === 0) delete copy[row.id];
+                                    else copy[row.id] = rowCopy;
+                                  }
+                                  return copy;
+                                });
+                                pendingSavesRef.current.delete(row.id);
+                                cancelIdleSave(row.id);
+
+                                setEditingCell(null);
+                                setFocusedField(null);
+                                return;
+                              }
+
+                              // ✅ VALIDATION: Mark obligatoire
                               if (!vNorm) {
                                 cancelIdleSave(row.id);
                                 pendingSavesRef.current.delete(row.id);
                                 
                                 setSaveMessage({ 
                                   type: 'error', 
-                                  text: 'Le Mark (unité de vente) est obligatoire' 
+                                  text: 'Mark obligatoire. Exemple: PQT, RAM, DZ…' 
                                 });
                                 setTimeout(() => setSaveMessage({ type: '', text: '' }), 3000);
-                                // Rester en édition pour que l'utilisateur corrige
                                 return;
                               }
 
@@ -2648,20 +2799,20 @@ const ProductsPage = () => {
                         </tr>
                       );
                     } catch (err) {
-                      // Erreur silencieuse pour éviter de casser le rendu
                       if (IS_DEV) {
-                        console.error('Erreur rendu ligne:', err, row);
+                        console.error('Erreur rendu ligne virtuelle:', err);
                       }
-                      // Retourner une ligne vide au lieu de null pour éviter les problèmes de clés
-                      return (
-                        <tr key={row?.id || `error-${index}`} className="opacity-50">
-                          <td colSpan={9} className="px-4 py-2 text-center text-gray-500 text-sm">
-                            Erreur de rendu
-                          </td>
-                        </tr>
-                      );
+                      return null;
                     }
-                  })}
+                        })}
+
+                      {/* Padding bottom */}
+                      <tr>
+                        <td colSpan={9} style={{ height: `${bottomPad}px` }} />
+                      </tr>
+                    </>
+                  );
+                })()}
               </tbody>
             </table>
           </div>
@@ -2674,6 +2825,7 @@ const ProductsPage = () => {
         onClose={() => setModalState({ isOpen: false, type: '', data: null })}
         onConfirm={modalState.data?.onConfirm}
         onCustomName={modalState.data?.onCustomName}
+        onCancel={modalState.data?.onCancel}
         title="Créer un nouveau produit?"
         message={`Le produit "${modalState.data?.edits?.product_name || ''}" n'existe pas en CARTON. Voulez-vous créer un nouveau produit ${modalState.data?.unitLevel === 'MILLIER' ? 'Détail' : modalState.data?.unitLevel === 'PIECE' ? 'Pièce' : ''} avec ce nom?`}
         productName={modalState.data?.edits?.product_name}

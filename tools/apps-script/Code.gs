@@ -1702,26 +1702,39 @@ function handleDebtUpsert(payload) {
   const dataRange = sheet.getDataRange();
   const values = dataRange.getValues();
   
-  // Recherche par UUID ou clé composite
+  // Recherche par UUID ou clé composite (améliorée)
   let rowIndex = -1;
-  const searchUuid = payload.uuid;
-  const searchFacture = payload.invoice_number;
-  const searchClient = payload.client_name;
-  
+  const searchUuid = (payload.uuid || '').toString().trim();
+  const searchFacture = (payload.invoice_number || '').toString().trim();
+  const searchClient = (payload.client_name || '').toString().trim();
+  const searchProduit = (payload.product_description || payload.note || '').toString().trim();
+
   for (let i = 1; i < values.length; i++) {
-    const rowUuid = colUuid > 0 ? values[i][colUuid - 1] : null;
-    const rowFacture = colFacture > 0 ? values[i][colFacture - 1] : null;
-    const rowClient = colClient > 0 ? values[i][colClient - 1] : null;
-    
+    const rowUuid = colUuid > 0 ? String(values[i][colUuid - 1] || '').trim() : '';
     if (searchUuid && rowUuid === searchUuid) {
       rowIndex = i + 1;
       break;
     }
-    if (rowFacture === searchFacture && rowClient === searchClient) {
-      rowIndex = i + 1;
-      break;
+
+    // Composite: facture + client + produit (évite écraser plusieurs lignes même facture)
+    const rowFacture = colFacture > 0 ? String(values[i][colFacture - 1] || '').trim() : '';
+    const rowClient = colClient > 0 ? String(values[i][colClient - 1] || '').trim() : '';
+    const rowProduit = colProduit > 0 ? String(values[i][colProduit - 1] || '').trim() : '';
+
+    if (!searchUuid && searchFacture && searchClient) {
+      if (rowFacture === searchFacture && rowClient === searchClient) {
+        // si produit est fourni, il doit matcher
+        if (!searchProduit || rowProduit === searchProduit) {
+          rowIndex = i + 1;
+          break;
+        }
+      }
     }
   }
+
+  // Si pas de uuid, en générer un (et le retourner)
+  let finalUuid = searchUuid;
+  if (!finalUuid) finalUuid = Utilities.getUuid();
   
   const maxCol = Math.max(colClient, colProduit, colArgent, colPrixAPayer, 
                           colPrixPaye, colReste, colDate, colFacture, 
@@ -1743,7 +1756,7 @@ function handleDebtUpsert(payload) {
   if (colDollars > 0) rowData[colDollars - 1] = payload.total_usd || 0;
   if (colDescription > 0) rowData[colDescription - 1] = payload.product_description || payload.note || '';
   if (colDettesFCUSD > 0) rowData[colDettesFCUSD - 1] = payload.debt_fc_in_usd || 0;
-  if (colUuid > 0) rowData[colUuid - 1] = searchUuid || '';
+  if (colUuid > 0) rowData[colUuid - 1] = finalUuid;
   
   // ✅ Tech columns
   if (colUpdatedAt > 0) rowData[colUpdatedAt - 1] = nowIso();
@@ -2043,9 +2056,86 @@ function getProductsSince(sinceDate, entityType) {
   const sheetNames = [SHEETS.CARTON, SHEETS.MILLIERS, SHEETS.PIECE];
   const results = [];
   const productsByCode = {}; // Grouper par code produit
+  const modifiedProductCodes = new Set(); // Tracer les produits modifiés
   
+  // ===== PASS 1: Identifier les produits modifiés =====
   for (const sheetName of sheetNames) {
-    logDebug('📄 Traitement feuille:', sheetName);
+    logDebug('📄 [PASS1] Traitement feuille:', sheetName);
+    const sheet = getSheet(sheetName);
+    if (!sheet) {
+      logDebug('   ⚠️ Feuille non trouvée:', sheetName);
+      continue;
+    }
+    
+    ensureTechColumns(sheet);
+    const colDateUpdate = findColumnIndex(sheet, 'Date de dernière mise à jour');
+    const colCode = findColumnIndex(sheet, 'Code produit');
+    const colNom = findColumnIndex(sheet, 'Nom du produit');
+    const colUuid = findColumnIndex(sheet, '_uuid');
+    
+    if (colCode === -1) {
+      logDebug('   ⚠️ Pas de colonne Code produit, feuille ignorée');
+      continue; // Pas de colonne Code produit
+    }
+    
+    const lastRow = sheet.getLastRow();
+    if (lastRow <= 1) {
+      logDebug('   ⚠️ Pas de données (seulement en-tête)');
+      continue;
+    }
+    
+    const lastCol = sheet.getLastColumn();
+    const values = sheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+    
+    let modifiedCount = 0;
+    for (let i = 0; i < values.length; i++) {
+      const codeValue = colCode > 0 ? values[i][colCode - 1] : '';
+      const code = codeValue ? String(codeValue).trim() : '';
+      if (!code) continue;
+      
+      // En import initial, tous les produits sont "modifiés"
+      if (isInitialImport) {
+        modifiedProductCodes.add(code);
+        modifiedCount++;
+        continue;
+      }
+      
+      // En sync incrémentale, vérifier la date
+      let dateUpdate = null;
+      if (colDateUpdate > 0) {
+        const dateValue = values[i][colDateUpdate - 1];
+        if (dateValue) {
+          if (dateValue instanceof Date) {
+            dateUpdate = dateValue;
+          } else if (typeof dateValue === 'string' && dateValue.length > 0) {
+            try {
+              const parsedDate = new Date(dateValue);
+              if (!isNaN(parsedDate.getTime())) {
+                dateUpdate = parsedDate;
+              }
+            } catch (e) {}
+          } else if (typeof dateValue === 'number') {
+            dateUpdate = new Date(dateValue);
+          }
+        }
+      }
+      
+      // Ajouter si date >= sinceDate (modifié depuis la dernière sync)
+      if (dateUpdate && dateUpdate >= sinceDate) {
+        modifiedProductCodes.add(code);
+        modifiedCount++;
+        logDebug('   ✅ Code', code, 'marqué comme modifié (date:', dateUpdate.toISOString(), ')');
+      }
+    }
+    
+    console.log('   [PASS1]', sheetName, ':', modifiedCount, 'produit(s) marqué(s) comme modifié(s)');
+  }
+  
+  console.log('📊 [PASS1] Total produits modifiés marqués:', modifiedProductCodes.size);
+  
+  // ===== PASS 2: Récupérer TOUS les units de TOUS les produits modifiés =====
+  for (const sheetName of sheetNames) {
+    logDebug('📄 [PASS2] Traitement feuille:', sheetName);
     const sheet = getSheet(sheetName);
     if (!sheet) {
       logDebug('   ⚠️ Feuille non trouvée:', sheetName);
@@ -2066,35 +2156,18 @@ function getProductsSince(sinceDate, entityType) {
     const colPrixVenteUSD = findColumnIndex(sheet, 'Prix ventes (USD)');
     const colUuid = findColumnIndex(sheet, '_uuid');
     
-    logDebug('   Colonnes trouvées:', {
-      Code: colCode,
-      Nom: colNom,
-      Stock: colStockInit,
-      PrixAchatUSD: colPrixAchatUSD,
-      PrixVenteFC: colPrixVenteFC,
-      PrixVenteDetailFC: colPrixVenteDetailFC,
-      Mark: colMark,
-      AutoStock: colAutoStock,
-      PrixVenteUSD: colPrixVenteUSD
-    });
-    
     if (colCode === -1) {
       logDebug('   ⚠️ Pas de colonne Code produit, feuille ignorée');
-      continue; // Pas de colonne Code produit
+      continue;
     }
     
-    // Optimisation : utiliser getLastRow() pour éviter de lire toutes les colonnes vides
     const lastRow = sheet.getLastRow();
-    const lastCol = sheet.getLastColumn();
-    
-    logDebug('   Lignes de données:', lastRow - 1, 'Colonnes:', lastCol);
-    
     if (lastRow <= 1) {
       logDebug('   ⚠️ Pas de données (seulement en-tête)');
-      continue; // Pas de données (seulement l'en-tête)
+      continue;
     }
     
-    // Lire seulement les lignes de données (plus rapide que getDataRange qui lit toutes les colonnes vides)
+    const lastCol = sheet.getLastColumn();
     const values = sheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
     
     const unitLevel = sheetName === SHEETS.CARTON ? 'CARTON' : 
@@ -2111,37 +2184,16 @@ function getProductsSince(sinceDate, entityType) {
       const code = codeValue ? String(codeValue).trim() : '';
       if (!code) {
         skippedCount++;
-        continue; // Ignorer les lignes vides
+        continue;
       }
       
-      // Optimisation: ne convertir la date que si nécessaire (pas d'import initial)
-      let dateUpdate = null;
-      if (!isInitialImport && colDateUpdate > 0) {
-        const dateValue = values[i][colDateUpdate - 1];
-        if (dateValue) {
-          // Si c'est déjà un objet Date, l'utiliser directement
-          if (dateValue instanceof Date) {
-            dateUpdate = dateValue;
-          } else if (typeof dateValue === 'string' && dateValue.length > 0) {
-            // Essayer de convertir seulement si c'est une chaîne non vide
-            try {
-              const parsedDate = new Date(dateValue);
-              if (!isNaN(parsedDate.getTime())) {
-                dateUpdate = parsedDate;
-              }
-            } catch (e) {
-              // Ignorer les erreurs de conversion
-            }
-          } else if (typeof dateValue === 'number') {
-            // Si c'est un nombre (timestamp Sheets)
-            dateUpdate = new Date(dateValue);
-          }
-          
-          // Si import incrémental, vérifier la date maintenant
-          if (dateUpdate && dateUpdate < sinceDate) {
-            continue;
-          }
-        }
+      // ✅ CRITICAL FIX: Si ce produit n'a PAS été marqué comme modifié, le SKIP
+      // Mais ATTENTION: Certains autres units du même produit PEUVENT avoir changé!
+      // Solution: Ne skip QUE si le produit n'est pas dans modifiedProductCodes
+      if (!isInitialImport && !modifiedProductCodes.has(code)) {
+        skippedCount++;
+        logDebug('   ⏭️  Code', code, '(' + unitLevel + ') pas modifié, SKIP');
+        continue; // ← SKIP seulement si PAS marqué comme modifié
       }
       
       // Créer ou mettre à jour l'entrée produit
@@ -2166,10 +2218,21 @@ function getProductsSince(sinceDate, entityType) {
       const prixVenteFC = colPrixVenteDetailFC > 0 ? values[i][colPrixVenteDetailFC - 1] : 
                          (colPrixVenteFC > 0 ? values[i][colPrixVenteFC - 1] : 0);
       
+      // ✅ CORRECTION PRO: Valider unit_mark
+      // Ne JAMAIS accepter les valeurs de unit_level (CARTON, MILLIER, PIECE) comme unit_mark
+      let markValue = colMark > 0 ? (values[i][colMark - 1] ? String(values[i][colMark - 1]).trim() : '') : '';
+      const unitLevelValues = ['CARTON', 'MILLIER', 'PIECE', 'DETAIL'];
+      if (unitLevelValues.includes(markValue.toUpperCase())) {
+        // C'est une erreur de fusion - unit_mark contient un unit_level
+        // Vider le mark pour qu'il soit rempli correctement
+        logDebug('   ⚠️ Correction: unit_mark contenait "' + markValue + '" (value de unit_level), vidé');
+        markValue = '';
+      }
+      
       const unitData = {
         uuid: colUuid > 0 ? values[i][colUuid - 1] || null : null,
         unit_level: unitLevel,
-        unit_mark: colMark > 0 ? (values[i][colMark - 1] ? String(values[i][colMark - 1]).trim() : '') : '',
+        unit_mark: markValue,
         stock_initial: stock,
         stock_current: stock,
         purchase_price_usd: toNumber(colPrixAchatUSD > 0 ? values[i][colPrixAchatUSD - 1] : 0),
@@ -2819,6 +2882,58 @@ function getSalesPage(sinceDate, cursor, limit) {
 }
 
 /**
+ * ⚡ Backfill des colonnes techniques sur Dettes
+ * Remplit _uuid et _updated_at pour les dettes existantes (EXÉCUTER UNE FOIS)
+ */
+function backfillDettesTechColumns() {
+  const sheet = getSheet(SHEETS.DETTES);
+  ensureTechColumns(sheet);
+
+  const colUuid = findColumnIndex(sheet, '_uuid');
+  const colUpdatedAt = findColumnIndex(sheet, '_updated_at');
+  const colDate = findColumnIndex(sheet, 'date');
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) {
+    console.log('[backfillDettesTechColumns] Rien à faire (0 ligne)');
+    return 0;
+  }
+
+  const numRows = lastRow - 1;
+
+  const uuidRange = sheet.getRange(2, colUuid, numRows, 1);
+  const updatedAtRange = sheet.getRange(2, colUpdatedAt, numRows, 1);
+
+  const uuids = uuidRange.getValues();
+  const upd = updatedAtRange.getValues();
+
+  let changed = 0;
+  for (let i = 0; i < numRows; i++) {
+    const row = i + 2;
+
+    // UUID
+    if (!uuids[i][0] || String(uuids[i][0]).trim() === '') {
+      uuids[i][0] = Utilities.getUuid();
+      changed++;
+    }
+
+    // UPDATED_AT
+    if (!upd[i][0] || String(upd[i][0]).trim() === '') {
+      const dateVal = (colDate > 0) ? sheet.getRange(row, colDate).getValue() : null;
+      const d = toDate(dateVal) || new Date();
+      upd[i][0] = d.toISOString();
+      changed++;
+    }
+  }
+
+  uuidRange.setValues(uuids);
+  updatedAtRange.setValues(upd);
+
+  console.log('[backfillDettesTechColumns] ✅ Terminé. Modifs:', changed);
+  return changed;
+}
+
+/**
  * Récupère une page de dettes (pagination PRO)
  * @param {Date} sinceDate - Date depuis laquelle récupérer
  * @param {number} cursor - Ligne de départ (2 = première ligne de données)
@@ -2826,9 +2941,24 @@ function getSalesPage(sinceDate, cursor, limit) {
  * @returns {{data: Array, next_cursor: number|null, done: boolean}}
  */
 function getDebtsPage(sinceDate, cursor, limit) {
-  console.log('📄 [getDebtsPage] Feuille: Dettes | Cursor:', cursor, '| Limit:', limit);
+  console.log('📄 [getDebtsPage] DÉBUT - Feuille: Dettes | Cursor:', cursor, '| Limit:', limit);
   
   const sheet = getSheet(SHEETS.DETTES);
+  
+  // DIAGNOSTIC: Vérifier si la feuille est trouvée
+  if (!sheet) {
+    console.error('❌ [getDebtsPage] FEUILLE "Dettes" NON TROUVÉE!');
+    const ss = getSpreadsheet();
+    const allSheets = ss.getSheets();
+    console.log('📋 Feuilles disponibles dans le Spreadsheet:');
+    for (let i = 0; i < allSheets.length; i++) {
+      console.log(`   [${i}] "${allSheets[i].getName()}"`);
+    }
+    return { data: [], next_cursor: null, done: true };
+  }
+  
+  console.log('✅ [getDebtsPage] Feuille "Dettes" trouvée avec', sheet.getLastRow(), 'lignes');
+  
   ensureTechColumns(sheet);
   
   const colDate = findColumnIndex(sheet, 'date');
@@ -2840,12 +2970,20 @@ function getDebtsPage(sinceDate, cursor, limit) {
   const colReste = findColumnIndex(sheet, 'reste');
   const colFacture = findColumnIndex(sheet, 'numero de facture');
   const colDollars = findColumnIndex(sheet, 'Dollars');
-  const colDescription = findColumnIndex(sheet, 'objet\\Description');
+  const colDescription = findColumnIndex(sheet, 'objet') || findColumnIndex(sheet, 'objet\\Description') || findColumnIndex(sheet, 'Description');
   const colDettesFCUSD = findColumnIndex(sheet, 'Dettes Fc en usd');
   const colUuid = findColumnIndex(sheet, '_uuid');
   
+  console.log('🔍 [getDebtsPage] Colonnes trouvées:');
+  console.log('   colDate:', colDate, '| colUpdatedAt:', colUpdatedAt);
+  console.log('   colClient:', colClient, '| colProduit:', colProduit);
+  console.log('   colPrixAPayer:', colPrixAPayer, '| colPrixPaye:', colPrixPaye);
+  console.log('   colReste:', colReste, '| colFacture:', colFacture);
+  console.log('   colDollars:', colDollars, '| colDescription:', colDescription);
+  console.log('   colDettesFCUSD:', colDettesFCUSD, '| colUuid:', colUuid);
+  
   if (colDate === -1) {
-    console.log('⚠️ [getDebtsPage] Colonne date manquante');
+    console.log('❌ [getDebtsPage] ERREUR: Colonne "date" manquante!');
     return { data: [], next_cursor: null, done: true };
   }
   
@@ -2853,6 +2991,8 @@ function getDebtsPage(sinceDate, cursor, limit) {
                           colReste, colFacture, colDollars, colDescription, colDettesFCUSD, colUuid);
   
   const lastRow = sheet.getLastRow();
+  console.log('📋 [getDebtsPage] Total lignes dans la feuille:', lastRow);
+  
   if (lastRow <= 1) {
     console.log('⚠️ [getDebtsPage] Pas de données (seulement en-tête)');
     return { data: [], next_cursor: null, done: true };
@@ -2863,12 +3003,14 @@ function getDebtsPage(sinceDate, cursor, limit) {
   const numRows = endRow - startRow + 1;
   
   console.log('📊 [getDebtsPage] Lecture lignes', startRow, 'à', endRow, '(', numRows, 'lignes)');
+  console.log('📅 [getDebtsPage] sinceDate:', sinceDate, '(time:', sinceDate.getTime(), ')');
   
   const rows = sheet.getRange(startRow, 1, numRows, maxCol).getValues();
   
   const data = [];
   let processedCount = 0;
   let skippedCount = 0;
+  let skippedByDate = 0;
   
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
@@ -2878,20 +3020,26 @@ function getDebtsPage(sinceDate, cursor, limit) {
     const refDate = toDate(refVal);
     
     if (!refDate) {
+      console.log(`   ⏭️ Ligne ${startRow + i}: refDate invalide (refVal="${refVal}")`);
       skippedCount++;
       continue;
     }
     
     if (sinceDate.getTime() > 0 && refDate < sinceDate) {
+      console.log(`   ⏭️ Ligne ${startRow + i}: Rejetée par filtre date (refDate=${refDate.toISOString()} < sinceDate=${sinceDate.toISOString()})`);
+      skippedByDate++;
       skippedCount++;
       continue;
     }
     
     const dateDette = toDate(r[colDate - 1]);
     if (!dateDette) {
+      console.log(`   ⏭️ Ligne ${startRow + i}: dateDette invalide`);
       skippedCount++;
       continue;
     }
+    
+    console.log(`   ✅ Ligne ${startRow + i}: ${r[colClient - 1] || 'N/A'} - ${r[colProduit - 1] || 'N/A'} (${r[colPrixAPayer - 1] || 0} FC)`);
     
     const totalFC = toNumber(colPrixAPayer > 0 ? r[colPrixAPayer - 1] : 0);
     const paidFC = toNumber(colPrixPaye > 0 ? r[colPrixPaye - 1] : 0);
@@ -2928,7 +3076,11 @@ function getDebtsPage(sinceDate, cursor, limit) {
   const done = endRow >= lastRow;
   const next_cursor = done ? null : (endRow + 1);
   
-  console.log('✅ [getDebtsPage] Traité:', processedCount, 'dette(s) | Skippé:', skippedCount, '| Done:', done, '| Next cursor:', next_cursor);
+  console.log('✅ [getDebtsPage] RÉSUMÉ:');
+  console.log('   Traité:', processedCount, 'dette(s)');
+  console.log('   Skippé total:', skippedCount, '(dont', skippedByDate, 'par filtre date)');
+  console.log('   Done:', done, '| Next cursor:', next_cursor);
+  console.log('   Retourné:', data.length, 'dettes');
   
   return { data, next_cursor, done };
 }

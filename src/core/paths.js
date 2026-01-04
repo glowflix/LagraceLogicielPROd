@@ -6,10 +6,20 @@ export function getDataRoot() {
   if (process.env.LAGRACE_DATA_DIR) return path.resolve(process.env.LAGRACE_DATA_DIR);
   if (process.env.GLOWFLIX_ROOT_DIR) return path.resolve(process.env.GLOWFLIX_ROOT_DIR);
 
-  const winDefault = "C:\\Glowflixprojet";
-  return process.platform === "win32"
-    ? winDefault
-    : path.join(os.homedir(), "Glowflixprojet");
+  // ✅ EN MODE EXE INSTALLÉ: Utiliser AppData\Roaming (utilisateur-spécifique)
+  // ✅ EN DEV: Utiliser C:\Glowflixprojet (dossier commun)
+  // La différence: AppData = installé pour l'utilisateur, C:\ = partagé
+  if (process.platform === "win32") {
+    // Chercher AppData (Roaming de préférence)
+    const appDataRoaming = process.env.APPDATA; // %APPDATA% = AppData\Roaming
+    if (appDataRoaming) {
+      return path.join(appDataRoaming, "Glowflixprojet");
+    }
+    // Fallback si APPDATA pas défini
+    return "C:\\Glowflixprojet";
+  }
+  
+  return path.join(os.homedir(), "Glowflixprojet");
 }
 
 export function getResourcesRoot() {

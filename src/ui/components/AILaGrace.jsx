@@ -61,6 +61,12 @@ export default function AILaGrace({ className = '' }) {
     speaking: false,
     listening: false,
   });
+  
+  // FIX: Memoize isConnected to replace aiStatus.connected reference
+  const isConnected = React.useMemo(() => {
+    return aiStatus.status === 'connected';
+  }, [aiStatus.status]);
+  
   const [showPanel, setShowPanel] = useState(false);
   const [messages, setMessages] = useState([]);
   const socketRef = useRef(null);
@@ -98,6 +104,19 @@ export default function AILaGrace({ className = '' }) {
     }
   }, []); // Dépendance vide - pas de dépendance circulaire
 
+  // ✅ DÉCLARER addMessage AVANT useEffect (évite TDZ - Temporal Dead Zone)
+  // Sinon: ReferenceError: Cannot access 'addMessage' before initialization
+  const addMessage = useCallback((type, text) => {
+    const newMsg = {
+      id: Date.now(),
+      type,
+      text,
+      time: new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }),
+    };
+    setMessages(prev => [...prev.slice(-20), newMsg]); // Garder les 20 derniers
+    setAiStatus(prev => ({ ...prev, lastMessage: text }));
+  }, []);
+
   useEffect(() => {
     const socket = io(SOCKET_URL, {
       transports: ['websocket', 'polling'],
@@ -108,12 +127,12 @@ export default function AILaGrace({ className = '' }) {
 
     socketRef.current = socket;
 
-    // Événements de connexion
+    // REGISTER ALL LISTENERS FIRST - BEFORE ANY EARLY RETURNS
+    // Events de connexion
     socket.on('connect', () => {
       console.log('🔌 [AILaGrace] Connecté au serveur');
       addMessage('system', 'Connecté au serveur La Grâce');
       
-      // Toujours vérifier le statut pour navigateur web
       setTimeout(() => {
         if (!window.electronAPI) {
           console.log('🔍 Vérification du statut IA (navigateur web)');
@@ -125,40 +144,6 @@ export default function AILaGrace({ className = '' }) {
     socket.on('disconnect', () => {
       console.log('🔌 [AILaGrace] Déconnecté');
     });
-
-    // Écouter les mises à jour de statut de l'IA depuis Electron
-    if (window.electronAPI) {
-      const cleanup = window.electronAPI.onAIStatusUpdate(({ status, message }) => {
-        console.log(`[IPC] Statut AI reçu: ${status}`, message);
-        setAiStatus(prev => ({ ...prev, status, message }));
-        
-        if (status === 'connected') {
-          addMessage('ai', message || 'AI LaGrace connectée et prête');
-        } else if (status === 'disconnected') {
-          addMessage('error', message || 'AI LaGrace déconnectée');
-        } else if (status === 'reconnecting') {
-          addMessage('system', message || 'Reconnexion de l\'IA...');
-        }
-      });
-      
-      return () => {
-        cleanup();
-        socket.disconnect();
-      };
-    } else {
-      // Pour navigateur web : vérifier le statut immédiatement et ensuite périodiquement
-      checkAIStatus(); // Vérification immédiate
-      
-      const interval = setInterval(() => {
-        console.log('⏰ Vérification périodique du statut IA');
-        checkAIStatus();
-      }, 5000); // Vérification toutes les 5 secondes
-      
-      return () => {
-        clearInterval(interval);
-        socket.disconnect();
-      };
-    }
 
     // Événements de vente
     socket.on('sale:created', (data) => {
@@ -191,10 +176,41 @@ export default function AILaGrace({ className = '' }) {
       addMessage('user', `${username} s'est connecté`);
     });
 
+    // NOW define cleanup with all subscriptions registered
+    let cleanup = null;
+    let interval = null;
+
+    // Écouter les mises à jour de statut de l'IA depuis Electron
+    if (window.electronAPI) {
+      cleanup = window.electronAPI.onAIStatusUpdate(({ status, message }) => {
+        console.log(`[IPC] Statut AI reçu: ${status}`, message);
+        setAiStatus(prev => ({ ...prev, status, message }));
+        
+        if (status === 'connected') {
+          addMessage('ai', message || 'AI LaGrace connectée et prête');
+        } else if (status === 'disconnected') {
+          addMessage('error', message || 'AI LaGrace déconnectée');
+        } else if (status === 'reconnecting') {
+          addMessage('system', message || 'Reconnexion de l\'IA...');
+        }
+      });
+    } else {
+      // Pour navigateur web : vérifier le statut immédiatement et ensuite périodiquement
+      checkAIStatus();
+      
+      interval = setInterval(() => {
+        console.log('⏰ Vérification périodique du statut IA');
+        checkAIStatus();
+      }, 5000);
+    }
+
+    // Return single cleanup function - all listeners guaranteed registered above
     return () => {
+      if (cleanup) cleanup();
+      if (interval) clearInterval(interval);
       socket.disconnect();
     };
-  }, []);
+  }, [checkAIStatus, addMessage]);
 
   // Démarrer l'IA (pour navigateur web)
   const startAIWeb = useCallback(async () => {
@@ -230,18 +246,6 @@ export default function AILaGrace({ className = '' }) {
     } catch (error) {
       addMessage('error', `Erreur arrêt IA: ${error.message}`);
     }
-  }, []);
-
-  // Ajouter un message à la liste
-  const addMessage = useCallback((type, text) => {
-    const newMsg = {
-      id: Date.now(),
-      type,
-      text,
-      time: new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }),
-    };
-    setMessages(prev => [...prev.slice(-20), newMsg]); // Garder les 20 derniers
-    setAiStatus(prev => ({ ...prev, lastMessage: text }));
   }, []);
 
   // Demander l'activation du micro (Web Speech API)
@@ -301,23 +305,25 @@ export default function AILaGrace({ className = '' }) {
   };
 
   return (
-    <div className={`relative ${className}`}>
-      {/* Bouton flottant AI */}
-      <button
+    <div className="fixed inset-0 pointer-events-none" style={{ zIndex: 40 }}>
+      {/* Conteneur flottant AI LaGrace avec pointer-events isolation */}
+      <div className="relative">
+        {/* Bouton flottant AI */}
+        <button
         onClick={() => setShowPanel(!showPanel)}
         className={`
-          fixed bottom-4 right-4 z-50
+          fixed bottom-4 right-4 z-50 pointer-events-auto
           w-14 h-14 rounded-full shadow-lg
           flex items-center justify-center
           transition-all duration-300 transform hover:scale-110
-          ${aiStatus.connected 
+          ${isConnected 
             ? 'bg-gradient-to-br from-green-500 to-emerald-600' 
             : 'bg-gradient-to-br from-gray-600 to-gray-700'}
           ${aiStatus.speaking ? 'animate-pulse ring-4 ring-yellow-400/50' : ''}
         `}
-        title={aiStatus.connected ? 'AI LaGrace - Connectée' : 'AI LaGrace - Déconnectée'}
+        title={isConnected ? 'AI LaGrace - Connectée' : 'AI LaGrace - Déconnectée'}
       >
-        <AIIcon connected={aiStatus.connected} />
+        <AIIcon connected={isConnected} />
         
         {/* Indicateur de statut */}
         <span 
@@ -332,7 +338,7 @@ export default function AILaGrace({ className = '' }) {
       {/* Panel de contrôle */}
       {showPanel && (
         <div className="
-          fixed bottom-20 right-4 z-50
+          fixed bottom-20 right-4 z-50 pointer-events-auto
           w-80 max-h-96
           bg-gray-900/95 backdrop-blur-xl
           border border-gray-700/50 rounded-2xl
@@ -347,7 +353,7 @@ export default function AILaGrace({ className = '' }) {
           ">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <AIIcon connected={aiStatus.connected} />
+                <AIIcon connected={isConnected} />
                 <div>
                   <h3 className="font-semibold text-white text-sm">AI LaGrace</h3>
                   <p className={`text-xs ${
@@ -474,6 +480,7 @@ export default function AILaGrace({ className = '' }) {
           )}
         </div>
       )}
+      </div>
     </div>
   );
 }

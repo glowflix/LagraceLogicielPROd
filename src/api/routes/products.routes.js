@@ -15,8 +15,20 @@ const router = express.Router();
  * Liste tous les produits
  */
 router.get('/', optionalAuth, (req, res) => {
+  console.log('\n\n╔════════════════════════════════════════════╗');
+  console.log('║  🔴🔴🔴 GET /api/products ENDPOINT 🔴🔴🔴   ║');
+  console.log('╚════════════════════════════════════════════╝\n');
   try {
+    console.log('   → Appel de productsRepo.findAll()...');
     const products = productsRepo.findAll();
+    console.log(`   ✅ findAll() retourné ${products.length} produit(s)`);
+    
+    // Log spécifique pour produit 1
+    const p1 = products.find(p => p.code === '1');
+    if (p1) {
+      console.log(`   🟢 PRODUCT 1: ${p1.units?.length || 0} unités (${p1.units?.map(u => u.unit_level).join(', ') || 'AUCUNE'})`);
+    }
+    
     logger.debug(`📤 GET /api/products: ${products.length} produit(s) retourné(s)`);
     res.json(products);
   } catch (error) {

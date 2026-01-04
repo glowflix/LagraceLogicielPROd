@@ -28,46 +28,71 @@ export class ProductsRepository {
   findAll() {
     const db = getDb();
     try {
+      console.log('\n\n═══════════════════════════════════════════════════════');
+      console.log('🔴🔴🔴 PRODUCTS.REPO findAll() APPELÉ 🔴🔴🔴');
+      console.log('═══════════════════════════════════════════════════════\n');
+      
       // Récupérer le taux actuel pour calculer FC depuis USD
       const currentRate = ratesRepo.getCurrent();
       
+      // ✅ CORRECTION: Récupérer les produits SANS GROUP_CONCAT (trop fragile avec JSON)
+      // Utiliser une approche simple: récupérer tous les produits, puis pour chacun ses unités
       const products = db
         .prepare(`
-          SELECT p.*, 
-                 GROUP_CONCAT(
-                   json_object(
-                     'id', pu.id,
-                     'uuid', pu.uuid,
-                     'unit_level', pu.unit_level,
-                     'unit_mark', pu.unit_mark,
-                     'stock_initial', pu.stock_initial,
-                     'stock_current', pu.stock_current,
-                     'purchase_price_usd', pu.purchase_price_usd,
-                     'sale_price_usd', pu.sale_price_usd,
-                     'auto_stock_factor', pu.auto_stock_factor,
-                     'qty_step', pu.qty_step
-                   )
-                 ) as units
+          SELECT p.* 
           FROM products p
-          LEFT JOIN product_units pu ON p.id = pu.product_id
           WHERE p.is_active = 1
-          GROUP BY p.id
+          ORDER BY p.id
         `)
         .all()
-        .map((row) => {
-          const units = row.units ? JSON.parse(`[${row.units}]`) : [];
+        .map((product) => {
+          // Récupérer les unités pour ce produit
+          let units = [];
+          try {
+            units = db
+              .prepare('SELECT * FROM product_units WHERE product_id = ? ORDER BY unit_level')
+              .all(product.id);
+            
+            // DEBUG: Log units pour produit 1
+            if (product.code === '1') {
+              console.log(`\n🔵 [DEBUG] Product 1 - SQL query returned ${units.length} units:`);
+              units.forEach((u, i) => {
+                console.log(`   [${i}] ID=${u.id}, Level=${u.unit_level}, Mark=${u.unit_mark}, Stock=${u.stock_current}`);
+              });
+              console.log('');
+            }
+          } catch (unitsError) {
+            logger.warn(`⚠️  Erreur récupération unités pour produit ${product.code}: ${unitsError.message}`);
+            units = [];
+          }
+          
           // Calculer sale_price_fc depuis sale_price_usd pour chaque unité
           const unitsWithCalculatedFC = units.map(unit => ({
             ...unit,
             sale_price_fc: unit.sale_price_usd ? Math.round(unit.sale_price_usd * currentRate) : 0
           }));
+          
           return {
-            ...row,
+            ...product,
             units: unitsWithCalculatedFC,
           };
         });
       
       logger.info(`📊 findAll products: ${products.length} produit(s) trouvé(s) dans la base`);
+      
+      // Debug: Log products avec plus d'une unité
+      const multiUnitProducts = products.filter(p => p.units && p.units.length > 1);
+      if (multiUnitProducts.length > 0) {
+        logger.info(`   ✅ ${multiUnitProducts.length} produit(s) avec plusieurs unités:
+${multiUnitProducts.map(p => `      - ${p.code}: ${p.units.length} unités (${p.units.map(u => u.unit_level).join(', ')})`).join('\n')}`);
+      }
+      
+      // LOG SPÉCIFIQUE PRODUIT 1
+      const p1 = products.find(p => p.code === '1');
+      if (p1) {
+        console.log(`🟢 PRODUCT 1 RETOURNÉ: ${p1.units?.length || 0} unités (${p1.units?.map(u => u.unit_level).join(', ') || 'AUCUNE'})`);
+      }
+      
       return products;
     } catch (error) {
       logger.error('Erreur findAll products:', error);
@@ -158,7 +183,9 @@ export class ProductsRepository {
           
           // Helpers pour normalisation
           const normLevel = (v) => (v ?? 'PIECE').trim().toUpperCase();
-          const normMark = (v) => (v ?? '').trim().toUpperCase();
+          // ✅ PRO: libre écriture du mark (pas de forçage toUpperCase)
+          // Permet à l'utilisateur d'écrire "Dz", "dz", "DZ" comme il veut
+          const normMark = (v) => (v ?? '').trim();
 
           let unitIndex = 0;
           for (const unit of productData.units) {
@@ -183,11 +210,12 @@ export class ProductsRepository {
             let dbUnit = null;
             
             // PRIORITÉ 1: UUID (identité stable pour sync offline)
+            // ✅ Ajouter product_id pour plus de sécurité (évite UUID mixup cross-products)
             if (unit.uuid) {
               dbUnit = db.prepare(`
                 SELECT id, uuid FROM product_units
-                WHERE uuid = ?
-              `).get(unit.uuid);
+                WHERE uuid = ? AND product_id = ?
+              `).get(unit.uuid, productId);
             }
             
             // FALLBACK: ID (identité stable pour cette session)
@@ -198,13 +226,15 @@ export class ProductsRepository {
               `).get(unit.id, productId);
             }
             
-            // DERNIER RECOURS: Chercher par (level+mark) pour nouvelles unités sans uuid
-            // ⚠️ Uniquement si pas trouvé par uuid ou id
+            // DERNIER RECOURS (PRO): Chercher par (product_id + unit_level) SEULEMENT
+            // ✅ Car UNIQUE(product_id, unit_level) => 1 seule unité par niveau
+            // ✅ unit_mark est modifiable => ne doit jamais servir de clé de lookup
+            // Si l'utilisateur change DZ → NMBO, on retrouve toujours la même ligne
             if (!dbUnit) {
               dbUnit = db.prepare(`
                 SELECT id, uuid FROM product_units
-                WHERE product_id = ? AND unit_level = ? AND unit_mark = ?
-              `).get(productId, unitLevel, unitMark);
+                WHERE product_id = ? AND unit_level = ?
+              `).get(productId, unitLevel);
             }
             
             // ✅ 2) UUID final: TOUJOURS utiliser celui de la DB si l'unité existe

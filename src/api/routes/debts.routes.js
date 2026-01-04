@@ -5,8 +5,25 @@ import { syncRepo } from '../../db/repositories/sync.repo.js';
 import { auditRepo } from '../../db/repositories/audit.repo.js';
 import { authenticate, optionalAuth } from '../middlewares/auth.js';
 import { logger } from '../../core/logger.js';
+import { pullDebtsFromSheets } from '../../services/sync/pull-debts-from-sheets.js';
 
 const router = express.Router();
+
+/**
+ * POST /api/debts/sync/pull
+ * PULL dettes depuis Google Sheets → SQLite
+ */
+router.post('/sync/pull', authenticate, async (req, res) => {
+  try {
+    logger.info('🔄 [ENDPOINT] POST /api/debts/sync/pull - Démarrage PULL Sheets → SQLite');
+    const result = await pullDebtsFromSheets();
+    logger.info(`✅ [ENDPOINT] PULL complété: ${result.upserted}/${result.invoices} dettes upsertées`);
+    res.json({ success: true, result });
+  } catch (error) {
+    logger.error('❌ [ENDPOINT] POST /api/debts/sync/pull error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 
 /**
  * GET /api/debts

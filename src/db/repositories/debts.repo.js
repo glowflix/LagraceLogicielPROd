@@ -161,6 +161,8 @@ export class DebtsRepository {
 
   /**
    * Crée ou met à jour une dette
+   * IMPORTANT: Prend toujours la PLUS RÉCENTE si plusieurs doublons existent
+   * SYNC: Crée automatiquement une opération sync_operations pour push vers Sheets
    */
   upsert(debtData) {
     const db = getDb();
@@ -168,8 +170,13 @@ export class DebtsRepository {
       // Vérifier si la dette existe (par invoice_number ou uuid)
       let existing = null;
       if (debtData.invoice_number) {
-        const debts = db.prepare('SELECT * FROM debts WHERE invoice_number = ?').all(debtData.invoice_number);
-        existing = debts.length > 0 ? debts[0] : null;
+        // Prendre la plus récente (order by updated_at DESC, id DESC)
+        existing = db.prepare(`
+          SELECT * FROM debts
+          WHERE invoice_number = ?
+          ORDER BY updated_at DESC, id DESC
+          LIMIT 1
+        `).get(debtData.invoice_number);
       } else if (debtData.uuid) {
         existing = db.prepare('SELECT * FROM debts WHERE uuid = ?').get(debtData.uuid);
       }
@@ -219,6 +226,10 @@ export class DebtsRepository {
         logger.info(`   ✅ [SQL] UPDATE réussie: ${updateResult.changes} ligne(s) modifiée(s)`);
         const updated = this.findById(existing.id);
         logger.info(`   📊 [SQL] Dette mise à jour: id=${updated.id}, invoice=${updated.invoice_number}, status=${updated.status}`);
+        
+        // 📤 Créer opération DEBT pour le PUSH vers Sheets
+        this.createSyncOperation(updated, 'upsert');
+        
         return updated;
       } else {
         // Créer
@@ -251,11 +262,60 @@ export class DebtsRepository {
         logger.info(`   ✅ [SQL] INSERT réussie: id=${result.lastInsertRowid}, invoice=${debtData.invoice_number || 'N/A'}`);
         const created = this.findById(result.lastInsertRowid);
         logger.info(`   📊 [SQL] Dette créée et disponible: id=${created.id}, invoice=${created.invoice_number}, status=${created.status}`);
+        
+        // 📤 Créer opération DEBT pour le PUSH vers Sheets
+        this.createSyncOperation(created, 'upsert');
+        
         return created;
       }
     } catch (error) {
       logger.error('Erreur upsert debt:', error);
       throw error;
+    }
+  }
+
+  /**
+   * Crée une opération sync_operations pour la dette
+   * Cette opération sera pushée vers Google Sheets via sync.worker
+   */
+  createSyncOperation(debt, opType = 'upsert') {
+    const db = getDb();
+    try {
+      const op_id = generateUUID();
+      
+      const payload = {
+        uuid: debt.uuid,
+        invoice_number: debt.invoice_number,
+        client_name: debt.client_name,
+        client_phone: debt.client_phone,
+        product_description: debt.product_description,
+        total_fc: debt.total_fc,
+        paid_fc: debt.paid_fc,
+        remaining_fc: debt.remaining_fc,
+        total_usd: debt.total_usd,
+        debt_fc_in_usd: debt.debt_fc_in_usd,
+        status: debt.status,
+        note: debt.note
+      };
+      
+      db.prepare(`
+        INSERT OR IGNORE INTO sync_operations (
+          op_id, op_type, entity_uuid, entity_code, payload_json, status
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(
+        op_id,
+        'DEBT',
+        debt.uuid,
+        debt.invoice_number,
+        JSON.stringify(payload),
+        'pending'
+      );
+      
+      logger.debug(`   📤 [SYNC] Opération DEBT créée: op_id=${op_id.substring(0, 8)}..., invoice=${debt.invoice_number}`);
+    } catch (error) {
+      // Ne pas bloquer si la création de sync_op échoue
+      logger.warn(`   ⚠️ [SYNC] Erreur création sync_operations: ${error.message}`);
     }
   }
 

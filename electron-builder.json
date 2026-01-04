@@ -15,6 +15,8 @@
     "electron/**/*",
     "src/**/*",
     "asset/**/*",
+    "print/**/*",
+    "node_modules/**/*",
     "package.json"
   ],
   "extraResources": [
