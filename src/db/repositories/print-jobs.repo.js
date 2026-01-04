@@ -11,6 +11,13 @@ export class PrintJobsRepository {
   create(printJobData) {
     const db = getDb();
     try {
+      logger.info('🖨️  [PRINT-JOB-REPO] ==========================================');
+      logger.info('🖨️  [PRINT-JOB-REPO] CRÉATION D\'UN JOB D\'IMPRESSION (DB)');
+      logger.info('🖨️  [PRINT-JOB-REPO] ==========================================');
+      logger.info(`📄 [PRINT-JOB-REPO] Invoice: ${printJobData.invoice_number}`);
+      logger.info(`📋 [PRINT-JOB-REPO] Template: ${printJobData.template || 'receipt-80'}`);
+      logger.info(`📦 [PRINT-JOB-REPO] Payload size: ${JSON.stringify(printJobData.payload_json || {}).length} bytes`);
+      
       const stmt = db.prepare(`
         INSERT INTO print_jobs (
           invoice_number, template, payload_json, status
@@ -18,15 +25,26 @@ export class PrintJobsRepository {
         VALUES (?, ?, ?, 'pending')
       `);
 
-      stmt.run(
+      const result = stmt.run(
         printJobData.invoice_number,
         printJobData.template || 'receipt-80',
         JSON.stringify(printJobData.payload_json || {}),
       );
+      
+      logger.info(`✅ [PRINT-JOB-REPO] Job créé en DB avec ID: ${result.lastInsertRowid}`);
+      logger.info(`📊 [PRINT-JOB-REPO] Status: pending`);
+      logger.info('🖨️  [PRINT-JOB-REPO] ==========================================');
 
       return this.findByInvoice(printJobData.invoice_number);
     } catch (error) {
-      logger.error('Erreur create print_job:', error);
+      logger.error('❌ [PRINT-JOB-REPO] ==========================================');
+      logger.error('❌ [PRINT-JOB-REPO] ERREUR CRÉATION JOB D\'IMPRESSION');
+      logger.error('❌ [PRINT-JOB-REPO] ==========================================');
+      logger.error(`❌ [PRINT-JOB-REPO] Invoice: ${printJobData.invoice_number}`);
+      logger.error(`❌ [PRINT-JOB-REPO] Message: ${error.message}`);
+      logger.error(`❌ [PRINT-JOB-REPO] Code: ${error.code || 'N/A'}`);
+      logger.error(`❌ [PRINT-JOB-REPO] Stack: ${error.stack}`);
+      logger.error('❌ [PRINT-JOB-REPO] ==========================================');
       throw error;
     }
   }

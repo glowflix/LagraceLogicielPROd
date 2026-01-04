@@ -2,6 +2,7 @@
 
 import fs from "fs";
 import path from "path";
+import os from "os";
 import chokidar from "chokidar";
 import dayjs from "dayjs";
 import { fileURLToPath } from "url";
@@ -348,9 +349,9 @@ function normalizeForFingerprint(job){
   };
 }
 
-function hashFingerprint(obj){
+async function hashFingerprint(obj){
   const data = safeStringify(obj);
-  const { createHash } = require("crypto");
+  const { createHash } = await import("crypto");
   return createHash("sha1").update(data).digest("hex");
 }
 
@@ -1340,12 +1341,45 @@ export function createPrinterModule({
   retryDelays = [2000, 5000, 10000],
   forceDefault = true,
 } = {}) {
-  // Déterminer le project root (C:\Glowflixprojet ou depuis env)
-  const projectRoot = process.env.GLOWFLIX_ROOT_DIR 
-    ? path.resolve(process.env.GLOWFLIX_ROOT_DIR)
-    : (process.platform === "win32" 
-      ? "C:\\Glowflixprojet" 
-      : path.join(os.homedir(), "Glowflixprojet"));
+  // CRITIQUE: Utiliser la même logique que src/core/paths.js pour garantir la cohérence
+  // En build: %APPDATA%\Glowflixprojet\printer
+  // En dev: C:\Glowflixprojet\printer (ou GLOWFLIX_ROOT_DIR si défini)
+  const getDataRoot = () => {
+    if (process.env.LAGRACE_DATA_DIR) return path.resolve(process.env.LAGRACE_DATA_DIR);
+    if (process.env.GLOWFLIX_ROOT_DIR) return path.resolve(process.env.GLOWFLIX_ROOT_DIR);
+    
+    // EN MODE EXE: Utiliser AppData\Roaming
+    // EN DEV: Utiliser C:\Glowflixprojet
+    if (process.platform === "win32") {
+      const appDataRoaming = process.env.APPDATA; // %APPDATA% = AppData\Roaming
+      if (appDataRoaming) {
+        return path.join(appDataRoaming, "Glowflixprojet");
+      }
+      return "C:\\Glowflixprojet";
+    }
+    
+    return path.join(os.homedir(), "Glowflixprojet");
+  };
+  
+  const dataRoot = getDataRoot();
+  
+  // Déterminer le project root
+  const projectRoot = dataRoot;
+  
+  // LOG: Afficher le chemin utilisé (critique pour diagnostic)
+  const logModule = {
+    info:  (...a) => logger?.info ? logger.info(...a)   : console.log(...a),
+    warn:  (...a) => logger?.warn ? logger.warn(...a)   : console.warn(...a),
+    error: (...a) => logger?.error ? logger.error(...a) : console.error(...a),
+  };
+  
+  logModule.info('🖨️  [PRINT-MODULE] ==========================================');
+  logModule.info('🖨️  [PRINT-MODULE] INITIALISATION DU MODULE D\'IMPRESSION');
+  logModule.info('🖨️  [PRINT-MODULE] ==========================================');
+  logModule.info(`📁 [PRINT-MODULE] Data Root: ${dataRoot}`);
+  logModule.info(`📁 [PRINT-MODULE] Project Root: ${projectRoot}`);
+  logModule.info(`📁 [PRINT-MODULE] APPDATA: ${process.env.APPDATA || '(non défini)'}`);
+  logModule.info(`📁 [PRINT-MODULE] GLOWFLIX_ROOT_DIR: ${process.env.GLOWFLIX_ROOT_DIR || '(non défini)'}`);
   
   // Chemins par défaut basés sur project root
   const defaultPrintDir = printDir || path.join(projectRoot, "printer");
@@ -1356,6 +1390,11 @@ export function createPrinterModule({
   const PRINT_DIR = defaultPrintDir;
   const templatesDirFinal = defaultTemplatesDir;
   const assetsDirFinal = defaultAssetsDir;
+  
+  logModule.info(`📁 [PRINT-MODULE] Print Dir: ${PRINT_DIR}`);
+  logModule.info(`📁 [PRINT-MODULE] Templates Dir: ${templatesDirFinal}`);
+  logModule.info(`📁 [PRINT-MODULE] Assets Dir: ${assetsDirFinal}`);
+  logModule.info('🖨️  [PRINT-MODULE] ==========================================');
   
   const PRINT_OK  = path.join(PRINT_DIR, "ok");
   const PRINT_ERR = path.join(PRINT_DIR, "err");
@@ -1528,7 +1567,7 @@ export function createPrinterModule({
         const numero = String(d.factureNum ?? d.numero ?? d.num ?? "").trim();
 
         const norm = normalizeForFingerprint(job);
-        const fp   = hashFingerprint(norm);
+        const fp   = await hashFingerprint(norm);
 
         const dup  = isDuplicate(dedupeStore, fp, numero);
         if (dup.duplicate) {
@@ -1713,21 +1752,78 @@ export function createPrinterModule({
   }
 
   function start() {
-    if (watcher) return;
+    if (watcher) {
+      log.warn("[PRINT] watcher déjà actif");
+      return;
+    }
+    
+    // 🖨️  LOGS CONSOLE DIRECTS - TOUJOURS VISIBLES
+    console.log('\n' + '='.repeat(70));
+    console.log('🖨️  [PRINT-MODULE] DÉMARRAGE DU WATCHER D\'IMPRESSION');
+    console.log('='.repeat(70));
+    console.log(`📁 Dossier surveillé: ${PRINT_DIR}`);
+    console.log(`📄 Patterns: *.json, *.pdf`);
+    console.log(`🔄 Max retry: ${maxRetry}`);
+    console.log(`📋 Template par défaut: ${DEFAULT_TEMPLATE}`);
+    console.log('='.repeat(70));
+    console.log('⚠️  IMPORTANT: Déposez les jobs dans le dossier ROOT, pas dans ok/err/tmp');
+    console.log('='.repeat(70) + '\n');
+    
+    log.info('🖨️  [PRINT] ==========================================');
+    log.info('🖨️  [PRINT] DÉMARRAGE DU WATCHER D\'IMPRESSION');
+    log.info('🖨️  [PRINT] ==========================================');
+    log.info(`📁 [PRINT] Surveillance: ${PRINT_DIR}`);
+    log.info(`📄 [PRINT] Patterns: *.json, *.pdf`);
+    log.info(`🔄 [PRINT] Max retry: ${maxRetry}`);
+    log.info(`📋 [PRINT] Template par défaut: ${DEFAULT_TEMPLATE}`);
+    log.info(`⚠️  [PRINT] CRITIQUE: Les jobs doivent être déposés dans ROOT (${PRINT_DIR})`);
+    log.info(`⚠️  [PRINT] PAS dans les sous-dossiers ok/, err/, tmp/`);
+    log.info('🖨️  [PRINT] ==========================================');
+    
     watcher = chokidar.watch(
       [path.join(PRINT_DIR, "*.json"), path.join(PRINT_DIR, "*.pdf")],
-      { ignoreInitial: false, awaitWriteFinish: false, depth: 0 }
+      { ignoreInitial: false, awaitWriteFinish: { stabilityThreshold: 500, pollInterval: 100 }, depth: 0 }
     );
     watcher.on("add", (file) => {
       const low = file.toLowerCase();
-      if (low.includes(`${path.sep}ok${path.sep}`) || low.includes(`${path.sep}err${path.sep}`) || low.includes(`${path.sep}tmp${path.sep}`)) return;
-      log.info(banner("info", "NEW JOB", [`${file}`]));
+      if (low.includes(`${path.sep}ok${path.sep}`) || low.includes(`${path.sep}err${path.sep}`) || low.includes(`${path.sep}tmp${path.sep}`)) {
+        log.warn(`⚠️  [PRINT] Fichier ignoré (sous-dossier): ${file}`);
+        return;
+      }
+      
+      // 🖨️  LOG CONSOLE DIRECT - TOUJOURS VISIBLE
+      console.log('\n' + '-'.repeat(50));
+      console.log(`🖨️  [PRINT] NOUVEAU JOB DÉTECTÉ!`);
+      console.log(`📄 Fichier: ${path.basename(file)}`);
+      console.log('-'.repeat(50) + '\n');
+      
+      log.info(clr("green", `✅ [PRINT] NOUVEAU JOB DÉTECTÉ`));
+      log.info(`📁 [PRINT] Fichier: ${path.basename(file)}`);
+      log.info(`📁 [PRINT] Chemin: ${file}`);
       if (enqueueIfNotQueued(queue, file)) {
+        log.info(`📋 [PRINT] Job ajouté à la file d'attente`);
+        console.log(`📋 [PRINT] Job en cours de traitement...`);
         scheduleDrain();
+      } else {
+        log.warn(`⚠️  [PRINT] Job déjà en file d'attente (skip)`);
       }
     });
-    watcher.on("error", (e) => log.error(banner("error", "WATCHER ERROR", [e.message])));
-    log.info(clr("magenta", `[PRINT] watching ${PRINT_DIR}\\*.json and *.pdf`));
+    watcher.on("error", (e) => {
+      console.log('\n' + '!'.repeat(50));
+      console.log(`❌ [PRINT] ERREUR WATCHER: ${e.message}`);
+      console.log('!'.repeat(50) + '\n');
+      log.error('❌ [PRINT] ==========================================');
+      log.error('❌ [PRINT] ERREUR WATCHER');
+      log.error('❌ [PRINT] ==========================================');
+      log.error(`❌ [PRINT] ${e.message}`);
+      log.error('❌ [PRINT] ==========================================');
+    });
+    
+    // 🖨️  CONFIRMATION FINALE - TRÈS VISIBLE
+    console.log('✅ [PRINT] WATCHER ACTIF ET PRÊT!');
+    console.log(`📁 Surveillance: ${PRINT_DIR}\\*.json et *.pdf\n`);
+    
+    log.info(clr("magenta", `✅ [PRINT] Watcher actif sur ${PRINT_DIR}\\*.json et *.pdf`));
 
     listRootAndEnqueue("startup");
     scheduleDrain();
@@ -1735,6 +1831,7 @@ export function createPrinterModule({
 
     const auto = (process.env.PRINT_GUARDIAN_AUTO ?? "1") !== "0";
     if (auto && process.platform === "win32") {
+      log.info(`🔧 [PRINT] Installation du PrintQueueGuardian (auto=${auto})`);
       installGuardian({ logger, printDir: PRINT_DIR }).catch(e => log.warn(`[guardian] install fail: ${e?.message}`));
     }
   }

@@ -327,16 +327,77 @@ router.post('/', optionalAuth, (req, res) => {
     });
 
     // Écrire aussi le fichier JSON pour le watcher (compatibilité avec print/module.js)
+    // CRITIQUE: Écrire dans le dossier ROOT du printer (pas dans tmp/) pour que le watcher le détecte
     try {
       const printDir = getPrintDir();
+      
+      // LOG: Chemin utilisé pour l'impression
+      logger.info('🖨️  [PRINT] ==========================================');
+      logger.info('🖨️  [PRINT] DÉBUT CRÉATION JOB D\'IMPRESSION');
+      logger.info('🖨️  [PRINT] ==========================================');
+      logger.info(`📁 [PRINT] Dossier printer: ${printDir}`);
+      logger.info(`📄 [PRINT] Facture: ${sale.invoice_number}`);
+      
+      // CRITIQUE: Créer les dossiers s'ils n'existent pas (indispensable en premier lancement)
+      if (!fs.existsSync(printDir)) {
+        logger.info(`📁 [PRINT] Création du dossier printer: ${printDir}`);
+        fs.mkdirSync(printDir, { recursive: true });
+      }
+      
+      // Créer aussi les sous-dossiers ok/err/tmp pour éviter erreurs du watcher
+      const okDir = path.join(printDir, 'ok');
+      const errDir = path.join(printDir, 'err');
+      const tmpDir = path.join(printDir, 'tmp');
+      const templatesDir = path.join(printDir, 'templates');
+      
+      [okDir, errDir, tmpDir, templatesDir].forEach(dir => {
+        if (!fs.existsSync(dir)) {
+          logger.info(`📁 [PRINT] Création du sous-dossier: ${path.basename(dir)}`);
+          fs.mkdirSync(dir, { recursive: true });
+        }
+      });
+      
       // Utiliser le numéro de facture pour un nom de fichier unique et identifiable
       const safeInvoiceNumber = sale.invoice_number.replace(/[^\w\-]/g, '_');
       const jobFile = path.join(printDir, `job-${safeInvoiceNumber}-${Date.now()}.json`);
+      
+      logger.info(`📄 [PRINT] Création du fichier job: ${path.basename(jobFile)}`);
+      logger.info(`📄 [PRINT] Chemin complet: ${jobFile}`);
+      
+      // Écrire le fichier avec gestion d'erreur robuste
       fs.writeFileSync(jobFile, JSON.stringify(printPayload, null, 2), 'utf-8');
-      console.log(`[PRINT] Job créé: ${path.basename(jobFile)}`);
+      
+      // Vérifier que le fichier existe bien après écriture
+      if (fs.existsSync(jobFile)) {
+        const stats = fs.statSync(jobFile);
+        logger.info(`✅ [PRINT] Job créé avec succès!`);
+        logger.info(`   - Nom: ${path.basename(jobFile)}`);
+        logger.info(`   - Taille: ${stats.size} bytes`);
+        logger.info(`   - Chemin: ${jobFile}`);
+        logger.info(`✅ [PRINT] Le watcher devrait détecter ce fichier dans quelques secondes...`);
+        logger.info('🖨️  [PRINT] ==========================================');
+      } else {
+        logger.error(`❌ [PRINT] ERREUR: Fichier non créé après writeFileSync!`);
+        logger.error(`   - Chemin attendu: ${jobFile}`);
+        logger.error(`   - Vérifier les permissions du dossier`);
+      }
     } catch (printError) {
       // Ne pas bloquer la vente si l'écriture du fichier échoue (OFFLINE-FIRST)
-      console.warn('[PRINT] Erreur écriture fichier print job:', printError);
+      logger.error('❌ [PRINT] ==========================================');
+      logger.error('❌ [PRINT] ERREUR CRITIQUE LORS DE LA CRÉATION DU JOB');
+      logger.error('❌ [PRINT] ==========================================');
+      logger.error(`❌ [PRINT] Message: ${printError.message}`);
+      logger.error(`❌ [PRINT] Code: ${printError.code || 'N/A'}`);
+      logger.error(`❌ [PRINT] Stack: ${printError.stack}`);
+      
+      if (printError.code === 'ENOENT') {
+        logger.error(`❌ [PRINT] Le dossier n'existe pas ou n'est pas accessible`);
+      } else if (printError.code === 'EACCES' || printError.code === 'EPERM') {
+        logger.error(`❌ [PRINT] Permissions insuffisantes pour écrire dans le dossier`);
+      }
+      
+      logger.error('❌ [PRINT] L\'impression ne fonctionnera pas pour cette vente');
+      logger.error('❌ [PRINT] ==========================================');
     }
 
     // 7. Audit log

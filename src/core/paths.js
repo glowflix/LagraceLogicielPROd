@@ -3,19 +3,39 @@ import path from "path";
 import os from "os";
 
 export function getDataRoot() {
+  // PRIORITÉ 1: Variable d'environnement explicite
   if (process.env.LAGRACE_DATA_DIR) return path.resolve(process.env.LAGRACE_DATA_DIR);
   if (process.env.GLOWFLIX_ROOT_DIR) return path.resolve(process.env.GLOWFLIX_ROOT_DIR);
 
-  // ✅ EN MODE EXE INSTALLÉ: Utiliser AppData\Roaming (utilisateur-spécifique)
+  // PRIORITÉ 2: Détection automatique selon le mode (build vs dev)
+  // ✅ EN MODE EXE INSTALLÉ: Utiliser %APPDATA%\Glowflixprojet (utilisateur-spécifique)
   // ✅ EN DEV: Utiliser C:\Glowflixprojet (dossier commun)
   // La différence: AppData = installé pour l'utilisateur, C:\ = partagé
   if (process.platform === "win32") {
     // Chercher AppData (Roaming de préférence)
     const appDataRoaming = process.env.APPDATA; // %APPDATA% = AppData\Roaming
     if (appDataRoaming) {
+      // CRITIQUE: En build, toujours utiliser AppData
+      // Vérifier si on est en mode "packaged" (electron) ou dev
+      const isPackaged = process.env.NODE_ENV === 'production' || 
+                         process.defaultApp === false ||
+                         (process.mainModule && process.mainModule.filename.indexOf('app.asar') !== -1);
+      
+      // En production (exe), TOUJOURS utiliser AppData
+      if (isPackaged || process.env.NODE_ENV === 'production') {
+        return path.join(appDataRoaming, "Glowflixprojet");
+      }
+      
+      // En dev, utiliser C:\ si le dossier existe déjà, sinon AppData aussi
+      const devPath = "C:\\Glowflixprojet";
+      if (fs.existsSync(devPath)) {
+        return devPath;
+      }
+      
+      // Sinon, utiliser AppData même en dev (cohérence)
       return path.join(appDataRoaming, "Glowflixprojet");
     }
-    // Fallback si APPDATA pas défini
+    // Fallback si APPDATA pas défini (rare mais possible)
     return "C:\\Glowflixprojet";
   }
   
@@ -52,10 +72,24 @@ export function ensureDirs() {
     "config",
   ];
 
+  console.log('📁 [PATHS] ==========================================');
+  console.log('📁 [PATHS] CRÉATION DES DOSSIERS SYSTÈME');
+  console.log('📁 [PATHS] ==========================================');
+  console.log(`📁 [PATHS] Root: ${root}`);
+  console.log(`📁 [PATHS] Platform: ${process.platform}`);
+  console.log(`📁 [PATHS] NODE_ENV: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`📁 [PATHS] APPDATA: ${process.env.APPDATA || '(non défini)'}`);
+
   for (const d of dirs) {
     const fullPath = path.join(root, d);
-    if (!fs.existsSync(fullPath)) fs.mkdirSync(fullPath, { recursive: true });
+    if (!fs.existsSync(fullPath)) {
+      fs.mkdirSync(fullPath, { recursive: true });
+      console.log(`✅ [PATHS] Créé: ${d}`);
+    }
   }
+  
+  console.log(`✅ [PATHS] Tous les dossiers sont prêts`);
+  console.log('📁 [PATHS] ==========================================');
   return root;
 }
 
