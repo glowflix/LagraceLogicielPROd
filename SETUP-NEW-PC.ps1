@@ -1,231 +1,284 @@
 # ============================================================================
-# 🚀 SCRIPT D'INSTALLATION AUTOMATIQUE - LA GRACE POS
+# SCRIPT D'INSTALLATION AUTOMATIQUE - LA GRACE POS
 # ============================================================================
-# Ce script installe automatiquement tous les outils nécessaires sur un nouveau PC:
-# - Node.js 20 LTS
-# - Python 3.11
-# - SQLite (inclus avec Python)
-# - Toutes les dépendances npm
+# Ce script installe automatiquement tous les outils necessaires:
+# - Node.js 20 LTS (pour npm, React, Electron)
+# - Python 3.11 (pour l'IA)
+# - Git
+# - Toutes les dependances npm (React, Electron, Vite, etc.)
 # - L'environnement virtuel Python pour l'IA
 # ============================================================================
-# USAGE: Exécuter en tant qu'Administrateur
+# USAGE: Executer en tant qu'Administrateur
 #   powershell -ExecutionPolicy Bypass -File SETUP-NEW-PC.ps1
 # ============================================================================
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 $ProgressPreference = "SilentlyContinue"
 
 # Couleurs pour le terminal
-function Write-Title($text) { Write-Host "`n$('='*70)" -ForegroundColor Cyan; Write-Host "  $text" -ForegroundColor Cyan; Write-Host "$('='*70)`n" -ForegroundColor Cyan }
-function Write-Step($text) { Write-Host "➡️  $text" -ForegroundColor Yellow }
-function Write-Success($text) { Write-Host "✅ $text" -ForegroundColor Green }
-function Write-Error($text) { Write-Host "❌ $text" -ForegroundColor Red }
-function Write-Info($text) { Write-Host "ℹ️  $text" -ForegroundColor Gray }
+function Write-Title($text) { 
+    Write-Host ""
+    Write-Host ("=" * 70) -ForegroundColor Cyan
+    Write-Host "  $text" -ForegroundColor Cyan
+    Write-Host ("=" * 70) -ForegroundColor Cyan
+    Write-Host ""
+}
+function Write-Step($text) { Write-Host "[>] $text" -ForegroundColor Yellow }
+function Write-OK($text) { Write-Host "[OK] $text" -ForegroundColor Green }
+function Write-Err($text) { Write-Host "[X] $text" -ForegroundColor Red }
+function Write-Info($text) { Write-Host "[i] $text" -ForegroundColor Gray }
 
-# Dossier du projet (fonctionne si exécuté comme fichier OU collé dans le terminal)
+# Dossier du projet
 if ($MyInvocation.MyCommand.Path) {
     $PROJECT_DIR = Split-Path -Parent $MyInvocation.MyCommand.Path
 } else {
-    # Si collé directement dans le terminal, utiliser le dossier courant
-    $PROJECT_DIR = Get-Location
+    $PROJECT_DIR = (Get-Location).Path
 }
-Set-Location $PROJECT_DIR
 
-Write-Title "🚀 INSTALLATION AUTOMATIQUE - LA GRACE POS"
-Write-Host "📁 Dossier du projet: $PROJECT_DIR" -ForegroundColor White
+Write-Title "INSTALLATION AUTOMATIQUE - LA GRACE POS"
+Write-Host "Dossier du projet: $PROJECT_DIR" -ForegroundColor White
 Write-Host ""
 
+# Aller dans le dossier du projet
+Set-Location $PROJECT_DIR
+
 # ============================================================================
-# VÉRIFICATION DES DROITS ADMIN
+# VERIFICATION DES DROITS ADMIN
 # ============================================================================
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
-    Write-Error "Ce script doit être exécuté en tant qu'Administrateur!"
-    Write-Info "Clic droit sur PowerShell > Exécuter en tant qu'administrateur"
+    Write-Err "Ce script doit etre execute en tant qu'Administrateur!"
+    Write-Info "Clic droit sur PowerShell > Executer en tant qu'administrateur"
     Write-Host ""
     Write-Host "Relancement automatique en mode Admin..." -ForegroundColor Yellow
-    Start-Process powershell -Verb RunAs -ArgumentList "-ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`""
-    exit
+    
+    $scriptPath = $MyInvocation.MyCommand.Path
+    if ($scriptPath) {
+        Start-Process powershell -Verb RunAs -ArgumentList "-ExecutionPolicy Bypass -File `"$scriptPath`""
+        exit
+    } else {
+        Write-Host "Veuillez relancer manuellement en mode Administrateur" -ForegroundColor Red
+        pause
+        exit
+    }
 }
 
+Write-OK "Droits administrateur OK"
+
 # ============================================================================
-# INSTALLATION DE WINGET (si nécessaire)
+# 1. INSTALLATION DE WINGET (si necessaire)
 # ============================================================================
-Write-Title "1️⃣ VÉRIFICATION DE WINGET"
+Write-Title "1. VERIFICATION DE WINGET"
 
 $wingetExists = Get-Command winget -ErrorAction SilentlyContinue
 if (-not $wingetExists) {
     Write-Step "Installation de winget (App Installer)..."
     try {
-        # Télécharger et installer App Installer depuis le Microsoft Store
         $appInstallerUrl = "https://aka.ms/getwinget"
         $appInstallerPath = "$env:TEMP\Microsoft.DesktopAppInstaller.msixbundle"
-        Invoke-WebRequest -Uri $appInstallerUrl -OutFile $appInstallerPath
+        Invoke-WebRequest -Uri $appInstallerUrl -OutFile $appInstallerPath -UseBasicParsing
         Add-AppxPackage -Path $appInstallerPath
-        Write-Success "Winget installé!"
+        Write-OK "Winget installe!"
     } catch {
-        Write-Error "Impossible d'installer winget automatiquement"
+        Write-Err "Impossible d'installer winget automatiquement"
         Write-Info "Installer manuellement depuis: https://aka.ms/getwinget"
+        Write-Info "Puis relancer ce script"
+        pause
+        exit 1
     }
 } else {
-    Write-Success "Winget déjà installé"
+    Write-OK "Winget deja installe"
 }
 
 # ============================================================================
-# INSTALLATION DE NODE.JS 20 LTS
+# 2. INSTALLATION DE NODE.JS 20 LTS
 # ============================================================================
-Write-Title "2️⃣ INSTALLATION DE NODE.JS 20 LTS"
+Write-Title "2. INSTALLATION DE NODE.JS 20 LTS"
 
 $nodeVersion = $null
 try {
     $nodeVersion = (node --version 2>$null)
 } catch {}
 
-if ($nodeVersion -and $nodeVersion -match "v20") {
-    Write-Success "Node.js 20 déjà installé: $nodeVersion"
-} elseif ($nodeVersion) {
-    Write-Info "Node.js installé mais version différente: $nodeVersion"
-    Write-Step "Installation de Node.js 20 LTS via winget..."
-    winget install OpenJS.NodeJS.LTS --version 20.18.1 --accept-package-agreements --accept-source-agreements
-    Write-Success "Node.js 20 LTS installé!"
-    Write-Info "⚠️  Redémarrer le terminal après l'installation pour utiliser node/npm"
+if ($nodeVersion -and $nodeVersion -match "v(18|20|22)") {
+    Write-OK "Node.js deja installe: $nodeVersion"
 } else {
+    if ($nodeVersion) {
+        Write-Info "Node.js installe mais version differente: $nodeVersion"
+    }
     Write-Step "Installation de Node.js 20 LTS via winget..."
-    winget install OpenJS.NodeJS.LTS --version 20.18.1 --accept-package-agreements --accept-source-agreements
-    Write-Success "Node.js 20 LTS installé!"
-    Write-Info "⚠️  Redémarrer le terminal après l'installation pour utiliser node/npm"
+    winget install OpenJS.NodeJS.LTS --accept-package-agreements --accept-source-agreements --silent
+    
+    if ($LASTEXITCODE -eq 0) {
+        Write-OK "Node.js 20 LTS installe!"
+    } else {
+        Write-Err "Erreur installation Node.js - Essai avec installeur direct..."
+        # Fallback: telecharger directement
+        $nodeUrl = "https://nodejs.org/dist/v20.18.1/node-v20.18.1-x64.msi"
+        $nodeMsi = "$env:TEMP\node-v20.18.1-x64.msi"
+        Write-Step "Telechargement de Node.js..."
+        Invoke-WebRequest -Uri $nodeUrl -OutFile $nodeMsi -UseBasicParsing
+        Write-Step "Installation de Node.js..."
+        Start-Process msiexec.exe -ArgumentList "/i `"$nodeMsi`" /qn" -Wait
+        Write-OK "Node.js installe via MSI!"
+    }
+    Write-Info "Redemarrer le terminal apres l'installation pour utiliser node/npm"
 }
 
-# Rafraîchir le PATH
+# Rafraichir le PATH
 $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
 
 # ============================================================================
-# INSTALLATION DE PYTHON 3.11
+# 3. INSTALLATION DE PYTHON 3.11
 # ============================================================================
-Write-Title "3️⃣ INSTALLATION DE PYTHON 3.11"
+Write-Title "3. INSTALLATION DE PYTHON 3.11"
 
 $pythonVersion = $null
 try {
     $pythonVersion = (python --version 2>$null)
 } catch {}
 
-if ($pythonVersion -and $pythonVersion -match "3\.(10|11|12)") {
-    Write-Success "Python déjà installé: $pythonVersion"
+if ($pythonVersion -and $pythonVersion -match "3\.(10|11|12|13)") {
+    Write-OK "Python deja installe: $pythonVersion"
 } else {
     Write-Step "Installation de Python 3.11 via winget..."
-    winget install Python.Python.3.11 --accept-package-agreements --accept-source-agreements
-    Write-Success "Python 3.11 installé!"
-    Write-Info "⚠️  Redémarrer le terminal après l'installation pour utiliser python"
+    winget install Python.Python.3.11 --accept-package-agreements --accept-source-agreements --silent
+    
+    if ($LASTEXITCODE -eq 0) {
+        Write-OK "Python 3.11 installe!"
+    } else {
+        Write-Err "Erreur installation Python via winget"
+        Write-Info "Installer manuellement depuis: https://www.python.org/downloads/"
+    }
+    Write-Info "Redemarrer le terminal apres l'installation pour utiliser python"
 }
 
-# Rafraîchir le PATH
+# Rafraichir le PATH
 $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
 
 # ============================================================================
-# INSTALLATION DE GIT (optionnel mais recommandé)
+# 4. INSTALLATION DE GIT
 # ============================================================================
-Write-Title "4️⃣ INSTALLATION DE GIT"
+Write-Title "4. INSTALLATION DE GIT"
 
 $gitExists = Get-Command git -ErrorAction SilentlyContinue
 if (-not $gitExists) {
     Write-Step "Installation de Git..."
-    winget install Git.Git --accept-package-agreements --accept-source-agreements
-    Write-Success "Git installé!"
+    winget install Git.Git --accept-package-agreements --accept-source-agreements --silent
+    
+    if ($LASTEXITCODE -eq 0) {
+        Write-OK "Git installe!"
+    } else {
+        Write-Info "Git optionnel - continuer sans Git"
+    }
 } else {
-    Write-Success "Git déjà installé: $(git --version)"
+    Write-OK "Git deja installe: $(git --version)"
 }
 
-# Rafraîchir le PATH
+# Rafraichir le PATH
 $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
 
 # ============================================================================
-# INSTALLATION DES DÉPENDANCES NPM
+# 5. INSTALLATION DES DEPENDANCES NPM (React, Electron, Vite, etc.)
 # ============================================================================
-Write-Title "5️⃣ INSTALLATION DES DÉPENDANCES NPM"
+Write-Title "5. INSTALLATION DES DEPENDANCES NPM"
 
-# Vérifier que npm est accessible
+# Verifier que npm est accessible
 $npmExists = Get-Command npm -ErrorAction SilentlyContinue
 if (-not $npmExists) {
-    Write-Error "npm non trouvé! Redémarrer le terminal et relancer le script."
-    Write-Info "Ou installer manuellement: https://nodejs.org/en/download/"
+    Write-Err "npm non trouve!"
+    Write-Info "Fermer ce terminal, en ouvrir un nouveau, et relancer le script"
+    Write-Info "Ou installer Node.js manuellement: https://nodejs.org/en/download/"
     pause
     exit 1
 }
 
-Write-Step "Installation des dépendances npm (npm install)..."
+Write-OK "npm trouve: v$(npm --version)"
+
+Write-Step "Installation des dependances npm (React, Electron, Vite, etc.)..."
+Write-Info "Cela peut prendre quelques minutes..."
+
 Set-Location $PROJECT_DIR
-npm install
+npm install 2>&1 | Out-Host
+
 if ($LASTEXITCODE -eq 0) {
-    Write-Success "Dépendances npm installées!"
+    Write-OK "Dependances npm installees!"
+    Write-Info "  - React (UI)"
+    Write-Info "  - Electron (application desktop)"
+    Write-Info "  - Vite (bundler)"
+    Write-Info "  - Express (serveur backend)"
+    Write-Info "  - SQLite (better-sqlite3)"
+    Write-Info "  - Socket.IO (temps reel)"
 } else {
-    Write-Error "Erreur lors de npm install"
+    Write-Err "Erreur lors de npm install"
+    Write-Info "Essayer: npm install --legacy-peer-deps"
 }
 
 # ============================================================================
-# CRÉATION DE L'ENVIRONNEMENT VIRTUEL PYTHON
+# 6. CREATION DE L'ENVIRONNEMENT VIRTUEL PYTHON (pour l'IA)
 # ============================================================================
-Write-Title "6️⃣ CONFIGURATION DE L'ENVIRONNEMENT PYTHON (AI LaGrace)"
+Write-Title "6. CONFIGURATION PYTHON (AI LaGrace)"
 
 $venvPath = Join-Path $PROJECT_DIR ".venv"
 $aiLagracePath = Join-Path $PROJECT_DIR "ai-lagrace"
 
-if (Test-Path $aiLagracePath) {
-    Write-Step "Création de l'environnement virtuel Python..."
+# Verifier si Python est disponible
+$pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+if (-not $pythonCmd) {
+    Write-Info "Python non disponible - skip configuration IA"
+    Write-Info "Installer Python et relancer le script pour configurer l'IA"
+} elseif (Test-Path $aiLagracePath) {
+    Write-Step "Creation de l'environnement virtuel Python..."
     
     # Supprimer l'ancien venv s'il existe
     if (Test-Path $venvPath) {
         Write-Info "Suppression de l'ancien environnement virtuel..."
-        Remove-Item -Recurse -Force $venvPath
+        Remove-Item -Recurse -Force $venvPath -ErrorAction SilentlyContinue
     }
     
-    # Créer le nouveau venv
+    # Creer le nouveau venv
     python -m venv $venvPath
     
     if (Test-Path $venvPath) {
-        Write-Success "Environnement virtuel créé: $venvPath"
+        Write-OK "Environnement virtuel cree: $venvPath"
         
-        # Activer et installer les dépendances
-        Write-Step "Installation des dépendances Python pour l'IA..."
+        # Installer les dependances
+        Write-Step "Installation des dependances Python pour l'IA..."
         $pipPath = Join-Path $venvPath "Scripts\pip.exe"
         $requirementsPath = Join-Path $aiLagracePath "requirements.txt"
         
         if (Test-Path $requirementsPath) {
-            & $pipPath install -r $requirementsPath
-            Write-Success "Dépendances Python installées!"
+            & $pipPath install -r $requirementsPath 2>&1 | Out-Host
+            Write-OK "Dependances Python installees!"
         } else {
-            Write-Info "Pas de requirements.txt trouvé dans ai-lagrace"
-            # Installer les packages de base
-            & $pipPath install flask flask-cors python-socketio requests
-            Write-Success "Packages Python de base installés!"
+            Write-Info "Pas de requirements.txt - installation des packages de base"
+            & $pipPath install flask flask-cors python-socketio requests pyttsx3 2>&1 | Out-Host
+            Write-OK "Packages Python de base installes!"
         }
     } else {
-        Write-Error "Échec de la création du venv"
+        Write-Err "Echec de la creation du venv"
     }
 } else {
-    Write-Info "Dossier ai-lagrace non trouvé, skip de la config Python"
+    Write-Info "Dossier ai-lagrace non trouve - skip configuration IA"
 }
 
 # ============================================================================
-# CONFIGURATION DU FICHIER .ENV
+# 7. CONFIGURATION DU FICHIER config.env
 # ============================================================================
-Write-Title "7️⃣ CONFIGURATION DU FICHIER config.env"
+Write-Title "7. CONFIGURATION config.env"
 
 $configEnvPath = Join-Path $PROJECT_DIR "config.env"
-$configEnvExample = Join-Path $PROJECT_DIR "config.example.env"
 
 if (-not (Test-Path $configEnvPath)) {
-    if (Test-Path $configEnvExample) {
-        Copy-Item $configEnvExample $configEnvPath
-        Write-Success "config.env créé depuis config.example.env"
-    } else {
-        # Créer un config.env de base
-        $defaultConfig = @"
+    Write-Step "Creation de config.env..."
+    
+    $defaultConfig = @"
 # Configuration LA GRACE POS
 PORT=3030
 HOST=0.0.0.0
 NODE_ENV=development
 
-# Base de données (SQLite - chemin auto-détecté)
+# Base de donnees SQLite (chemin auto-detecte)
 # DB_PATH=%APPDATA%\LA GRACE POS\lagrace.db
 
 # Google Sheets Sync (optionnel)
@@ -235,18 +288,17 @@ NODE_ENV=development
 AI_LAGRACE_ENABLED=true
 AI_LAGRACE_AUTOSTART=false
 "@
-        Set-Content -Path $configEnvPath -Value $defaultConfig
-        Write-Success "config.env créé avec la configuration par défaut"
-    }
-    Write-Info "📝 Éditer config.env pour personnaliser la configuration"
+    Set-Content -Path $configEnvPath -Value $defaultConfig -Encoding UTF8
+    Write-OK "config.env cree avec la configuration par defaut"
+    Write-Info "Editer config.env pour personnaliser"
 } else {
-    Write-Success "config.env existe déjà"
+    Write-OK "config.env existe deja"
 }
 
 # ============================================================================
-# CRÉATION DES DOSSIERS NÉCESSAIRES
+# 8. CREATION DES DOSSIERS NECESSAIRES
 # ============================================================================
-Write-Title "8️⃣ CRÉATION DES DOSSIERS"
+Write-Title "8. CREATION DES DOSSIERS"
 
 $folders = @(
     "$env:APPDATA\LA GRACE POS",
@@ -257,70 +309,101 @@ $folders = @(
 foreach ($folder in $folders) {
     if (-not (Test-Path $folder)) {
         New-Item -ItemType Directory -Path $folder -Force | Out-Null
-        Write-Success "Dossier créé: $folder"
+        Write-OK "Dossier cree: $folder"
     } else {
         Write-Info "Dossier existe: $folder"
     }
 }
 
 # ============================================================================
-# BUILD DU PROJET (optionnel)
+# 9. BUILD DU PROJET (optionnel)
 # ============================================================================
-Write-Title "9️⃣ BUILD DU PROJET"
+Write-Title "9. BUILD DU PROJET"
 
+Write-Host ""
 Write-Host "Voulez-vous builder le projet maintenant? (O/N)" -ForegroundColor Yellow
 $buildChoice = Read-Host
+
 if ($buildChoice -eq "O" -or $buildChoice -eq "o" -or $buildChoice -eq "Y" -or $buildChoice -eq "y") {
-    Write-Step "Build du frontend (Vite)..."
-    npm run build:ui
+    Write-Step "Build du projet..."
     
-    Write-Step "Build du backend (ESBuild)..."
-    npm run build:backend
+    npm run build 2>&1 | Out-Host
     
     if ($LASTEXITCODE -eq 0) {
-        Write-Success "Build terminé!"
+        Write-OK "Build termine!"
     } else {
-        Write-Error "Erreur lors du build"
+        Write-Err "Erreur lors du build - verifier les erreurs ci-dessus"
     }
 } else {
-    Write-Info "Build ignoré. Lancer 'npm run build' plus tard."
+    Write-Info "Build ignore. Lancer 'npm run build' plus tard."
 }
 
 # ============================================================================
-# RÉSUMÉ FINAL
+# RESUME FINAL
 # ============================================================================
-Write-Title "🎉 INSTALLATION TERMINÉE!"
+Write-Title "INSTALLATION TERMINEE!"
 
 Write-Host ""
-Write-Host "╔══════════════════════════════════════════════════════════════════════╗" -ForegroundColor Green
-Write-Host "║                    ✅ TOUT EST PRÊT!                                  ║" -ForegroundColor Green
-Write-Host "╠══════════════════════════════════════════════════════════════════════╣" -ForegroundColor Green
-Write-Host "║                                                                      ║" -ForegroundColor Green
-Write-Host "║  📁 Projet: $($PROJECT_DIR.PadRight(52))║" -ForegroundColor White
-Write-Host "║                                                                      ║" -ForegroundColor Green
-Write-Host "║  🚀 COMMANDES UTILES:                                                ║" -ForegroundColor Green
-Write-Host "║                                                                      ║" -ForegroundColor Green
-Write-Host "║     npm run dev          → Démarrer en mode développement           ║" -ForegroundColor Yellow
-Write-Host "║     npm run build        → Builder le projet                        ║" -ForegroundColor Yellow
-Write-Host "║     npm run electron:dev → Démarrer Electron en dev                 ║" -ForegroundColor Yellow
-Write-Host "║     npm run dist         → Créer l'EXE installable                  ║" -ForegroundColor Yellow
-Write-Host "║                                                                      ║" -ForegroundColor Green
-Write-Host "║  📝 PROCHAINES ÉTAPES:                                               ║" -ForegroundColor Green
-Write-Host "║     1. Fermer et rouvrir le terminal (pour charger le PATH)         ║" -ForegroundColor White
-Write-Host "║     2. Éditer config.env si nécessaire                              ║" -ForegroundColor White
-Write-Host "║     3. Lancer: npm run dev                                          ║" -ForegroundColor White
-Write-Host "║                                                                      ║" -ForegroundColor Green
-Write-Host "╚══════════════════════════════════════════════════════════════════════╝" -ForegroundColor Green
+Write-Host "========================================================================" -ForegroundColor Green
+Write-Host "                         TOUT EST PRET!                                 " -ForegroundColor Green
+Write-Host "========================================================================" -ForegroundColor Green
+Write-Host ""
+Write-Host "  Projet: $PROJECT_DIR" -ForegroundColor White
+Write-Host ""
+Write-Host "  COMPOSANTS INSTALLES:" -ForegroundColor Cyan
+Write-Host "    - Node.js 20 LTS (npm, npx)" -ForegroundColor White
+Write-Host "    - React + Vite (frontend)" -ForegroundColor White
+Write-Host "    - Electron (application desktop)" -ForegroundColor White
+Write-Host "    - Express + SQLite (backend)" -ForegroundColor White
+Write-Host "    - Python + venv (IA)" -ForegroundColor White
+Write-Host ""
+Write-Host "  COMMANDES UTILES:" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "    npm run dev           - Demarrer en mode developpement" -ForegroundColor Yellow
+Write-Host "    npm run build         - Builder le projet" -ForegroundColor Yellow
+Write-Host "    npm run electron:dev  - Demarrer Electron en dev" -ForegroundColor Yellow
+Write-Host "    npm run dist          - Creer l'EXE installable" -ForegroundColor Yellow
+Write-Host ""
+Write-Host "  PROCHAINES ETAPES:" -ForegroundColor Cyan
+Write-Host "    1. FERMER et ROUVRIR le terminal (pour charger le PATH)" -ForegroundColor White
+Write-Host "    2. Editer config.env si necessaire" -ForegroundColor White
+Write-Host "    3. Lancer: npm run dev" -ForegroundColor White
+Write-Host ""
+Write-Host "========================================================================" -ForegroundColor Green
 Write-Host ""
 
-# Vérification finale des versions
-Write-Host "`n📊 VERSIONS INSTALLÉES:" -ForegroundColor Cyan
-Write-Host "─────────────────────────" -ForegroundColor Gray
-try { Write-Host "   Node.js: $(node --version)" -ForegroundColor White } catch { Write-Host "   Node.js: ⚠️ Redémarrer terminal" -ForegroundColor Yellow }
-try { Write-Host "   npm:     v$(npm --version)" -ForegroundColor White } catch { Write-Host "   npm:     ⚠️ Redémarrer terminal" -ForegroundColor Yellow }
-try { Write-Host "   Python:  $(python --version)" -ForegroundColor White } catch { Write-Host "   Python:  ⚠️ Redémarrer terminal" -ForegroundColor Yellow }
-try { Write-Host "   Git:     $(git --version)" -ForegroundColor White } catch { Write-Host "   Git:     Non installé" -ForegroundColor Gray }
-Write-Host ""
+# Verification finale des versions
+Write-Host "VERSIONS INSTALLEES:" -ForegroundColor Cyan
+Write-Host "-------------------------" -ForegroundColor Gray
 
+try { 
+    $nv = node --version 2>$null
+    Write-Host "   Node.js: $nv" -ForegroundColor White 
+} catch { 
+    Write-Host "   Node.js: [Redemarrer terminal]" -ForegroundColor Yellow 
+}
+
+try { 
+    $npmv = npm --version 2>$null
+    Write-Host "   npm:     v$npmv" -ForegroundColor White 
+} catch { 
+    Write-Host "   npm:     [Redemarrer terminal]" -ForegroundColor Yellow 
+}
+
+try { 
+    $pyv = python --version 2>$null
+    Write-Host "   Python:  $pyv" -ForegroundColor White 
+} catch { 
+    Write-Host "   Python:  [Redemarrer terminal]" -ForegroundColor Yellow 
+}
+
+try { 
+    $gv = git --version 2>$null
+    Write-Host "   Git:     $gv" -ForegroundColor White 
+} catch { 
+    Write-Host "   Git:     Non installe (optionnel)" -ForegroundColor Gray 
+}
+
+Write-Host ""
 Write-Host "Appuyez sur une touche pour fermer..." -ForegroundColor Gray
 $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
