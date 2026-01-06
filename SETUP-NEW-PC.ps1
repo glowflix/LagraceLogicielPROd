@@ -230,33 +230,93 @@ if (-not $pythonCmd) {
 } elseif (Test-Path $aiLagracePath) {
     Write-Step "Creation de l'environnement virtuel Python..."
     
-    # Supprimer l'ancien venv s'il existe
+    # TOUJOURS supprimer l'ancien venv pour eviter les problemes de pip corrompu
     if (Test-Path $venvPath) {
-        Write-Info "Suppression de l'ancien environnement virtuel..."
+        Write-Info "Suppression de l'ancien environnement virtuel (evite pip corrompu)..."
+        # Fermer tous les processus Python qui pourraient utiliser le venv
+        Get-Process python -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "*$venvPath*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 500
         Remove-Item -Recurse -Force $venvPath -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 500
     }
     
     # Creer le nouveau venv
+    Write-Step "Creation du venv..."
     python -m venv $venvPath
     
     if (Test-Path $venvPath) {
         Write-OK "Environnement virtuel cree: $venvPath"
         
-        # Installer les dependances
-        Write-Step "Installation des dependances Python pour l'IA..."
-        $pipPath = Join-Path $venvPath "Scripts\pip.exe"
+        $pythonPath = Join-Path $venvPath "Scripts\python.exe"
         $requirementsPath = Join-Path $aiLagracePath "requirements.txt"
         
-        if (Test-Path $requirementsPath) {
-            & $pipPath install -r $requirementsPath 2>&1 | Out-Host
-            Write-OK "Dependances Python installees!"
+        # ETAPE 1: Mettre a jour pip en utilisant python -m pip (evite pip.exe corrompu)
+        Write-Step "Mise a jour de pip (via python -m pip)..."
+        & $pythonPath -m pip install --upgrade pip --quiet 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-OK "pip mis a jour"
         } else {
-            Write-Info "Pas de requirements.txt - installation des packages de base"
-            & $pipPath install flask flask-cors python-socketio requests pyttsx3 2>&1 | Out-Host
-            Write-OK "Packages Python de base installes!"
+            Write-Info "pip deja a jour ou erreur mineure"
+        }
+        
+        # ETAPE 2: Installer les dependances en utilisant python -m pip
+        Write-Step "Installation des dependances Python pour l'IA..."
+        
+        # Installer les packages principaux un par un pour eviter les erreurs
+        $packages = @(
+            "python-socketio[client]",
+            "aiohttp",
+            "requests", 
+            "vosk",
+            "sounddevice",
+            "numpy",
+            "pyttsx3",
+            "soundfile",
+            "scipy",
+            "webrtcvad",
+            "python-dotenv",
+            "colorama",
+            "onnxruntime",
+            "websocket-client"
+        )
+        
+        $failedPackages = @()
+        foreach ($pkg in $packages) {
+            Write-Host "  Installing $pkg..." -ForegroundColor Gray -NoNewline
+            $result = & $pythonPath -m pip install $pkg --quiet 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host " OK" -ForegroundColor Green
+            } else {
+                Write-Host " SKIP" -ForegroundColor Yellow
+                $failedPackages += $pkg
+            }
+        }
+        
+        # Essayer piper-tts separement (optionnel, peut echouer)
+        Write-Host "  Installing piper-tts (optionnel)..." -ForegroundColor Gray -NoNewline
+        & $pythonPath -m pip install piper-tts --quiet 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host " OK" -ForegroundColor Green
+        } else {
+            Write-Host " SKIP (Windows TTS sera utilise)" -ForegroundColor Yellow
+        }
+        
+        # ETAPE 3: Verification de l'installation
+        Write-Step "Verification de l'installation Python..."
+        $testResult = & $pythonPath -c "import socketio; import numpy; import requests; print('OK')" 2>&1
+        if ($testResult -match "OK") {
+            Write-OK "Dependances Python installees et verifiees!"
+            if ($failedPackages.Count -gt 0) {
+                Write-Info "Packages optionnels non installes: $($failedPackages -join ', ')"
+            }
+        } else {
+            Write-Err "Certains modules Python manquent"
+            Write-Info "Erreur: $testResult"
+            Write-Info "Essayer manuellement: .\.venv\Scripts\python.exe -m pip install -r ai-lagrace\requirements.txt"
         }
     } else {
         Write-Err "Echec de la creation du venv"
+        Write-Info "Verifier que Python est correctement installe"
     }
 } else {
     Write-Info "Dossier ai-lagrace non trouve - skip configuration IA"
@@ -343,19 +403,106 @@ if ($buildChoice -eq "O" -or $buildChoice -eq "o" -or $buildChoice -eq "Y" -or $
 # ============================================================================
 Write-Title "INSTALLATION TERMINEE!"
 
+# Verification finale automatique
+Write-Step "Verification finale de l'installation..."
+
+$allOK = $true
+
+# Verifier Node.js
+try { 
+    $nv = node --version 2>$null
+    if ($nv) {
+        Write-OK "Node.js: $nv"
+    } else {
+        Write-Err "Node.js: NON INSTALLE"
+        $allOK = $false
+    }
+} catch { 
+    Write-Err "Node.js: NON TROUVE (redemarrer terminal)"
+    $allOK = $false
+}
+
+# Verifier npm
+try { 
+    $npmv = npm --version 2>$null
+    if ($npmv) {
+        Write-OK "npm: v$npmv"
+    } else {
+        Write-Err "npm: NON INSTALLE"
+        $allOK = $false
+    }
+} catch { 
+    Write-Err "npm: NON TROUVE (redemarrer terminal)"
+    $allOK = $false
+}
+
+# Verifier Python
+try { 
+    $pyv = python --version 2>$null
+    if ($pyv) {
+        Write-OK "Python: $pyv"
+    } else {
+        Write-Info "Python: NON INSTALLE (optionnel pour l'IA)"
+    }
+} catch { 
+    Write-Info "Python: NON TROUVE (optionnel)"
+}
+
+# Verifier Git
+try { 
+    $gv = git --version 2>$null
+    if ($gv) {
+        Write-OK "Git: $gv"
+    } else {
+        Write-Info "Git: NON INSTALLE (optionnel)"
+    }
+} catch { 
+    Write-Info "Git: NON TROUVE (optionnel)"
+}
+
+# Verifier node_modules
+if (Test-Path (Join-Path $PROJECT_DIR "node_modules")) {
+    $nodeModulesCount = (Get-ChildItem (Join-Path $PROJECT_DIR "node_modules") -Directory).Count
+    Write-OK "node_modules: $nodeModulesCount packages installes"
+} else {
+    Write-Err "node_modules: MANQUANT - relancer npm install"
+    $allOK = $false
+}
+
+# Verifier venv Python
+$venvPython = Join-Path $PROJECT_DIR ".venv\Scripts\python.exe"
+if (Test-Path $venvPython) {
+    $venvTest = & $venvPython -c "import socketio; print('OK')" 2>&1
+    if ($venvTest -match "OK") {
+        Write-OK "Python venv: OK (socketio installe)"
+    } else {
+        Write-Info "Python venv: Certains modules manquent"
+    }
+} else {
+    Write-Info "Python venv: Non configure (IA optionnelle)"
+}
+
 Write-Host ""
-Write-Host "========================================================================" -ForegroundColor Green
-Write-Host "                         TOUT EST PRET!                                 " -ForegroundColor Green
-Write-Host "========================================================================" -ForegroundColor Green
+
+if ($allOK) {
+    Write-Host "========================================================================" -ForegroundColor Green
+    Write-Host "                    TOUT EST PRET!                                      " -ForegroundColor Green
+    Write-Host "========================================================================" -ForegroundColor Green
+} else {
+    Write-Host "========================================================================" -ForegroundColor Yellow
+    Write-Host "           INSTALLATION PARTIELLE - VERIFIER LES ERREURS               " -ForegroundColor Yellow
+    Write-Host "========================================================================" -ForegroundColor Yellow
+}
+
 Write-Host ""
 Write-Host "  Projet: $PROJECT_DIR" -ForegroundColor White
 Write-Host ""
-Write-Host "  COMPOSANTS INSTALLES:" -ForegroundColor Cyan
+Write-Host "  COMPOSANTS:" -ForegroundColor Cyan
 Write-Host "    - Node.js 20 LTS (npm, npx)" -ForegroundColor White
 Write-Host "    - React + Vite (frontend)" -ForegroundColor White
 Write-Host "    - Electron (application desktop)" -ForegroundColor White
 Write-Host "    - Express + SQLite (backend)" -ForegroundColor White
-Write-Host "    - Python + venv (IA)" -ForegroundColor White
+Write-Host "    - Python + venv (IA optionnel)" -ForegroundColor White
 Write-Host ""
 Write-Host "  COMMANDES UTILES:" -ForegroundColor Cyan
 Write-Host ""
@@ -365,45 +512,12 @@ Write-Host "    npm run electron:dev  - Demarrer Electron en dev" -ForegroundCol
 Write-Host "    npm run dist          - Creer l'EXE installable" -ForegroundColor Yellow
 Write-Host ""
 Write-Host "  PROCHAINES ETAPES:" -ForegroundColor Cyan
-Write-Host "    1. FERMER et ROUVRIR le terminal (pour charger le PATH)" -ForegroundColor White
+Write-Host "    1. FERMER et ROUVRIR le terminal (charger le PATH)" -ForegroundColor White
 Write-Host "    2. Editer config.env si necessaire" -ForegroundColor White
 Write-Host "    3. Lancer: npm run dev" -ForegroundColor White
 Write-Host ""
 Write-Host "========================================================================" -ForegroundColor Green
 Write-Host ""
 
-# Verification finale des versions
-Write-Host "VERSIONS INSTALLEES:" -ForegroundColor Cyan
-Write-Host "-------------------------" -ForegroundColor Gray
-
-try { 
-    $nv = node --version 2>$null
-    Write-Host "   Node.js: $nv" -ForegroundColor White 
-} catch { 
-    Write-Host "   Node.js: [Redemarrer terminal]" -ForegroundColor Yellow 
-}
-
-try { 
-    $npmv = npm --version 2>$null
-    Write-Host "   npm:     v$npmv" -ForegroundColor White 
-} catch { 
-    Write-Host "   npm:     [Redemarrer terminal]" -ForegroundColor Yellow 
-}
-
-try { 
-    $pyv = python --version 2>$null
-    Write-Host "   Python:  $pyv" -ForegroundColor White 
-} catch { 
-    Write-Host "   Python:  [Redemarrer terminal]" -ForegroundColor Yellow 
-}
-
-try { 
-    $gv = git --version 2>$null
-    Write-Host "   Git:     $gv" -ForegroundColor White 
-} catch { 
-    Write-Host "   Git:     Non installe (optionnel)" -ForegroundColor Gray 
-}
-
-Write-Host ""
 Write-Host "Appuyez sur une touche pour fermer..." -ForegroundColor Gray
 $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
