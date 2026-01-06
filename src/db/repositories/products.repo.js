@@ -28,10 +28,6 @@ export class ProductsRepository {
   findAll() {
     const db = getDb();
     try {
-      console.log('\n\n═══════════════════════════════════════════════════════');
-      console.log('🔴🔴🔴 PRODUCTS.REPO findAll() APPELÉ 🔴🔴🔴');
-      console.log('═══════════════════════════════════════════════════════\n');
-      
       // Récupérer le taux actuel pour calculer FC depuis USD
       const currentRate = ratesRepo.getCurrent();
       
@@ -52,15 +48,6 @@ export class ProductsRepository {
             units = db
               .prepare('SELECT * FROM product_units WHERE product_id = ? ORDER BY unit_level')
               .all(product.id);
-            
-            // DEBUG: Log units pour produit 1
-            if (product.code === '1') {
-              console.log(`\n🔵 [DEBUG] Product 1 - SQL query returned ${units.length} units:`);
-              units.forEach((u, i) => {
-                console.log(`   [${i}] ID=${u.id}, Level=${u.unit_level}, Mark=${u.unit_mark}, Stock=${u.stock_current}`);
-              });
-              console.log('');
-            }
           } catch (unitsError) {
             logger.warn(`⚠️  Erreur récupération unités pour produit ${product.code}: ${unitsError.message}`);
             units = [];
@@ -78,20 +65,9 @@ export class ProductsRepository {
           };
         });
       
-      logger.info(`📊 findAll products: ${products.length} produit(s) trouvé(s) dans la base`);
-      
-      // Debug: Log products avec plus d'une unité
-      const multiUnitProducts = products.filter(p => p.units && p.units.length > 1);
-      if (multiUnitProducts.length > 0) {
-        logger.info(`   ✅ ${multiUnitProducts.length} produit(s) avec plusieurs unités:
-${multiUnitProducts.map(p => `      - ${p.code}: ${p.units.length} unités (${p.units.map(u => u.unit_level).join(', ')})`).join('\n')}`);
-      }
-      
-      // LOG SPÉCIFIQUE PRODUIT 1
-      const p1 = products.find(p => p.code === '1');
-      if (p1) {
-        console.log(`🟢 PRODUCT 1 RETOURNÉ: ${p1.units?.length || 0} unités (${p1.units?.map(u => u.unit_level).join(', ') || 'AUCUNE'})`);
-      }
+      // Log compact (une seule ligne)
+      const multiUnitCount = products.filter(p => p.units && p.units.length > 1).length;
+      logger.info(`📊 findAll: ${products.length} produits (${multiUnitCount} multi-unités)`);
       
       return products;
     } catch (error) {

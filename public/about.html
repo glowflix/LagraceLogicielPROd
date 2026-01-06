@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>À propos - La Grâce Pro</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    
+    :root {
+      --bg-dark: #0f0f1a;
+      --bg-card: #1a1a2e;
+      --text-primary: #ffffff;
+      --text-secondary: #a0a0b0;
+      --accent: #6366f1;
+      --accent-pink: #fe2c55;
+      --border: rgba(255, 255, 255, 0.1);
+    }
+    
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: var(--bg-dark);
+      color: var(--text-primary);
+      min-height: 100vh;
+      padding: 2rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    
+    .container {
+      max-width: 450px;
+      text-align: center;
+    }
+    
+    .logo {
+      width: 100px;
+      height: 100px;
+      margin: 0 auto 1.5rem;
+      background: linear-gradient(135deg, var(--accent), var(--accent-pink));
+      border-radius: 24px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 3rem;
+      box-shadow: 0 10px 40px rgba(99, 102, 241, 0.3);
+    }
+    
+    h1 {
+      font-size: 2rem;
+      margin-bottom: 0.5rem;
+      background: linear-gradient(135deg, var(--accent), var(--accent-pink));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    
+    .version {
+      color: var(--text-secondary);
+      font-size: 0.9rem;
+      margin-bottom: 2rem;
+    }
+    
+    .description {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 1.5rem;
+      margin-bottom: 1.5rem;
+      text-align: left;
+    }
+    
+    .description p {
+      color: var(--text-secondary);
+      line-height: 1.7;
+      margin-bottom: 1rem;
+      font-size: 0.95rem;
+    }
+    
+    .description p:last-child {
+      margin-bottom: 0;
+    }
+    
+    .features {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.75rem;
+      margin-bottom: 1.5rem;
+    }
+    
+    .feature {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1rem;
+      text-align: center;
+      transition: all 0.2s;
+    }
+    
+    .feature:hover {
+      border-color: rgba(99, 102, 241, 0.3);
+      transform: translateY(-2px);
+    }
+    
+    .feature-icon {
+      font-size: 1.5rem;
+      margin-bottom: 0.5rem;
+    }
+    
+    .feature-label {
+      font-size: 0.8rem;
+      color: var(--text-secondary);
+    }
+    
+    .links {
+      display: flex;
+      gap: 0.75rem;
+      justify-content: center;
+      margin-bottom: 2rem;
+    }
+    
+    .link-btn {
+      padding: 0.75rem 1.5rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      color: var(--text-primary);
+      font-size: 0.9rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.2s;
+      text-decoration: none;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    
+    .link-btn:hover {
+      background: rgba(255, 255, 255, 0.1);
+      border-color: rgba(255, 255, 255, 0.2);
+    }
+    
+    .link-btn-primary {
+      background: linear-gradient(135deg, var(--accent), var(--accent-pink));
+      border: none;
+    }
+    
+    .link-btn-primary:hover {
+      transform: scale(1.02);
+      box-shadow: 0 4px 20px rgba(99, 102, 241, 0.4);
+    }
+    
+    .footer {
+      color: var(--text-secondary);
+      font-size: 0.75rem;
+    }
+    
+    .footer p {
+      margin-bottom: 0.25rem;
+    }
+    
+    .tech-stack {
+      background: rgba(255, 255, 255, 0.03);
+      border-radius: 8px;
+      padding: 0.75rem;
+      margin-top: 1rem;
+    }
+    
+    .tech-stack span {
+      display: inline-block;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      padding: 0.25rem 0.5rem;
+      border-radius: 4px;
+      font-size: 0.7rem;
+      margin: 0.15rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="logo">🛒</div>
+    
+    <h1>La Grâce Pro</h1>
+    <p class="version">Version 1.0.0</p>
+    
+    <div class="description">
+      <p>
+        <strong>La Grâce Pro</strong> est un logiciel de gestion de point de vente (POS) professionnel 
+        conçu pour les commerces et magasins de toutes tailles.
+      </p>
+      <p>
+        Gérez facilement vos <strong>produits</strong>, <strong>ventes</strong>, <strong>dettes</strong> 
+        et <strong>stocks</strong> avec une synchronisation automatique vers le Cloud pour une 
+        accessibilité partout et à tout moment.
+      </p>
+      <p>
+        Notre système intelligent vous aide à suivre vos performances avec des 
+        <strong>statistiques détaillées</strong> et des <strong>rapports A4</strong> professionnels.
+      </p>
+    </div>
+    
+    <div class="features">
+      <div class="feature">
+        <div class="feature-icon">💰</div>
+        <div class="feature-label">Ventes POS</div>
+      </div>
+      <div class="feature">
+        <div class="feature-icon">📦</div>
+        <div class="feature-label">Gestion Stock</div>
+      </div>
+      <div class="feature">
+        <div class="feature-icon">☁️</div>
+        <div class="feature-label">Sync Cloud</div>
+      </div>
+      <div class="feature">
+        <div class="feature-icon">📊</div>
+        <div class="feature-label">Statistiques</div>
+      </div>
+      <div class="feature">
+        <div class="feature-icon">🖨️</div>
+        <div class="feature-label">Export A4</div>
+      </div>
+      <div class="feature">
+        <div class="feature-icon">👥</div>
+        <div class="feature-label">Multi-utilisateurs</div>
+      </div>
+    </div>
+    
+    <div class="links">
+      <a href="https://glowflix.com/lagraceglow" target="_blank" class="link-btn link-btn-primary">
+        🔄 Mise à jour
+      </a>
+      <a href="https://glowflix.com/glo-eco" target="_blank" class="link-btn">
+        🌐 Site Web
+      </a>
+    </div>
+    
+    <div class="footer">
+      <p>© 2024-2026 Glowflix - Tous droits réservés</p>
+      <p>Développé avec ❤️ pour les commerçants</p>
+      
+      <div class="tech-stack">
+        <span>Electron</span>
+        <span>React</span>
+        <span>Node.js</span>
+        <span>SQLite</span>
+        <span>Socket.IO</span>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

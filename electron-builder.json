@@ -8,8 +8,15 @@
   "asar": true,
   "asarUnpack": [
     "**/*.node",
-    "node_modules/better-sqlite3/**",
-    "node_modules/bcrypt/**"
+    "**/better-sqlite3/**/*",
+    "**/bcrypt/**/*",
+    "**/pdf-to-printer/**/*",
+    "**/chokidar/**/*",
+    "**/handlebars/**/*",
+    "**/puppeteer/**/*",
+    "**/puppeteer-core/**/*",
+    "print/**/*",
+    "**/print/**/*"
   ],
   "files": [
     "electron/**/*",
@@ -31,6 +38,11 @@
       "filter": ["**/*"]
     },
     {
+      "from": "vendor/sumatra",
+      "to": "vendor/sumatra",
+      "filter": ["**/*"]
+    },
+    {
       "from": "src/db/schema.sql",
       "to": "src/db/schema.sql"
     },
@@ -41,6 +53,10 @@
     {
       "from": "config.env",
       "to": "config.env"
+    },
+    {
+      "from": "config.production.env",
+      "to": "config.production.env"
     },
     {
       "from": "dist/ai/ai-lagrace",
@@ -57,18 +73,19 @@
         ]
       }
     ],
-    "icon": "asset/image/icon/photo.ico",
-    "publisherName": "LA GRACE",
-    "certificateFile": null,
-    "sign": null
+    "icon": "asset/image/icon/photo.ico"
   },
   "nsis": {
     "oneClick": false,
+    "warningsAsErrors": false,
     "allowToChangeInstallationDirectory": true,
     "createDesktopShortcut": true,
     "createStartMenuShortcut": true,
     "installerIcon": "asset/image/icon/photo.ico",
-    "uninstallerIcon": "asset/image/icon/photo.ico"
+    "uninstallerIcon": "asset/image/icon/photo.ico",
+    "include": "scripts/installer.nsh",
+    "runAfterFinish": true,
+    "perMachine": true
   },
   "mac": {
     "target": "dmg",

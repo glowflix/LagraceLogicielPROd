@@ -1,45 +1,57 @@
+/**
+ * ============================================================
+ * LA GRACE POS - Chemins UNIFIÉS (DEV + EXE identiques)
+ * ============================================================
+ * CHEMIN UNIQUE: C:\Glowflixprojet
+ * - DB: C:\Glowflixprojet\db\glowflixprojet.db
+ * - Print: C:\Glowflixprojet\printer\
+ * - Logs: C:\Glowflixprojet\logs\
+ * ============================================================
+ */
+
 import fs from "fs";
 import path from "path";
 import os from "os";
 
-export function getDataRoot() {
-  // PRIORITÉ 1: Variable d'environnement explicite
-  if (process.env.LAGRACE_DATA_DIR) return path.resolve(process.env.LAGRACE_DATA_DIR);
-  if (process.env.GLOWFLIX_ROOT_DIR) return path.resolve(process.env.GLOWFLIX_ROOT_DIR);
+// ✅ CHEMIN FIXE UNIQUE - Identique DEV et EXE
+const FIXED_DATA_ROOT = "C:\\Glowflixprojet";
 
-  // PRIORITÉ 2: Détection automatique selon le mode (build vs dev)
-  // ✅ EN MODE EXE INSTALLÉ: Utiliser %APPDATA%\Glowflixprojet (utilisateur-spécifique)
-  // ✅ EN DEV: Utiliser C:\Glowflixprojet (dossier commun)
-  // La différence: AppData = installé pour l'utilisateur, C:\ = partagé
-  if (process.platform === "win32") {
-    // Chercher AppData (Roaming de préférence)
-    const appDataRoaming = process.env.APPDATA; // %APPDATA% = AppData\Roaming
-    if (appDataRoaming) {
-      // CRITIQUE: En build, toujours utiliser AppData
-      // Vérifier si on est en mode "packaged" (electron) ou dev
-      const isPackaged = process.env.NODE_ENV === 'production' || 
-                         process.defaultApp === false ||
-                         (process.mainModule && process.mainModule.filename.indexOf('app.asar') !== -1);
-      
-      // En production (exe), TOUJOURS utiliser AppData
-      if (isPackaged || process.env.NODE_ENV === 'production') {
-        return path.join(appDataRoaming, "Glowflixprojet");
-      }
-      
-      // En dev, utiliser C:\ si le dossier existe déjà, sinon AppData aussi
-      const devPath = "C:\\Glowflixprojet";
-      if (fs.existsSync(devPath)) {
-        return devPath;
-      }
-      
-      // Sinon, utiliser AppData même en dev (cohérence)
-      return path.join(appDataRoaming, "Glowflixprojet");
+function ensureDir(p) {
+  try {
+    if (!fs.existsSync(p)) {
+      fs.mkdirSync(p, { recursive: true });
     }
-    // Fallback si APPDATA pas défini (rare mais possible)
-    return "C:\\Glowflixprojet";
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * ✅ Retourne TOUJOURS C:\Glowflixprojet sur Windows
+ * Identique en DEV et EXE - Plus de confusion de chemins
+ */
+export function getDataRoot() {
+  if (process.platform === "win32") {
+    // Créer si n'existe pas
+    if (!fs.existsSync(FIXED_DATA_ROOT)) {
+      try {
+        fs.mkdirSync(FIXED_DATA_ROOT, { recursive: true });
+      } catch (e) {
+        // Fallback APPDATA seulement si C:\ bloqué
+        const appData = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+        const fallback = path.join(appData, "LA GRACE POS");
+        ensureDir(fallback);
+        return fallback;
+      }
+    }
+    return FIXED_DATA_ROOT;
   }
   
-  return path.join(os.homedir(), "Glowflixprojet");
+  // Linux/Mac
+  const homePath = path.join(os.homedir(), "Glowflixprojet");
+  ensureDir(homePath);
+  return homePath;
 }
 
 export function getResourcesRoot() {
@@ -48,7 +60,11 @@ export function getResourcesRoot() {
   return process.cwd();
 }
 
-// ✅ compat: l'ancien nom doit pointer vers DATA (écriture)
+export function getAppRoot() {
+  if (process.env.APP_ROOT) return path.resolve(process.env.APP_ROOT);
+  return process.cwd();
+}
+
 export function getProjectRoot() {
   return getDataRoot();
 }
@@ -57,56 +73,58 @@ export function ensureDirs() {
   const root = getDataRoot();
   const dirs = [
     "db",
-    "db/migrations",
+    "printer",
+    "printer/ok",
+    "printer/err",
+    "printer/tmp",
+    "printer/templates",
+    "printer/assets",
+    "logs",
+    "config",
     "data/cache",
     "data/imports",
     "data/exports",
     "data/backups",
-    "data/attachments",
-    "printer/ok",
-    "printer/err",
-    "printer/tmp",
-    "printer/assets",
-    "printer/templates",
-    "logs",
-    "config",
   ];
 
-  console.log('📁 [PATHS] ==========================================');
-  console.log('📁 [PATHS] CRÉATION DES DOSSIERS SYSTÈME');
-  console.log('📁 [PATHS] ==========================================');
-  console.log(`📁 [PATHS] Root: ${root}`);
-  console.log(`📁 [PATHS] Platform: ${process.platform}`);
-  console.log(`📁 [PATHS] NODE_ENV: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`📁 [PATHS] APPDATA: ${process.env.APPDATA || '(non défini)'}`);
+  console.log(`\n📁 [PATHS] Root: ${root} | Mode: ${process.env.NODE_ENV || 'dev'}`);
 
   for (const d of dirs) {
     const fullPath = path.join(root, d);
     if (!fs.existsSync(fullPath)) {
       fs.mkdirSync(fullPath, { recursive: true });
-      console.log(`✅ [PATHS] Créé: ${d}`);
     }
   }
   
-  console.log(`✅ [PATHS] Tous les dossiers sont prêts`);
-  console.log('📁 [PATHS] ==========================================');
+  console.log(`✅ [PATHS] Dossiers prêts\n`);
   return root;
 }
 
 export function getDbPath() {
-  return path.join(getDataRoot(), "db", "glowflixprojet.db");
+  const dbDir = path.join(getDataRoot(), "db");
+  ensureDir(dbDir);
+  return path.join(dbDir, "glowflixprojet.db");
 }
 
 export function getPrintDir() {
-  if (process.env.GLOWFLIX_PRINT_DIR) return path.resolve(process.env.GLOWFLIX_PRINT_DIR);
-  return path.join(getDataRoot(), "printer");
+  const printDir = path.join(getDataRoot(), "printer");
+  const subDirs = ["", "ok", "err", "tmp", "templates", "assets"];
+  for (const sub of subDirs) {
+    const dir = sub ? path.join(printDir, sub) : printDir;
+    ensureDir(dir);
+  }
+  return printDir;
 }
 
 export function getLogsDir() {
-  return path.join(getDataRoot(), "logs");
+  const logsDir = path.join(getDataRoot(), "logs");
+  ensureDir(logsDir);
+  return logsDir;
 }
 
 export function getConfigDir() {
-  return path.join(getDataRoot(), "config");
+  const configDir = path.join(getDataRoot(), "config");
+  ensureDir(configDir);
+  return configDir;
 }
 

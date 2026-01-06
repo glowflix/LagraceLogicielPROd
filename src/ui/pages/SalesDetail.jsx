@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { motion } from 'framer-motion';
+import { m } from 'framer-motion';
 import { ArrowLeft, Printer, XCircle, Package, Calendar, User, Phone, DollarSign, CheckCircle, Cloud, CloudOff, AlertCircle } from 'lucide-react';
 import axios from 'axios';
 import { format } from 'date-fns';
@@ -76,7 +76,7 @@ const SalesDetail = () => {
   if (loading) {
     return (
       <div className="flex items-center justify-center h-96">
-        <motion.div
+        <m.div
           animate={{ rotate: 360 }}
           transition={{ duration: 1, repeat: Infinity, ease: 'linear' }}
           className="w-12 h-12 border-4 border-primary-500 border-t-transparent rounded-full"
@@ -130,7 +130,7 @@ const SalesDetail = () => {
       </div>
 
       {/* Informations de la facture */}
-      <motion.div
+      <m.div
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
         className="card"
@@ -307,7 +307,7 @@ const SalesDetail = () => {
                 </thead>
                 <tbody>
                   {items.map((item, index) => (
-                    <motion.tr
+                    <m.tr
                       key={item.id || index}
                       initial={{ opacity: 0, x: -20 }}
                       animate={{ opacity: 1, x: 0 }}
@@ -329,7 +329,7 @@ const SalesDetail = () => {
                       <td className="py-3 px-4 text-right font-semibold text-primary-400">
                         {((item.qty || 0) * (item.unit_price_fc || 0)).toLocaleString()} FC
                       </td>
-                    </motion.tr>
+                    </m.tr>
                   ))}
                 </tbody>
               </table>
@@ -383,7 +383,7 @@ const SalesDetail = () => {
             </div>
           </div>
         </div>
-      </motion.div>
+      </m.div>
     </div>
   );
 };

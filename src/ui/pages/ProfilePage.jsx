@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { motion } from 'framer-motion';
+import { m } from 'framer-motion';
 import { 
   User, 
   Save, 
@@ -158,32 +158,32 @@ const ProfilePage = () => {
 
       {/* Messages d'erreur et succès */}
       {error && (
-        <motion.div
+        <m.div
           initial={{ opacity: 0, y: -10 }}
           animate={{ opacity: 1, y: 0 }}
           className="flex items-center gap-2 p-4 bg-red-500/20 border border-red-500/30 rounded-lg"
         >
           <AlertCircle className="w-5 h-5 text-red-400" />
           <span className="text-sm text-red-300">{error}</span>
-        </motion.div>
+        </m.div>
       )}
 
       {success && (
-        <motion.div
+        <m.div
           initial={{ opacity: 0, y: -10 }}
           animate={{ opacity: 1, y: 0 }}
           className="flex items-center gap-2 p-4 bg-green-500/20 border border-green-500/30 rounded-lg"
         >
           <CheckCircle2 className="w-5 h-5 text-green-400" />
           <span className="text-sm text-green-300">{success}</span>
-        </motion.div>
+        </m.div>
       )}
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Colonne gauche - Informations de profil */}
         <div className="lg:col-span-2 space-y-6">
           {/* Carte principale - Informations personnelles */}
-          <motion.div
+          <m.div
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             className="card"
@@ -281,13 +281,13 @@ const ProfilePage = () => {
                 </button>
               </div>
             </form>
-          </motion.div>
+          </m.div>
         </div>
 
         {/* Colonne droite - Informations système et permissions */}
         <div className="space-y-6">
           {/* Carte - Permissions */}
-          <motion.div
+          <m.div
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ delay: 0.1 }}
@@ -373,10 +373,10 @@ const ProfilePage = () => {
                 </span>
               </div>
             </div>
-          </motion.div>
+          </m.div>
 
           {/* Carte - Informations système */}
-          <motion.div
+          <m.div
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ delay: 0.2 }}
@@ -413,7 +413,7 @@ const ProfilePage = () => {
                 </div>
               )}
             </div>
-          </motion.div>
+          </m.div>
         </div>
       </div>
     </div>

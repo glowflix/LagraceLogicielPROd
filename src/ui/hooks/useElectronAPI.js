@@ -1,8 +1,28 @@
 /**
- * Exemple d'utilisation de l'API Electron dans React
+ * Hook useElectronAPI - Accès à l'API Electron depuis React
  * 
  * Les APIs sont disponibles via window.electronAPI (exposées par preload.cjs)
  */
+
+import { useState, useEffect } from 'react';
+
+/**
+ * Hook pour accéder à l'API Electron
+ * Retourne null si pas dans Electron
+ */
+export function useElectronAPI() {
+  const [electronAPI, setElectronAPI] = useState(null);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined' && window.electronAPI) {
+      setElectronAPI(window.electronAPI);
+    }
+  }, []);
+
+  return electronAPI;
+}
+
+export default useElectronAPI;
 
 // ============ CHEMINS & INFO APP ============
 
@@ -117,16 +137,16 @@ async function resetTemplates() {
 // ============ REACT HOOKS ============
 
 // Hook pour charger les chemins au mount
-import { useEffect, useState } from 'react';
-
 export function useAppPaths() {
   const [paths, setPaths] = useState(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    window.electronAPI.getPaths()
-      .then(setPaths)
-      .finally(() => setLoading(false));
+    if (window.electronAPI) {
+      window.electronAPI.getPaths()
+        .then(setPaths)
+        .finally(() => setLoading(false));
+    }
   }, []);
 
   return { paths, loading };
@@ -138,13 +158,15 @@ export function useTemplates() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    window.electronAPI.template.list()
-      .then((result) => {
-        if (result.success) {
-          setTemplates(result.templates);
-        }
-      })
-      .finally(() => setLoading(false));
+    if (window.electronAPI) {
+      window.electronAPI.template.list()
+        .then((result) => {
+          if (result.success) {
+            setTemplates(result.templates);
+          }
+        })
+        .finally(() => setLoading(false));
+    }
   }, []);
 
   return { templates, loading };
@@ -155,6 +177,8 @@ export function usePendingPrintJobs(intervalMs = 5000) {
   const [jobs, setJobs] = useState([]);
 
   useEffect(() => {
+    if (!window.electronAPI) return;
+    
     const interval = setInterval(() => {
       window.electronAPI.printer.getPendingJobs()
         .then((result) => {
@@ -168,50 +192,6 @@ export function usePendingPrintJobs(intervalMs = 5000) {
   }, [intervalMs]);
 
   return jobs;
-}
-
-// ============ COMPOSANT EXEMPLE ============
-
-export function PrinterDashboard() {
-  const { paths } = useAppPaths();
-  const { templates } = useTemplates();
-  const pendingJobs = usePendingPrintJobs();
-
-  return (
-    <div>
-      <h2>Imprimante - Dashboard</h2>
-      
-      {paths && (
-        <div>
-          <p><strong>Répertoire impression:</strong> {paths.printerDir}</p>
-          <p><strong>Templates:</strong> {paths.printerTemplates}</p>
-        </div>
-      )}
-
-      <h3>Templates ({templates.length})</h3>
-      <ul>
-        {templates.map((t) => (
-          <li key={t.name}>
-            {t.name} ({t.source})
-          </li>
-        ))}
-      </ul>
-
-      <h3>Jobs en cours ({pendingJobs.length})</h3>
-      <ul>
-        {pendingJobs.map((job) => (
-          <li key={job}>
-            {job}
-            <button onClick={() => markPrintJobDone(job)}>OK</button>
-            <button onClick={() => markPrintJobFailed(job, 'User cancelled')}>ERR</button>
-          </li>
-        ))}
-      </ul>
-
-      <button onClick={createPrintJob}>Créer un job test</button>
-      <button onClick={loadTemplates}>Recharger templates</button>
-    </div>
-  );
 }
 
 // ============ SERVICE IMPRESSION (pour export) ============

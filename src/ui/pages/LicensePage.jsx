@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { motion } from 'framer-motion';
-import { Key, CheckCircle2, XCircle, WifiOff, LogIn, FileText } from 'lucide-react';
+import { m } from 'framer-motion';
+import { Key, CheckCircle2, XCircle, WifiOff, LogIn, FileText, Smartphone, QrCode } from 'lucide-react';
 import { useStore } from '../store/useStore';
 import axios from 'axios';
 
@@ -90,7 +90,7 @@ const LicensePage = () => {
       {/* Effet de particules en arrière-plan */}
       <div className="absolute inset-0 overflow-hidden pointer-events-none">
         {[...Array(15)].map((_, i) => (
-          <motion.div
+          <m.div
             key={i}
             className="absolute w-1 h-1 bg-primary-400/30 rounded-full"
             initial={{
@@ -112,20 +112,20 @@ const LicensePage = () => {
         ))}
       </div>
 
-      <motion.div
+      <m.div
         initial={{ opacity: 0, y: 20, scale: 0.95 }}
         animate={{ opacity: 1, y: 0, scale: 1 }}
         transition={{ duration: 0.5 }}
         className="glass-strong rounded-2xl p-8 max-w-md w-full relative z-10 shadow-2xl"
       >
         {/* Header */}
-        <motion.div
+        <m.div
           initial={{ scale: 0.9, opacity: 0 }}
           animate={{ scale: 1, opacity: 1 }}
           transition={{ delay: 0.2 }}
           className="text-center mb-8"
         >
-          <motion.img
+          <m.img
             src="/asset/image/icon/photo.png"
             alt="Logo LA GRACE"
             className="w-20 h-20 mx-auto mb-4 object-contain"
@@ -139,10 +139,10 @@ const LicensePage = () => {
           <p className="text-gray-400">
             Entrez votre clé de licence pour activer l'application
           </p>
-        </motion.div>
+        </m.div>
 
         {/* Info badge */}
-        <motion.div
+        <m.div
           initial={{ x: -20, opacity: 0 }}
           animate={{ x: 0, opacity: 1 }}
           transition={{ delay: 0.3 }}
@@ -152,10 +152,10 @@ const LicensePage = () => {
           <span className="text-sm text-blue-300">
             Aucune connexion Internet requise
           </span>
-        </motion.div>
+        </m.div>
 
         {/* Formulaire */}
-        <motion.div
+        <m.div
           initial={{ y: 20, opacity: 0 }}
           animate={{ y: 0, opacity: 1 }}
           transition={{ delay: 0.4 }}
@@ -167,37 +167,38 @@ const LicensePage = () => {
             </label>
             {checkingFile ? (
               <div className="input-field text-center text-lg tracking-widest font-mono flex items-center justify-center gap-2">
-                <motion.div
+                <m.div
                   animate={{ rotate: 360 }}
                   transition={{ duration: 1, repeat: Infinity, ease: 'linear' }}
                 >
                   <FileText className="w-5 h-5 text-primary-400" />
-                </motion.div>
+                </m.div>
                 <span className="text-gray-400">Lecture du fichier...</span>
               </div>
             ) : (
               <>
-                <input
-                  type={fileFound && key ? 'password' : 'text'}
-                  value={fileFound && key ? maskedKey : key}
-                  onChange={(e) => {
-                    const newValue = e.target.value;
-                    setKey(newValue);
-                    if (fileFound && key) {
-                      // Si le fichier a été trouvé et qu'on a déjà une clé, masquer
-                      setMaskedKey(maskKey(newValue));
-                    } else {
-                      // Sinon, permettre la saisie normale
-                      setMaskedKey('');
-                    }
-                  }}
-                  onKeyPress={(e) => e.key === 'Enter' && !fileFound && handleActivate()}
-                  placeholder="Entrez votre clé de licence"
-                  className="input-field text-center text-lg tracking-widest font-mono"
-                  autoFocus={!fileFound}
-                  disabled={fileFound && key}
-                  readOnly={fileFound && key}
-                />
+                {/* Clé de licence TOUJOURS masquée pour sécurité */}
+                <div className="relative">
+                  <input
+                    type="password"
+                    value={fileFound && key ? '••••••••••' : key}
+                    onChange={(e) => {
+                      // Ne pas permettre la modification si la clé vient du fichier
+                      if (fileFound && key) return;
+                      setKey(e.target.value);
+                    }}
+                    onKeyPress={(e) => e.key === 'Enter' && !fileFound && handleActivate()}
+                    placeholder="Entrez votre clé de licence"
+                    className="input-field text-center text-lg tracking-widest font-mono"
+                    autoFocus={!fileFound}
+                    disabled={fileFound && key}
+                    readOnly={fileFound && key}
+                  />
+                  {/* Indicateur de sécurité */}
+                  <div className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500">
+                    <Key className="w-4 h-4" />
+                  </div>
+                </div>
                 {fileFound && key && (
                   <p className="text-xs text-green-400 mt-2 text-center flex items-center justify-center gap-1">
                     <CheckCircle2 className="w-3 h-3" />
@@ -214,14 +215,14 @@ const LicensePage = () => {
           </div>
 
           {error && (
-            <motion.div
+            <m.div
               initial={{ opacity: 0, y: -10 }}
               animate={{ opacity: 1, y: 0 }}
               className="flex items-center gap-2 p-3 bg-red-500/20 border border-red-500/30 rounded-lg"
             >
               <XCircle className="w-5 h-5 text-red-400" />
               <span className="text-sm text-red-300">{error}</span>
-            </motion.div>
+            </m.div>
           )}
 
           <button
@@ -231,12 +232,12 @@ const LicensePage = () => {
           >
             {loading ? (
               <span className="flex items-center justify-center gap-2">
-                <motion.div
+                <m.div
                   animate={{ rotate: 360 }}
                   transition={{ duration: 1, repeat: Infinity, ease: 'linear' }}
                 >
                   <Key className="w-5 h-5" />
-                </motion.div>
+                </m.div>
                 Activation...
               </span>
             ) : (
@@ -267,18 +268,40 @@ const LicensePage = () => {
               Se connecter à un compte
             </span>
           </button>
-        </motion.div>
+
+          {/* Séparateur pour mobile */}
+          <div className="relative my-4">
+            <div className="absolute inset-0 flex items-center">
+              <div className="w-full border-t border-gray-700"></div>
+            </div>
+            <div className="relative flex justify-center text-sm">
+              <span className="px-2 bg-dark-800 text-gray-500 text-xs">Accès mobile</span>
+            </div>
+          </div>
+
+          {/* Bouton Connexion Mobile avec QR */}
+          <button
+            onClick={() => navigate('/mobile-connect')}
+            className="w-full bg-gradient-to-r from-purple-500/20 to-blue-500/20 hover:from-purple-500/30 hover:to-blue-500/30 border border-purple-500/30 text-purple-300 py-3 rounded-lg transition-all"
+          >
+            <span className="flex items-center justify-center gap-2">
+              <QrCode className="w-5 h-5" />
+              <span>Connexion Mobile</span>
+              <Smartphone className="w-4 h-4 opacity-60" />
+            </span>
+          </button>
+        </m.div>
 
         {/* Footer */}
-        <motion.p
+        <m.p
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           transition={{ delay: 0.6 }}
           className="text-center text-xs text-gray-500 mt-6"
         >
           Glowflixprojet v1.0.0
-        </motion.p>
-      </motion.div>
+        </m.p>
+      </m.div>
     </div>
   );
 };

@@ -506,9 +506,9 @@ function runAutoCheck(db) {
       ORDER BY p.code ASC
     `).all();
 
-    console.log(`\n🔍 [AutoCheck] Vérification de ${products.length} produit(s)...`);
-
+    // Mode silencieux pour accélérer le démarrage - n'affiche que les actions effectuées
     let actionCount = 0;
+    let skippedCount = 0;
 
     for (const product of products) {
       try {
@@ -522,17 +522,15 @@ function runAutoCheck(db) {
         const carton = units.find((u) => (u.unit_level || '').toUpperCase().trim() === "CARTON");
         
         if (!carton) {
-          console.log(`  ⚠️  ${product.code}: Pas d'unité CARTON - skip`);
+          skippedCount++;
           continue;
         }
 
         const cartonStock = Math.floor(Number(carton.stock_current ?? 0));
         if (cartonStock <= 0) {
-          console.log(`  ⏸️  ${product.code}: CARTON stock=${cartonStock} (<=0) - skip`);
+          skippedCount++;
           continue;
         }
-
-        console.log(`  ✓ ${product.code}: CARTON stock=${cartonStock} (>0)`);
 
         // 4. Chercher UNE unité cible vide avec auto_stock_factor > 0
         const targets = units.filter(
@@ -545,7 +543,7 @@ function runAutoCheck(db) {
         );
 
         if (targets.length === 0) {
-          console.log(`  ⚠️  ${product.code}: Aucune cible vide avec factor>0 - skip`);
+          skippedCount++;
           continue;
         }
 
@@ -553,9 +551,6 @@ function runAutoCheck(db) {
         const target = targets[0]; // Prendre la première cible
         const targetFactor = Math.floor(Number(target.auto_stock_factor ?? 0));
         const targetStock = Math.floor(Number(target.stock_current ?? 0));
-
-        console.log(`  📦 ${product.code}: Trouvé cible ${target.unit_level} (stock=${targetStock}, factor=${targetFactor})`);
-        console.log(`     → Déclenchement AutoStock: CARTON ${cartonStock}→${cartonStock-1}, ${target.unit_level} ${targetStock}→${targetStock+targetFactor}`);
 
         // ✅ TRANSACTION SYNCHRONE
         try {
@@ -667,10 +662,8 @@ function runAutoCheck(db) {
           const result = tx();
           actionCount++;
 
-          console.log(`  ✅ ${product.code} → ${target.unit_level}:`);
-          console.log(`     CARTON: ${cartonStock} → ${cartonStock - 1}`);
-          console.log(`     ${target.unit_level}: ${targetStock} → ${targetStock + targetFactor}`);
-          console.log(`     sync_op_id: ${result.opId}`);
+          // Afficher uniquement les actions effectuées
+          console.log(`  ✅ [AutoStock] ${product.code}: CARTON ${cartonStock}→${cartonStock-1}, ${target.unit_level} ${targetStock}→${targetStock+targetFactor}`);
 
         } catch (txErr) {
           console.error(`  ❌ ${product.code}: Erreur transaction - ${txErr.message}`);
@@ -682,7 +675,11 @@ function runAutoCheck(db) {
     }
 
     const checkDuration = Date.now() - checkStartTime;
-    console.log(`\n✨ [AutoCheck] Terminé: ${actionCount} action(s) exécutée(s) en ${checkDuration}ms\n`);
+    // Résumé compact
+    if (actionCount > 0) {
+      console.log(`✨ [AutoCheck] ${actionCount} action(s), ${skippedCount} skip en ${checkDuration}ms`);
+    }
+    // Pas de log si rien n'a été fait (silencieux)
 
   } catch (err) {
     console.error("❌ [AutoCheck] Erreur globale:", err.message);
@@ -701,12 +698,8 @@ export function startAutoCheck(db) {
     return;
   }
 
-  const startTime = new Date().toLocaleTimeString('fr-FR');
-  console.log(`\n🚀 [AutoCheck] Démarrage à ${startTime}`);
-  console.log(`   Intervalle: 2 secondes (2000ms)`);
-  console.log(`   Logique: Scanne tous les produits, déclenche autostock si:`);
-  console.log(`     ✓ CARTON.stock_current > 0`);
-  console.log(`     ✓ Une cible (PIECE/MILLIER) avec stock <= 0 ET factor > 0\n`);
+  // Log compact au démarrage
+  console.log(`🚀 [AutoCheck] Démarré (intervalle: 2s)`);
 
   let checkCount = 0;
 

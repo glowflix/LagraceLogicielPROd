@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Export A4 - La Grâce Pro</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    
+    :root {
+      --bg-dark: #0f0f1a;
+      --bg-card: #1a1a2e;
+      --text-primary: #ffffff;
+      --text-secondary: #a0a0b0;
+      --accent: #6366f1;
+      --accent-pink: #fe2c55;
+      --border: rgba(255, 255, 255, 0.1);
+    }
+    
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: var(--bg-dark);
+      color: var(--text-primary);
+      min-height: 100vh;
+      padding: 1.5rem;
+    }
+    
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+    
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 2rem;
+      padding-bottom: 1rem;
+      border-bottom: 1px solid var(--border);
+    }
+    
+    .header h1 {
+      font-size: 1.5rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    
+    .header .badge {
+      background: linear-gradient(135deg, var(--accent), var(--accent-pink));
+      padding: 0.25rem 0.75rem;
+      border-radius: 20px;
+      font-size: 0.8rem;
+      font-weight: 600;
+    }
+    
+    .actions {
+      display: flex;
+      gap: 0.75rem;
+    }
+    
+    .btn {
+      padding: 0.75rem 1.5rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      color: var(--text-primary);
+      font-size: 0.9rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.2s;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    
+    .btn:hover {
+      background: rgba(255, 255, 255, 0.1);
+      border-color: rgba(255, 255, 255, 0.2);
+    }
+    
+    .btn-primary {
+      background: linear-gradient(135deg, var(--accent), var(--accent-pink));
+      border: none;
+    }
+    
+    .btn-primary:hover {
+      transform: scale(1.02);
+      box-shadow: 0 4px 20px rgba(99, 102, 241, 0.4);
+    }
+    
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 1rem;
+      margin-bottom: 2rem;
+    }
+    
+    .stat-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1rem 1.25rem;
+    }
+    
+    .stat-card .label {
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+      margin-bottom: 0.5rem;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    
+    .stat-card .value {
+      font-size: 1.5rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, var(--accent), var(--accent-pink));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    
+    .table-container {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    
+    th, td {
+      padding: 0.75rem 1rem;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    
+    th {
+      background: rgba(255, 255, 255, 0.05);
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-secondary);
+      font-weight: 600;
+    }
+    
+    tr:hover {
+      background: rgba(255, 255, 255, 0.02);
+    }
+    
+    .code-cell {
+      font-family: 'Consolas', monospace;
+      font-weight: 600;
+      color: var(--accent);
+    }
+    
+    .stock-cell {
+      font-weight: 700;
+    }
+    
+    .stock-low {
+      color: #ef4444;
+    }
+    
+    .stock-ok {
+      color: #22c55e;
+    }
+    
+    .price-cell {
+      font-weight: 600;
+      color: var(--accent-pink);
+    }
+    
+    .total-cell {
+      font-weight: 700;
+      color: var(--accent);
+    }
+    
+    .loading {
+      text-align: center;
+      padding: 4rem;
+      color: var(--text-secondary);
+    }
+    
+    .loading .spinner {
+      width: 40px;
+      height: 40px;
+      border: 3px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      margin: 0 auto 1rem;
+    }
+    
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    
+    /* Print styles - noir et blanc */
+    @media print {
+      body {
+        background: white;
+        color: black;
+        padding: 0.5cm;
+        font-size: 10pt;
+      }
+      
+      .header, .actions, .stats {
+        display: none !important;
+      }
+      
+      .no-print {
+        display: none !important;
+      }
+      
+      .table-container {
+        background: white;
+        border: 1px solid #000;
+      }
+      
+      th, td {
+        border: 1px solid #000;
+        padding: 4px 8px;
+      }
+      
+      th {
+        background: #f0f0f0 !important;
+        color: black;
+      }
+      
+      .code-cell, .stock-cell, .price-cell, .total-cell {
+        color: black !important;
+      }
+      
+      .stat-card .value {
+        background: none;
+        -webkit-text-fill-color: black;
+      }
+      
+      @page {
+        size: A4;
+        margin: 1cm;
+      }
+      
+      /* En-tête d'impression */
+      .print-header {
+        display: block !important;
+        text-align: center;
+        margin-bottom: 1rem;
+        padding-bottom: 0.5rem;
+        border-bottom: 2px solid black;
+      }
+      
+      .print-header h1 {
+        font-size: 18pt;
+        margin-bottom: 0.25rem;
+      }
+      
+      .print-header .subtitle {
+        font-size: 10pt;
+        color: #666;
+      }
+    }
+    
+    .print-header {
+      display: none;
+    }
+    
+    /* Empty state */
+    .empty-state {
+      text-align: center;
+      padding: 4rem 2rem;
+      color: var(--text-secondary);
+    }
+    
+    .empty-state .icon {
+      font-size: 4rem;
+      margin-bottom: 1rem;
+    }
+    
+    .empty-state h3 {
+      font-size: 1.25rem;
+      margin-bottom: 0.5rem;
+      color: var(--text-primary);
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- En-tête d'impression (visible uniquement à l'impression) -->
+    <div class="print-header">
+      <h1>LA GRÂCE PRO</h1>
+      <div class="subtitle" id="print-subtitle">Liste des Produits</div>
+      <div class="subtitle" id="print-date"></div>
+    </div>
+    
+    <!-- Header normal -->
+    <div class="header no-print">
+      <h1>
+        📄 Export A4 <span class="badge" id="export-type">Produits</span>
+      </h1>
+      <div class="actions">
+        <button class="btn" onclick="window.location.reload()">🔄 Actualiser</button>
+        <button class="btn btn-primary" onclick="window.print()">🖨️ Imprimer</button>
+      </div>
+    </div>
+    
+    <!-- Statistiques -->
+    <div class="stats no-print">
+      <div class="stat-card">
+        <div class="label">Total Produits</div>
+        <div class="value" id="stat-count">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Stock Total</div>
+        <div class="value" id="stat-stock">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Valeur Totale FC</div>
+        <div class="value" id="stat-value">0 FC</div>
+      </div>
+    </div>
+    
+    <!-- Tableau -->
+    <div class="table-container">
+      <table>
+        <thead>
+          <tr>
+            <th style="width: 8%;">Code</th>
+            <th style="width: 30%;">Nom du Produit</th>
+            <th style="width: 10%;">Unité</th>
+            <th style="width: 10%;">Mark</th>
+            <th style="width: 10%;">Stock</th>
+            <th style="width: 12%;">Prix FC</th>
+            <th style="width: 10%;">Prix USD</th>
+            <th style="width: 12%;">Total FC</th>
+          </tr>
+        </thead>
+        <tbody id="products-table">
+          <tr class="loading">
+            <td colspan="8">
+              <div class="spinner"></div>
+              Chargement des données...
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+  
+  <script>
+    // Récupérer les paramètres URL
+    const params = new URLSearchParams(window.location.search);
+    const exportType = params.get('type') || 'all';
+    const exportTitle = params.get('title') || 'Tous les Produits';
+    
+    // Mettre à jour le titre
+    document.getElementById('export-type').textContent = exportTitle;
+    document.getElementById('print-subtitle').textContent = `Liste ${exportTitle}`;
+    document.getElementById('print-date').textContent = `Imprimé le ${new Date().toLocaleDateString('fr-FR')} à ${new Date().toLocaleTimeString('fr-FR')}`;
+    document.title = `Export A4 - ${exportTitle}`;
+    
+    // Construire l'URL API selon le type
+    function getApiUrl() {
+      const base = '/api/newarrivage/products';
+      
+      switch (exportType) {
+        case 'newarrivage':
+          return '/api/newarrivage';
+        case 'carton':
+          return `${base}?unitLevel=CARTON`;
+        case 'carton-no-stock':
+          return `${base}?unitLevel=CARTON&withStock=false`;
+        case 'carton-with-stock':
+          return `${base}?unitLevel=CARTON&withStock=true`;
+        case 'millier':
+          return `${base}?unitLevel=MILLIER`;
+        case 'piece':
+          return `${base}?unitLevel=PIECE`;
+        case 'all':
+        default:
+          return base;
+      }
+    }
+    
+    // Formater les nombres
+    function formatNumber(num) {
+      if (num === null || num === undefined) return '0';
+      return new Intl.NumberFormat('fr-FR').format(Math.round(num));
+    }
+    
+    // Charger les données
+    async function loadData() {
+      try {
+        const response = await fetch(getApiUrl());
+        if (!response.ok) throw new Error('Erreur API');
+        
+        const data = await response.json();
+        renderTable(data);
+        updateStats(data);
+      } catch (error) {
+        console.error('Erreur:', error);
+        document.getElementById('products-table').innerHTML = `
+          <tr>
+            <td colspan="8" class="empty-state">
+              <div class="icon">⚠️</div>
+              <h3>Erreur de chargement</h3>
+              <p>${error.message}</p>
+            </td>
+          </tr>
+        `;
+      }
+    }
+    
+    // Afficher le tableau
+    function renderTable(products) {
+      const tbody = document.getElementById('products-table');
+      
+      if (!products || products.length === 0) {
+        tbody.innerHTML = `
+          <tr>
+            <td colspan="8" class="empty-state">
+              <div class="icon">📭</div>
+              <h3>Aucun produit</h3>
+              <p>Aucun produit ne correspond à ce filtre.</p>
+            </td>
+          </tr>
+        `;
+        return;
+      }
+      
+      tbody.innerHTML = products.map(p => {
+        const stock = p.stock || p.stock_after || p.stock_current || 0;
+        const prixFc = p.prix_fc || p.sale_price_fc || 0;
+        const prixUsd = p.prix_usd || p.sale_price_usd || 0;
+        const total = p.total_fc || (stock * prixFc) || 0;
+        const stockClass = stock <= 0 ? 'stock-low' : (stock < 10 ? 'stock-low' : 'stock-ok');
+        
+        return `
+          <tr>
+            <td class="code-cell">${p.code || p.product_code || '-'}</td>
+            <td>${p.nom || p.product_name || p.name || '-'}</td>
+            <td>${p.unit_level || '-'}</td>
+            <td>${p.unit_mark || p.current_unit_mark || '-'}</td>
+            <td class="stock-cell ${stockClass}">${formatNumber(stock)}</td>
+            <td class="price-cell">${formatNumber(prixFc)} FC</td>
+            <td>${formatNumber(prixUsd)} $</td>
+            <td class="total-cell">${formatNumber(total)} FC</td>
+          </tr>
+        `;
+      }).join('');
+    }
+    
+    // Mettre à jour les statistiques
+    function updateStats(products) {
+      const count = products.length;
+      const totalStock = products.reduce((acc, p) => acc + (p.stock || p.stock_after || p.stock_current || 0), 0);
+      const totalValue = products.reduce((acc, p) => {
+        const stock = p.stock || p.stock_after || p.stock_current || 0;
+        const price = p.prix_fc || p.sale_price_fc || 0;
+        return acc + (stock * price);
+      }, 0);
+      
+      document.getElementById('stat-count').textContent = formatNumber(count);
+      document.getElementById('stat-stock').textContent = formatNumber(totalStock);
+      document.getElementById('stat-value').textContent = `${formatNumber(totalValue)} FC`;
+    }
+    
+    // Charger au démarrage
+    loadData();
+  </script>
+</body>
+</html>

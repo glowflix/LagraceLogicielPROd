@@ -1,6 +1,7 @@
-import { useState, useEffect } from 'react';
-import { motion } from 'framer-motion';
-import { Settings as SettingsIcon, DollarSign, RefreshCw, Save, CheckCircle2, XCircle, Wifi, Server } from 'lucide-react';
+import { useState, useEffect, useCallback } from 'react';
+import { m } from 'framer-motion';
+import { Settings as SettingsIcon, DollarSign, RefreshCw, Save, CheckCircle2, XCircle, Wifi, Server, Smartphone, QrCode, Copy, Check, Download, Monitor } from 'lucide-react';
+import { QRCodeSVG } from 'qrcode.react';
 import axios from 'axios';
 import { useStore } from '../store/useStore';
 import { getApiUrl, setApiUrl, testApiConnection } from '../utils/apiConfig';
@@ -75,7 +76,7 @@ const SettingsPage = () => {
       </div>
 
       {/* Taux de change */}
-      <motion.div
+      <m.div
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
         className="glass-strong rounded-xl p-6"
@@ -121,12 +122,12 @@ const SettingsPage = () => {
               >
                 {loading ? (
                   <>
-                    <motion.div
+                    <m.div
                       animate={{ rotate: 360 }}
                       transition={{ duration: 1, repeat: Infinity, ease: 'linear' }}
                     >
                       <RefreshCw className="w-5 h-5" />
-                    </motion.div>
+                    </m.div>
                     Mise à jour...
                   </>
                 ) : (
@@ -140,7 +141,7 @@ const SettingsPage = () => {
           </div>
 
           {message.text && (
-            <motion.div
+            <m.div
               initial={{ opacity: 0, y: -10 }}
               animate={{ opacity: 1, y: 0 }}
               className={`flex items-center gap-2 p-3 rounded-lg ${
@@ -161,13 +162,13 @@ const SettingsPage = () => {
               >
                 {message.text}
               </span>
-            </motion.div>
+            </m.div>
           )}
         </div>
-      </motion.div>
+      </m.div>
 
       {/* Configuration serveur (pour Android) */}
-      <motion.div
+      <m.div
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ delay: 0.1 }}
@@ -179,7 +180,22 @@ const SettingsPage = () => {
         </h2>
         
         <ServerConfigSection />
-      </motion.div>
+      </m.div>
+
+      {/* QR Code Mobile - Connexion smartphone */}
+      <m.div
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.2 }}
+        className="glass-strong rounded-xl p-6"
+      >
+        <h2 className="text-xl font-bold text-gray-100 mb-4 flex items-center gap-2">
+          <Smartphone className="w-6 h-6 text-primary-400" />
+          Connexion Mobile (QR Code)
+        </h2>
+        
+        <MobileQRSection />
+      </m.div>
     </div>
   );
 };
@@ -246,12 +262,12 @@ const ServerConfigSection = () => {
             className="btn-secondary flex items-center gap-2 disabled:opacity-50"
           >
             {testing ? (
-              <motion.div
+              <m.div
                 animate={{ rotate: 360 }}
                 transition={{ duration: 1, repeat: Infinity, ease: 'linear' }}
               >
                 <RefreshCw className="w-5 h-5" />
-              </motion.div>
+              </m.div>
             ) : (
               <Wifi className="w-5 h-5" />
             )}
@@ -283,7 +299,7 @@ const ServerConfigSection = () => {
       </button>
 
       {message.text && (
-        <motion.div
+        <m.div
           initial={{ opacity: 0, y: -10 }}
           animate={{ opacity: 1, y: 0 }}
           className={`flex items-center gap-2 p-3 rounded-lg ${
@@ -304,8 +320,259 @@ const ServerConfigSection = () => {
           >
             {message.text}
           </span>
-        </motion.div>
+        </m.div>
       )}
+    </div>
+  );
+};
+
+// Composant QR Code pour connexion mobile
+const MobileQRSection = () => {
+  const [serverUrl, setServerUrl] = useState('');
+  const [ipAddresses, setIpAddresses] = useState([]);
+  const [selectedIp, setSelectedIp] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [copied, setCopied] = useState(false);
+  const PORT = 3030;
+
+  // Détecter automatiquement les adresses IP
+  const detectIpAddresses = useCallback(async () => {
+    setLoading(true);
+    const ips = new Set();
+    
+    try {
+      // Méthode 1: Via l'API système
+      const response = await axios.get(`${getApiUrl()}/api/system/network-info`);
+      if (response.data?.addresses) {
+        response.data.addresses.forEach(ip => ips.add(ip));
+      }
+    } catch (e) {
+      console.log('API network-info non disponible');
+    }
+
+    // Méthode 2: WebRTC (fallback navigateur)
+    try {
+      const pc = new RTCPeerConnection({ iceServers: [] });
+      pc.createDataChannel('');
+      
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      
+      await new Promise((resolve) => {
+        pc.onicecandidate = (e) => {
+          if (!e.candidate) {
+            resolve();
+            return;
+          }
+          const parts = e.candidate.candidate.split(' ');
+          const ip = parts[4];
+          if (ip && !ip.includes(':') && ip !== '0.0.0.0' && !ip.startsWith('127.')) {
+            ips.add(ip);
+          }
+        };
+        setTimeout(resolve, 1000);
+      });
+      
+      pc.close();
+    } catch (e) {
+      console.log('WebRTC non disponible');
+    }
+
+    // Méthode 3: IPs communes par défaut
+    if (ips.size === 0) {
+      ips.add('192.168.1.100');
+      ips.add('192.168.0.100');
+    }
+
+    const ipArray = Array.from(ips);
+    setIpAddresses(ipArray);
+    
+    // Sélectionner automatiquement la première IP
+    if (ipArray.length > 0 && !selectedIp) {
+      setSelectedIp(ipArray[0]);
+      setServerUrl(`http://${ipArray[0]}:${PORT}/mobile`);
+    }
+    
+    setLoading(false);
+  }, [selectedIp]);
+
+  useEffect(() => {
+    detectIpAddresses();
+  }, [detectIpAddresses]);
+
+  // Mettre à jour l'URL quand l'IP change
+  useEffect(() => {
+    if (selectedIp) {
+      setServerUrl(`http://${selectedIp}:${PORT}/mobile`);
+    }
+  }, [selectedIp]);
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(serverUrl);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      console.error('Erreur copie:', err);
+    }
+  };
+
+  // Générer raccourci Mobile (.url) - pour téléphone
+  const exportMobileShortcut = () => {
+    const shortcutContent = `[InternetShortcut]
+URL=${serverUrl}
+IconIndex=0
+`;
+    const blob = new Blob([shortcutContent], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `LA-GRACE-Mobile.url`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // Générer raccourci POS Desktop (.url) - pour autres PC
+  const exportPOSShortcut = () => {
+    const posUrl = `http://${selectedIp}:${PORT}`;
+    const shortcutContent = `[InternetShortcut]
+URL=${posUrl}
+IconIndex=0
+`;
+    const blob = new Blob([shortcutContent], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `LA-GRACE-POS.url`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <div className="space-y-4">
+      <p className="text-sm text-gray-400">
+        Scannez ce QR code avec l'appareil photo de votre téléphone ou Google Chrome pour ouvrir la page de ventes mobile.
+      </p>
+
+      {/* Sélection IP */}
+      <div>
+        <label className="block text-sm font-medium text-gray-300 mb-2">
+          Adresse IP du serveur
+        </label>
+        <select
+          value={selectedIp}
+          onChange={(e) => setSelectedIp(e.target.value)}
+          className="input-field w-full"
+        >
+          {ipAddresses.map((ip) => (
+            <option key={ip} value={ip}>
+              {ip}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      {/* QR Code */}
+      <div className="flex flex-col items-center py-4">
+        {loading ? (
+          <div className="w-[200px] h-[200px] bg-dark-700 rounded-xl flex items-center justify-center">
+            <RefreshCw className="w-8 h-8 text-primary-400 animate-spin" />
+          </div>
+        ) : serverUrl ? (
+          <m.div
+            initial={{ scale: 0.8, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            className="bg-white p-4 rounded-xl"
+          >
+            <QRCodeSVG 
+              value={serverUrl}
+              size={200}
+              bgColor="#ffffff"
+              fgColor="#000000"
+              level="H"
+              includeMargin={true}
+            />
+          </m.div>
+        ) : (
+          <div className="w-[200px] h-[200px] bg-dark-700 rounded-xl flex items-center justify-center">
+            <QrCode className="w-16 h-16 text-gray-600" />
+          </div>
+        )}
+      </div>
+
+      {/* URL avec copie */}
+      <div className="flex gap-2">
+        <input
+          type="text"
+          value={serverUrl}
+          readOnly
+          className="input-field flex-1 text-sm font-mono"
+        />
+        <button
+          onClick={handleCopy}
+          className="btn-secondary flex items-center gap-2"
+        >
+          {copied ? (
+            <>
+              <Check className="w-4 h-4 text-green-400" />
+              Copié!
+            </>
+          ) : (
+            <>
+              <Copy className="w-4 h-4" />
+              Copier
+            </>
+          )}
+        </button>
+      </div>
+
+      {/* Boutons Export */}
+      <div className="grid grid-cols-2 gap-3">
+        <button
+          onClick={exportMobileShortcut}
+          disabled={!serverUrl}
+          className="btn-primary flex items-center justify-center gap-2 py-3"
+        >
+          <Smartphone className="w-4 h-4" />
+          <span className="text-sm">Export Mobile</span>
+        </button>
+        <button
+          onClick={exportPOSShortcut}
+          disabled={!selectedIp}
+          className="bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white py-3 px-4 rounded-lg flex items-center justify-center gap-2 transition-colors"
+        >
+          <Monitor className="w-4 h-4" />
+          <span className="text-sm">Export POS</span>
+        </button>
+      </div>
+
+      {/* Instructions */}
+      <div className="bg-dark-700/50 rounded-lg p-4 space-y-2">
+        <h4 className="text-sm font-semibold text-gray-200 flex items-center gap-2">
+          <Smartphone className="w-4 h-4 text-primary-400" />
+          Comment utiliser:
+        </h4>
+        <ol className="text-xs text-gray-400 space-y-1 list-decimal list-inside">
+          <li>Connectez votre téléphone au <strong>même réseau Wi-Fi</strong> que ce PC</li>
+          <li>Ouvrez <strong>l'appareil photo</strong> ou <strong>Google Chrome</strong></li>
+          <li>Scannez le QR code ci-dessus</li>
+          <li>La page de ventes mobile s'ouvrira automatiquement</li>
+        </ol>
+      </div>
+
+      {/* Bouton actualiser */}
+      <button
+        onClick={detectIpAddresses}
+        disabled={loading}
+        className="btn-secondary w-full flex items-center justify-center gap-2"
+      >
+        <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+        Actualiser les adresses IP
+      </button>
     </div>
   );
 };

@@ -1,0 +1,1 @@
+; Get-Content "C:\Glowflixprojet\logs\app-*.log" -Tail 100 2>$null; Get-Content "C:\Glowflixprojet\logs\error-*.log" -Tail 50 2>$null

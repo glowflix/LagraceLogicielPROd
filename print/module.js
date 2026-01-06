@@ -1,18 +1,185 @@
-// src/print/module.js — Ultra PRO v2.4 (+ DZ/SZN full patch + auto font fit)
+// src/print/module.js — LA GRACE POS Print Module v3.0 (POLLING - Sans chokidar)
+// ✅ 100% compatible DEV + EXE - Dépendances optionnelles avec fallback
 
 import fs from "fs";
 import path from "path";
 import os from "os";
-import chokidar from "chokidar";
-import dayjs from "dayjs";
+// ❌ SUPPRIMÉ: import chokidar from "chokidar"; // Causait "Cannot find package" en EXE
+// ❌ SUPPRIMÉ: import dayjs from "dayjs";        // Causait "Cannot find package" en EXE
 import { fileURLToPath } from "url";
-import express from "express";
-import ptp from "pdf-to-printer";
-const { print: printPDF, getPrinters } = ptp;
-import Handlebars from "handlebars";
 import { exec, spawn } from "child_process";
 
+// ✅ Imports DYNAMIQUES pour éviter les erreurs en mode EXE
+let ptp = null;
+let Handlebars = null;
+
+async function loadPdfToPrinter() {
+  if (ptp) return ptp;
+  try {
+    const mod = await import("pdf-to-printer");
+    ptp = mod.default || mod;
+    return ptp;
+  } catch (e) {
+    console.warn("[PRINT] pdf-to-printer non disponible, fallback PowerShell:", e.message);
+    return null;
+  }
+}
+
+async function loadHandlebars() {
+  if (Handlebars) return Handlebars;
+  try {
+    const hbs = await import("handlebars");
+    Handlebars = hbs.default || hbs;
+    return Handlebars;
+  } catch (e) {
+    console.warn("[PRINT] Handlebars non disponible:", e.message);
+    return null;
+  }
+}
+
+// ✅ Fonction getPrinters avec import dynamique + fallback PowerShell
+async function getPrinters() {
+  const ptpMod = await loadPdfToPrinter();
+  if (ptpMod?.getPrinters) {
+    try {
+      return await ptpMod.getPrinters();
+    } catch (e) {
+      console.warn("[PRINT] pdf-to-printer.getPrinters échec:", e.message);
+    }
+  }
+  
+  // Fallback PowerShell
+  return new Promise((resolve) => {
+    exec('powershell -NoProfile -Command "Get-Printer | Select-Object -ExpandProperty Name"', (err, stdout) => {
+      if (err) {
+        resolve([]);
+      } else {
+        const printers = stdout.split("\n").map(p => p.trim()).filter(Boolean).map(name => ({ name }));
+        resolve(printers);
+      }
+    });
+  });
+}
+
+// ✅ Remplacer dayjs par des fonctions natives
+function formatDateSimple(d, fmt) {
+  const date = d ? new Date(d) : new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  const Y = date.getFullYear();
+  const M = pad(date.getMonth() + 1);
+  const D = pad(date.getDate());
+  const H = pad(date.getHours());
+  const m = pad(date.getMinutes());
+  const s = pad(date.getSeconds());
+  
+  if (fmt === "DD/MM/YYYY HH:mm") return `${D}/${M}/${Y} ${H}:${m}`;
+  if (fmt === "YYYY-MM-DD") return `${Y}-${M}-${D}`;
+  if (fmt === "HH:mm") return `${H}:${m}`;
+  if (fmt === "DD/MM/YYYY") return `${D}/${M}/${Y}`;
+  return `${Y}-${M}-${D} ${H}:${m}`;
+}
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// ✅✅✅ CORRECTION PROBLÈME n°1 & n°4: Single source of truth pour les chemins ✅✅✅
+// Déduire le chemin EXE réel via process.execPath (robuste en packagé)
+const EXE_DIR = process.platform === "win32" && process.execPath 
+  ? path.dirname(process.execPath) 
+  : "";
+const EXE_INSTALL_PATH = EXE_DIR || "C:\\Program Files\\LA GRACE POS";
+
+// Source unique pour le dossier d'impression
+const FIXED_PRINT_DIR = process.env.LAGRACE_PRINT_DIR || "C:\\Glowflixprojet\\printer";
+
+// ✅✅✅ CORRECTION PROBLÈME n°2: Vérification droits écriture + fallback ✅✅✅
+function ensureWritableDir(preferredDir) {
+  try {
+    fs.mkdirSync(preferredDir, { recursive: true });
+    const testFile = path.join(preferredDir, `.__writable_test_${Date.now()}.tmp`);
+    fs.writeFileSync(testFile, "ok", "utf-8");
+    fs.unlinkSync(testFile);
+    console.log(`[PRINT] ✅ Dossier accessible en écriture: ${preferredDir}`);
+    return preferredDir;
+  } catch (e) {
+    console.warn(`[PRINT] ⚠️ Dossier non accessible: ${preferredDir} - ${e.message}`);
+    // Fallback vers dossier user-writable
+    const base = process.env.PROGRAMDATA
+      ? path.join(process.env.PROGRAMDATA, "LA GRACE POS")
+      : (process.env.LOCALAPPDATA
+          ? path.join(process.env.LOCALAPPDATA, "LA GRACE POS")
+          : path.join(os.homedir(), "LA GRACE POS"));
+    const fallback = path.join(base, "printer");
+    try {
+      fs.mkdirSync(fallback, { recursive: true });
+      console.log(`[PRINT] ✅ Fallback dossier: ${fallback}`);
+      return fallback;
+    } catch (e2) {
+      console.error(`[PRINT] ❌ Impossible de créer dossier fallback: ${e2.message}`);
+      return preferredDir; // Retourner quand même le préféré
+    }
+  }
+}
+
+// ✅ Résoudre le dossier d'impression une seule fois au chargement
+const RESOLVED_PRINT_DIR = ensureWritableDir(FIXED_PRINT_DIR);
+
+/* ========= SumatraPDF - Recherche avec process.execPath (PROBLÈME n°4) ========= */
+function findSumatraPDF() {
+  const candidates = [];
+  
+  // 1. PRIORITÉ: Chemin déduit de process.execPath (robuste en EXE)
+  if (EXE_DIR) {
+    candidates.push(
+      path.join(EXE_DIR, "resources", "app.asar.unpacked", "node_modules", "pdf-to-printer", "dist", "SumatraPDF-3.4.6-32.exe"),
+      path.join(EXE_DIR, "resources", "app.asar.unpacked", "node_modules", "pdf-to-printer", "dist", "SumatraPDF.exe"),
+    );
+  }
+  
+  // 2. process.resourcesPath (Electron packagé)
+  if (process.resourcesPath) {
+    const unpacked = path.join(process.resourcesPath, "app.asar.unpacked");
+    candidates.push(
+      path.join(unpacked, "node_modules", "pdf-to-printer", "dist", "SumatraPDF-3.4.6-32.exe"),
+      path.join(unpacked, "node_modules", "pdf-to-printer", "dist", "SumatraPDF.exe"),
+    );
+  }
+  
+  // 3. Mode dev - node_modules local
+  candidates.push(
+    path.join(process.cwd(), "node_modules", "pdf-to-printer", "dist", "SumatraPDF-3.4.6-32.exe"),
+    path.join(process.cwd(), "node_modules", "pdf-to-printer", "dist", "SumatraPDF.exe"),
+  );
+  
+  // 4. vendor/sumatra (dev)
+  candidates.push(
+    path.join(process.cwd(), "vendor", "sumatra", "SumatraPDF.exe"),
+    path.join(__dirname, "..", "vendor", "sumatra", "SumatraPDF.exe"),
+  );
+  
+  // 5. Installation système standard
+  candidates.push(
+    "C:\\Program Files\\SumatraPDF\\SumatraPDF.exe",
+    "C:\\Program Files (x86)\\SumatraPDF\\SumatraPDF.exe",
+  );
+
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) {
+        console.log(`[PRINT] ✅ SumatraPDF: ${p}`);
+        return p;
+      }
+    } catch {}
+  }
+  
+  console.warn(`[PRINT] ⚠️ SumatraPDF non trouvé`);
+  return null;
+}
+
+const SUMATRA_PATH = findSumatraPDF();
+if (SUMATRA_PATH) process.env.SUMATRA_PDF_PATH = SUMATRA_PATH;
+
+// ✅ Log de démarrage compact
+console.log(`\n🖨️  [PRINT] Module chargé | SumatraPDF: ${SUMATRA_PATH ? '✅' : '❌'} | Dir: ${FIXED_PRINT_DIR}\n`);
 
 /* ========= Console helpers ========= */
 const ANSI = { reset:"\u001b[0m", bold:"\u001b[1m", dim:"\u001b[2m", red:"\u001b[31m", green:"\u001b[32m", yellow:"\u001b[33m", blue:"\u001b[34m", magenta:"\u001b[35m", cyan:"\u001b[36m", gray:"\u001b[90m" };
@@ -221,6 +388,8 @@ const CHROME_EXECUTABLE = detectChromeExecutable();
 
 /* ========= Handlebars ========= */
 function registerHbsHelpers({ assetsDir }) {
+  if (!Handlebars) throw new Error("Handlebars non chargé");
+  if (!Handlebars.helpers) Handlebars.helpers = {};
   if (Handlebars.helpers.__ultra_registered__) return;
 
   Handlebars.registerHelper("fmtFC", (v) => formatMoneyTight(v, "FC"));
@@ -232,8 +401,9 @@ function registerHbsHelpers({ assetsDir }) {
   });
   Handlebars.registerHelper("fmtUSDnum", (v) => formatMoneyTight(v, "USD"));
 
-  Handlebars.registerHelper("date", (d, fmt) => dayjs(d || new Date()).format(fmt || "YYYY-MM-DD HH:mm"));
-  Handlebars.registerHelper("now", (fmt) => dayjs().format(fmt || "YYYY-MM-DD HH:mm"));
+  // ✅ Remplacé dayjs par formatDateSimple (fonction native)
+  Handlebars.registerHelper("date", (d, fmt) => formatDateSimple(d || new Date(), fmt || "YYYY-MM-DD HH:mm"));
+  Handlebars.registerHelper("now", (fmt) => formatDateSimple(new Date(), fmt || "YYYY-MM-DD HH:mm"));
   Handlebars.registerHelper("eq", (a,b)=>a===b);
   Handlebars.registerHelper("or", (a,b)=>a||b);
   // ➕ helpers pour sizing intelligent
@@ -271,24 +441,48 @@ function ensureDefaultTemplates(dir) {
 
 function createTemplateEngine(templatesDir, assetsDir) {
   ensureDefaultTemplates(templatesDir);
-  registerHbsHelpers({ assetsDir });
+
   const cache = new Map();
+  let initPromise = null;
+  let ready = false;
+
   const exists = (name)=>fs.existsSync(path.join(templatesDir, `${name}.hbs`));
+
+  const ensureReady = async () => {
+    if (ready) return;
+    if (!initPromise) {
+      initPromise = (async () => {
+        const hbs = await loadHandlebars();
+        if (!hbs) throw new Error("Handlebars indisponible (import échoué)");
+        Handlebars = hbs;
+        registerHbsHelpers({ assetsDir });
+        ready = true;
+      })();
+    }
+    await initPromise;
+  };
+
   const load = (name)=>Handlebars.compile(fs.readFileSync(path.join(templatesDir, `${name}.hbs`), "utf-8"), { noEscape: true });
-  const compileIntoCache = (name) => {
+  const compileIntoCache = async (name) => {
+    await ensureReady();
     const use = exists(name) ? name : DEFAULT_TEMPLATE;
     if (!exists(name)) console.warn(`[PRINT] Template '${name}' introuvable → fallback '${DEFAULT_TEMPLATE}'`);
     if (!cache.has(use)) cache.set(use, load(use));
     return cache.get(use);
   };
+
   return {
     exists,
     list: () => fs.readdirSync(templatesDir).filter(f=>f.endsWith(".hbs")).map(f=>f.replace(/\.hbs$/,"")),
-    render: (name, data) => compileIntoCache(name)(data || {}),
-    preloadAll: () => {
+    render: async (name, data) => {
+      const tpl = await compileIntoCache(name);
+      return tpl(data || {});
+    },
+    preloadAll: async () => {
+      await ensureReady();
       try {
         const all = fs.readdirSync(templatesDir).filter(f => f.endsWith(".hbs"));
-        for (const tpl of all) compileIntoCache(tpl.replace(/\.hbs$/,""));
+        for (const tpl of all) await compileIntoCache(tpl.replace(/\.hbs$/,""));
       } catch (e) {
         console.warn("[PRINT] preload templates error:", e?.message || e);
       }
@@ -396,12 +590,62 @@ function isDuplicate(store, fp, numero){
 }
 
 /* ========= HTML → PDF (ticket 80mm, collé en haut) ========= */
-async function renderPDFfromHTML(html, { ticketWidthMM } = {}) {
-  const puppeteer = (await import("puppeteer")).default;
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// ✅✅✅ CORRECTION PROBLÈME n°3: Fallback Edge headless pour génération PDF ✅✅✅
+async function renderPDFviaEdge(html, outPdfPath) {
+  // Écrire le HTML dans un fichier temporaire
+  const tmpHtml = outPdfPath.replace(/\.pdf$/i, ".html");
+  fs.writeFileSync(tmpHtml, html, "utf-8");
+  
+  // Trouver Edge (presque toujours présent sur Windows)
+  const edgeCandidates = [
+    "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+    "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+  ];
+  const edge = edgeCandidates.find(p => fs.existsSync(p)) || "msedge.exe";
+  
+  const url = `file:///${tmpHtml.replace(/\\/g, "/")}`;
+  const cmd = `"${edge}" --headless=new --disable-gpu --print-to-pdf="${outPdfPath}" "${url}"`;
+  
+  console.log(`[PRINT] 🌐 Fallback Edge PDF: ${path.basename(outPdfPath)}`);
+  
+  return new Promise((resolve, reject) => {
+    exec(cmd, { timeout: 45000, windowsHide: true }, (err, stdout, stderr) => {
+      // Nettoyer le fichier HTML temporaire
+      try { fs.unlinkSync(tmpHtml); } catch {}
+      
+      if (err || !fs.existsSync(outPdfPath)) {
+        reject(new Error(`Edge PDF failed: ${stderr || stdout || err?.message || "unknown"}`));
+      } else {
+        console.log(`[PRINT] ✅ Edge PDF généré: ${path.basename(outPdfPath)}`);
+        resolve(fs.readFileSync(outPdfPath));
+      }
+    });
+  });
+}
+
+async function renderPDFfromHTML(html, { ticketWidthMM, templateName = "" } = {}) {
+  let puppeteer;
+  try {
+    puppeteer = (await import("puppeteer")).default;
+  } catch (e) {
+    console.warn(`[PRINT] Puppeteer non disponible: ${e.message}`);
+    puppeteer = null;
+  }
+
+  // ✅ Si Puppeteer n'est pas dispo, utiliser Edge directement
+  if (!puppeteer) {
+    const tmpDir = path.join(RESOLVED_PRINT_DIR, "tmp");
+    try { fs.mkdirSync(tmpDir, { recursive: true }); } catch {}
+    const tmpPdf = path.join(tmpDir, `edge-${Date.now()}.pdf`);
+    return await renderPDFviaEdge(html, tmpPdf);
+  }
 
   const baseArgs = [
     "--no-sandbox","--disable-setuid-sandbox","--disable-gpu","--disable-dev-shm-usage",
     "--no-first-run","--no-default-browser-check","--disable-features=TranslateUI",
+    "--font-render-hinting=none", // Meilleur rendu des polices
   ];
   const opts = { headless: "new", args: baseArgs };
 
@@ -415,21 +659,36 @@ async function renderPDFfromHTML(html, { ticketWidthMM } = {}) {
   let browser;
   try {
     browser = await puppeteer.launch(opts);
-  } catch {
-    const alt = { headless: "new", args: baseArgs };
-    browser = await puppeteer.launch(alt);
+  } catch (launchErr1) {
+    try {
+      const alt = { headless: "new", args: baseArgs };
+      browser = await puppeteer.launch(alt);
+    } catch (launchErr2) {
+      // ✅✅✅ FALLBACK EDGE si Puppeteer échoue complètement ✅✅✅
+      console.warn(`[PRINT] Puppeteer.launch échec: ${launchErr2.message} - Fallback Edge`);
+      const tmpDir = path.join(RESOLVED_PRINT_DIR, "tmp");
+      try { fs.mkdirSync(tmpDir, { recursive: true }); } catch {}
+      const tmpPdf = path.join(tmpDir, `edge-fallback-${Date.now()}.pdf`);
+      return await renderPDFviaEdge(html, tmpPdf);
+    }
   }
 
   try {
     const page = await browser.newPage();
     await page.emulateMediaType("screen");
-
+    
+    // Déterminer si c'est un template de produit vertical
+    const isProductTicket = templateName?.includes('produit') || html?.includes('class="ticket"');
+    
+    // CSS de sécurité amélioré pour tickets produits
     const safetyCSS = `
       @page{margin:0}
       html,body{margin:0;padding:0;background:#fff;color:#000}
       .__ticket-root{position:fixed;left:0;top:0;width:100%;}
       .__ticket-nudge{transform: translateY(-${TOP_NUDGE_MM}mm);}
       ${ROTATE_180 ? "body{transform:rotate(180deg)}" : ""}
+      /* Garantir que le texte ne soit jamais coupé */
+      .prix span, .nom span, .info-value { overflow: visible !important; }
     `;
     const wrappedHTML = `
       <!doctype html><html><head><meta charset="utf-8">
@@ -451,55 +710,77 @@ async function renderPDFfromHTML(html, { ticketWidthMM } = {}) {
           const adjusted = document.body?.getAttribute('data-adjusted') === 'true';
           return adjusted;
         },
-        { timeout: 5000, polling: 100 }
+        { timeout: 6000, polling: 80 } // Plus de temps pour les tickets produits
       ).catch(() => {
         // Si timeout, forcer l'exécution du script et attendre
         console.warn('[PRINT] Timeout attente ajustement, exécution forcée...');
         page.evaluate(() => {
           // Forcer l'exécution immédiate du script d'ajustement
-          if (typeof adjustAllText === 'function') {
+          if (typeof adjustAllElements === 'function') {
+            adjustAllElements();
+          } else if (typeof adjustAllText === 'function') {
             adjustAllText();
           }
         }).catch(() => {});
       });
       
       // Attendre que les styles soient stabilisés après ajustement
-      await page.waitForTimeout(300);
+      await sleep(isProductTicket ? 400 : 300);
       
-      // Forcer un reflow complet pour s'assurer que tout est calculé
+      // Forcer un reflow complet + vérification finale pour texte non coupé
       await page.evaluate(() => {
         void document.body.offsetHeight;
-        // Vérifier qu'aucun texte ne déborde
+        
+        // Vérification et correction finale
         const allSpans = document.querySelectorAll('.prix span, .nom span, .info-value, .info-label');
         allSpans.forEach(span => {
-          const parent = span.parentElement;
+          const parent = span.closest('.col') || span.closest('.info-row') || span.parentElement;
           if (parent) {
             const scrollH = span.scrollHeight || 0;
             const scrollW = span.scrollWidth || 0;
-            const clientH = parent.clientHeight || 0;
-            const clientW = parent.clientWidth || 0;
-            // Si déborde encore, réduire encore plus
-            if (scrollH > clientH * 0.98 || scrollW > clientW * 0.98) {
+            const clientH = parent.clientHeight || 9999;
+            const clientW = parent.clientWidth || 9999;
+            
+            // Si déborde encore, réduire agressivement
+            let iterations = 0;
+            while ((scrollH > clientH * 0.95 || scrollW > clientW * 0.95) && iterations < 30) {
               const currentSize = parseFloat(getComputedStyle(span).fontSize) || 20;
-              span.style.fontSize = Math.max(12, currentSize - 3) + 'px';
+              const newSize = Math.max(10, currentSize - 2);
+              span.style.fontSize = newSize + 'px';
+              void span.offsetHeight; // Force reflow
+              iterations++;
+              
+              // Re-vérifier
+              const newScrollH = span.scrollHeight || 0;
+              const newScrollW = span.scrollWidth || 0;
+              if (newScrollH <= clientH * 0.95 && newScrollW <= clientW * 0.95) break;
+              if (newSize <= 10) break;
             }
           }
         });
         void document.body.offsetHeight;
       });
       
-      // Dernier délai pour stabilité
-      await page.waitForTimeout(100);
+      // Délai final pour stabilité
+      await sleep(isProductTicket ? 150 : 100);
     } catch (e) {
       // Continuer même si l'attente échoue
       console.warn('[PRINT] Erreur attente ajustement:', e?.message);
     }
 
+    // Génération du PDF avec taille adaptée
     if (ticketWidthMM) {
       const pxHeight = await page.evaluate(() =>
         Math.ceil(document.documentElement.scrollHeight || document.body.scrollHeight || 0)
       );
-      const mmHeight = Math.max(40, Math.ceil(pxHeight * 0.264583));
+      // Pour tickets produits verticaux, hauteur fixe de 200mm
+      const isVerticalTicket = await page.evaluate(() => {
+        const ticket = document.querySelector('.ticket');
+        return ticket && window.getComputedStyle(ticket).minHeight?.includes('200mm');
+      });
+      
+      const mmHeight = isVerticalTicket ? 200 : Math.max(40, Math.ceil(pxHeight * 0.264583));
+      
       return await page.pdf({
         printBackground: true,
         preferCSSPageSize: false,
@@ -517,10 +798,104 @@ async function renderPDFfromHTML(html, { ticketWidthMM } = {}) {
   }
 }
 
+/* ========= Fallback PowerShell pour impression ========= */
+function printWithPowerShell(pdfPath, printerName = null) {
+  return new Promise((resolve, reject) => {
+    // Utiliser SumatraPDF via PowerShell si disponible
+    if (SUMATRA_PATH && fs.existsSync(SUMATRA_PATH)) {
+      const printerArg = printerName ? `-print-to "${printerName}"` : `-print-to-default`;
+      const cmd = `& "${SUMATRA_PATH}" ${printerArg} -silent "${pdfPath}"`;
+      
+      const ps = spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", cmd], {
+        windowsHide: true,
+        shell: false,
+      });
+      
+      ps.on("close", (code) => {
+        if (code === 0) {
+          console.log(`[PRINT] ✅ PowerShell+SumatraPDF terminé`);
+          resolve({ success: true, method: "powershell-sumatra" });
+        } else {
+          reject(new Error(`PowerShell exit ${code}`));
+        }
+      });
+      
+      ps.on("error", reject);
+      
+      // Timeout 30s
+      setTimeout(() => {
+        try { ps.kill(); } catch {}
+        resolve({ success: true, method: "powershell-timeout" }); // Ne pas bloquer
+      }, 30000);
+    } else {
+      // Pas de SumatraPDF, utiliser Start-Process avec le viewer PDF par défaut
+      const psCmd = `Start-Process -FilePath "${pdfPath.replace(/\\/g, "\\\\")}" -Verb Print -WindowStyle Hidden -Wait`;
+      
+      exec(`powershell -NoProfile -Command "${psCmd}"`, { timeout: 30000 }, (err) => {
+        if (err) {
+          console.warn(`[PRINT] PowerShell fallback warning:`, err.message);
+        }
+        resolve({ success: true, method: "powershell-default" });
+      });
+    }
+  });
+}
+
 /* ========= Impression ========= */
 async function printPDFSilent(pdfPath, { printer, copies=1 } = {}) {
-  const opts = { printer: printer || undefined, copies: Number(copies) || 1, scale: "noscale" };
-  await printPDF(pdfPath, opts);
+  // ✅ Utiliser SumatraPDF embarqué si disponible
+  if (SUMATRA_PATH && fs.existsSync(SUMATRA_PATH)) {
+    return new Promise((resolve, reject) => {
+      const args = [
+        "-print-to", printer || "-print-to-default",
+        "-silent",
+        "-print-settings", `${copies}x`,
+        pdfPath
+      ];
+      
+      // Si pas d'imprimante spécifiée, utiliser -print-to-default
+      if (!printer) {
+        args[0] = "-print-to-default";
+        args.splice(1, 1); // Retirer le nom vide
+      }
+      
+      console.log(`[PRINT] 🖨️ SumatraPDF: ${SUMATRA_PATH}`);
+      console.log(`[PRINT] 📄 Fichier: ${pdfPath}`);
+      console.log(`[PRINT] 🎯 Imprimante: ${printer || 'défaut'}`);
+      
+      const proc = spawn(SUMATRA_PATH, args, { windowsHide: true });
+      
+      proc.on('error', (err) => {
+        console.error(`[PRINT] ❌ Erreur SumatraPDF:`, err);
+        reject(err);
+      });
+      
+      proc.on('close', (code) => {
+        if (code === 0) {
+          console.log(`[PRINT] ✅ Impression terminée avec succès`);
+          resolve();
+        } else {
+          reject(new Error(`SumatraPDF exit code: ${code}`));
+        }
+      });
+      
+      // Timeout de sécurité (30 secondes)
+      setTimeout(() => {
+        try { proc.kill(); } catch {}
+        resolve(); // Ne pas bloquer même si timeout
+      }, 30000);
+    });
+  }
+  
+  // Fallback sur pdf-to-printer (import dynamique)
+  const ptpMod = await loadPdfToPrinter();
+  if (ptpMod?.print) {
+    const opts = { printer: printer || undefined, copies: Number(copies) || 1, scale: "noscale" };
+    await ptpMod.print(pdfPath, opts);
+  } else {
+    // Fallback PowerShell si pdf-to-printer non disponible
+    await printWithPowerShell(pdfPath, printer);
+  }
 }
 
 /* ========= Erreurs ========= */
@@ -1238,7 +1613,7 @@ async function buildHTML(job, TPL) {
   };
   data.now = new Date();
   const wanted = job.template || DEFAULT_TEMPLATE;
-  return TPL.render(wanted, data);
+  return await TPL.render(wanted, data);
 }
 
 /* ========= Default printer ========= */
@@ -1250,40 +1625,140 @@ async function getDefaultPrinterName() {
   } catch { return undefined; }
 }
 
-/* ========= Guardian PS ========= */
-function getGuardianPath() {
-  const projectRoot = process.env.GLOWFLIX_ROOT_DIR 
-    ? path.resolve(process.env.GLOWFLIX_ROOT_DIR)
-    : (process.platform === "win32" 
-      ? "C:\\Glowflixprojet" 
-      : path.join(os.homedir(), "Glowflixprojet"));
-  return path.join(projectRoot, "PrintQueueGuardian.ps1");
-}
-const PS_PATH = getGuardianPath();
-function guardianScript(printRoot) {
-  const root = printRoot || (process.platform === "win32" ? "C:\\Glowflixprojet\\printer" : path.join(os.homedir(), "Glowflixprojet", "printer"));
-  return `# PrintQueueGuardian.ps1
-$ErrorActionPreference = "Stop"
-$Root = "${root.replace(/\\/g, "\\\\")}"
-$LogName = "Application"
-$Source  = "LaGrace-Printer"
-if (-not [System.Diagnostics.EventLog]::SourceExists($Source)) { New-EventLog -LogName $LogName -Source $Source | Out-Null }
-function Write-Event($lvl, $msg) { Write-Host "[$lvl] $msg"; $type = @{INFO="Information"; WARN="Warning"; ERROR="Error"}[$lvl]; Write-EventLog -LogName $LogName -Source $Source -EventId 5000 -EntryType $type -Message $msg }
-try { $svc = Get-Service -Name Spooler -ErrorAction Stop; if ($svc.Status -ne "Running") { Start-Service Spooler; Write-Event INFO "Spooler démarré" } } catch { Write-Event ERROR "Spooler indisponible: $($_.Exception.Message)" }
-while ($true) {
+/* ========= Guardian PS - Version PRO EXE ========= */
+function getGuardianRootFromPrintDir(printDir) {
   try {
-    $ok  = Join-Path $Root "ok"; $err = Join-Path $Root "err"; $tmp = Join-Path $Root "tmp"
-    $files = Get-ChildItem -Path $Root -File -Include *.json,*.pdf -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notlike "$ok*" -and $_.FullName -notlike "$err*" -and $_.FullName -notlike "$tmp*" }
-    foreach ($f in $files) {
-      if ((New-TimeSpan -Start $f.LastWriteTime -End (Get-Date)).TotalSeconds -ge 10) {
-        $tmpName = "$($f.FullName).poke"
-        try { Rename-Item -Path $f.FullName -NewName $tmpName -ErrorAction Stop; Rename-Item -Path $tmpName -NewName $f.FullName -ErrorAction Stop; Write-Event WARN "Poke: $($f.Name)" } catch { Write-Event WARN "Poke échoué: $($f.Name) — $($_.Exception.Message)" }
-      }
+    if (printDir) return path.dirname(printDir);
+  } catch {}
+  if (process.env.LAGRACE_DATA_DIR) return path.resolve(process.env.LAGRACE_DATA_DIR);
+  return process.platform === "win32" ? "C:\\Glowflixprojet" : path.join(os.homedir(), "Glowflixprojet");
+}
+
+/**
+ * ✅ Script Guardian AMÉLIORÉ pour mode EXE
+ * - Utilise SumatraPDF embarqué dans l'installation
+ * - Auto-détecte les chemins d'installation
+ * - Gère le spooler Windows
+ * - Surveillance continue des jobs d'impression
+ */
+function guardianScript(printRoot, sumatraPath = null) {
+  const root = printRoot;
+  const sumatraExe = sumatraPath || SUMATRA_PATH || "";
+  
+  // Échapper les backslashes pour PowerShell
+  const rootEscaped = root.replace(/\\/g, "\\\\");
+  const sumatraEscaped = sumatraExe.replace(/\\/g, "\\\\");
+  
+  return `# PrintQueueGuardian.ps1 - LA GRACE POS v2.6
+# ✅ Généré automatiquement pour mode EXE
+# ✅ SumatraPDF: ${sumatraExe || 'Non configuré'}
+# ✅ Print Root: ${root}
+
+$ErrorActionPreference = "SilentlyContinue"
+$Root = "${rootEscaped}"
+$SumatraPath = "${sumatraEscaped}"
+
+# ========= LOGGING =========
+$LogDir = Join-Path $Root "logs"
+if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+$LogFile = Join-Path $LogDir "guardian-$(Get-Date -Format 'yyyy-MM-dd').log"
+
+function Write-Log {
+    param([string]$Level, [string]$Message)
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "[$ts] [$Level] $Message"
+    Write-Host $line
+    Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue
+}
+
+Write-Log "INFO" "=========================================="
+Write-Log "INFO" "PrintQueueGuardian DÉMARRÉ"
+Write-Log "INFO" "Print Root: $Root"
+Write-Log "INFO" "SumatraPDF: $SumatraPath"
+Write-Log "INFO" "=========================================="
+
+# ========= VÉRIFICATION SUMATRAPDF =========
+if ($SumatraPath -and (Test-Path $SumatraPath)) {
+    Write-Log "INFO" "✅ SumatraPDF trouvé: $SumatraPath"
+} else {
+    Write-Log "WARN" "⚠️ SumatraPDF non trouvé au chemin: $SumatraPath"
+    # Rechercher automatiquement
+    $searchPaths = @(
+        "C:\\Program Files\\LA GRACE POS\\resources\\app.asar.unpacked\\node_modules\\pdf-to-printer\\dist\\SumatraPDF-3.4.6-32.exe",
+        "C:\\Program Files\\LA GRACE POS\\resources\\app.asar.unpacked\\node_modules\\pdf-to-printer\\dist\\SumatraPDF.exe",
+        "C:\\Program Files\\SumatraPDF\\SumatraPDF.exe",
+        "C:\\Program Files (x86)\\SumatraPDF\\SumatraPDF.exe"
+    )
+    foreach ($p in $searchPaths) {
+        if (Test-Path $p) {
+            $SumatraPath = $p
+            Write-Log "INFO" "✅ SumatraPDF trouvé par recherche: $SumatraPath"
+            break
+        }
     }
-  } catch { Write-Event ERROR "Guardian loop: $($_.Exception.Message)" }
-  Start-Sleep -Seconds 2
+}
+
+# ========= VÉRIFICATION SPOOLER =========
+try {
+    $svc = Get-Service -Name Spooler -ErrorAction Stop
+    if ($svc.Status -ne "Running") {
+        Start-Service Spooler -ErrorAction Stop
+        Write-Log "INFO" "✅ Spooler démarré"
+    }
+} catch {
+    Write-Log "ERROR" "❌ Spooler indisponible: $($_.Exception.Message)"
+}
+
+# ========= CRÉATION DES DOSSIERS =========
+$ok = Join-Path $Root "ok"
+$err = Join-Path $Root "err" 
+$tmp = Join-Path $Root "tmp"
+@($ok, $err, $tmp) | ForEach-Object {
+    if (-not (Test-Path $_)) { 
+        New-Item -ItemType Directory -Path $_ -Force | Out-Null 
+        Write-Log "INFO" "Dossier créé: $_"
+    }
+}
+
+# ========= BOUCLE PRINCIPALE =========
+Write-Log "INFO" "Surveillance active du dossier: $Root"
+
+while ($true) {
+    try {
+        # Récupérer les fichiers dans le dossier racine (pas les sous-dossiers)
+        $files = Get-ChildItem -Path $Root -File -ErrorAction SilentlyContinue | 
+                 Where-Object { 
+                     ($_.Extension -eq ".json" -or $_.Extension -eq ".pdf") -and
+                     $_.FullName -notlike "$ok*" -and 
+                     $_.FullName -notlike "$err*" -and 
+                     $_.FullName -notlike "$tmp*" -and
+                     $_.FullName -notlike "*\\logs\\*"
+                 }
+        
+        foreach ($f in $files) {
+            $age = (New-TimeSpan -Start $f.LastWriteTime -End (Get-Date)).TotalSeconds
+            
+            # Si le fichier est là depuis plus de 10 secondes, le "poke" pour réveiller le watcher
+            if ($age -ge 10) {
+                try {
+                    $tmpName = "$($f.FullName).poke"
+                    Rename-Item -Path $f.FullName -NewName $tmpName -ErrorAction Stop
+                    Start-Sleep -Milliseconds 100
+                    Rename-Item -Path $tmpName -NewName $f.FullName -ErrorAction Stop
+                    Write-Log "WARN" "⚡ Poke: $($f.Name) (âge: $([math]::Round($age))s)"
+                } catch {
+                    Write-Log "WARN" "Poke échoué: $($f.Name) — $($_.Exception.Message)"
+                }
+            }
+        }
+    } catch {
+        Write-Log "ERROR" "Erreur boucle: $($_.Exception.Message)"
+    }
+    
+    Start-Sleep -Seconds 2
 }`;
 }
+
 function writeFileIfChanged(file, content) {
   try {
     if (fs.existsSync(file)) {
@@ -1295,20 +1770,98 @@ function writeFileIfChanged(file, content) {
     return true;
   } catch { return false; }
 }
+
 const execCmd = (cmd, opts={}) => new Promise((resolve)=>exec(cmd,{windowsHide:true,...opts},(err,stdout,stderr)=>resolve({ok:!err,err,stdout,stderr})));
+
+/**
+ * ✅ Vérifier si le Guardian est en cours d'exécution
+ */
+async function isGuardianRunning() {
+  if (process.platform !== "win32") return false;
+  try {
+    const result = await execCmd('powershell.exe -NoProfile -Command "Get-Process powershell -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like \'*PrintQueueGuardian*\' } | Select-Object -First 1"');
+    return result.ok && result.stdout && result.stdout.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * ✅ Lancer le Guardian si pas déjà en cours
+ */
+async function launchGuardianIfNeeded(psPath, logger) {
+  try {
+    const running = await isGuardianRunning();
+    if (running) {
+      logger?.info?.(`[GUARDIAN] ✅ PrintQueueGuardian déjà en cours d'exécution`);
+      return { ok: true, alreadyRunning: true };
+    }
+    
+    // Lancer le Guardian en arrière-plan
+    const p = spawn("powershell.exe", [
+      "-NoProfile",
+      "-WindowStyle", "Hidden",
+      "-ExecutionPolicy", "Bypass",
+      "-File", psPath
+    ], { 
+      windowsHide: true, 
+      stdio: "ignore", 
+      detached: true 
+    });
+    p?.unref?.();
+    
+    logger?.info?.(`[GUARDIAN] 🚀 PrintQueueGuardian lancé (PID: ${p?.pid || 'N/A'})`);
+    return { ok: true, alreadyRunning: false, pid: p?.pid };
+  } catch (e) {
+    logger?.warn?.(`[GUARDIAN] ⚠️ Erreur lancement: ${e?.message || e}`);
+    return { ok: false, error: e?.message };
+  }
+}
+
+/**
+ * ✅ Installation complète du Guardian avec auto-lancement
+ */
 async function installGuardian({ logger, printDir }) {
   if (process.platform !== "win32") return { ok:false, reason:"non-windows" };
-  const wrote = writeFileIfChanged(PS_PATH, guardianScript(printDir));
-  const psArg = `powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "${PS_PATH}"`;
-  const t1 = await execCmd(`schtasks /Create /TN "LaGrace Print Guardian (Startup)" /SC ONSTART /TR "${psArg}" /RU SYSTEM /RL HIGHEST /F`);
-  const t2 = await execCmd(`schtasks /Create /TN "LaGrace Print Guardian (Logon)" /SC ONLOGON /TR "${psArg}" /RL HIGHEST /F`);
-  try { const p = spawn("powershell.exe", ["-NoProfile","-WindowStyle","Hidden","-ExecutionPolicy","Bypass","-File", PS_PATH], { windowsHide:true, stdio:"ignore", detached:true }); p?.unref?.(); } catch {}
+  
+  const guardianRoot = getGuardianRootFromPrintDir(printDir);
+  const psPath = path.join(guardianRoot, "PrintQueueGuardian.ps1");
+  
+  // Créer le script avec le chemin SumatraPDF
+  const wrote = writeFileIfChanged(psPath, guardianScript(printDir, SUMATRA_PATH));
+  
+  if (wrote) {
+    console.log(`\n╔════════════════════════════════════════════════════════════╗`);
+    console.log(`║  ✅ PrintQueueGuardian.ps1 CRÉÉ/MIS À JOUR                  ║`);
+    console.log(`╠════════════════════════════════════════════════════════════╣`);
+    console.log(`║  📁 Chemin: ${String(psPath).slice(0,45).padEnd(45)} ║`);
+    console.log(`║  🖨️  SumatraPDF: ${String(SUMATRA_PATH || 'Auto-detect').slice(0,40).padEnd(40)} ║`);
+    console.log(`╚════════════════════════════════════════════════════════════╝\n`);
+  }
+  
+  // Tenter de créer les tâches planifiées (nécessite admin)
+  const psArg = `powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "${psPath}"`;
+  let t1 = { ok: false }, t2 = { ok: false };
+  
+  try {
+    t1 = await execCmd(`schtasks /Create /TN "LaGrace Print Guardian (Startup)" /SC ONSTART /TR "${psArg}" /RU SYSTEM /RL HIGHEST /F`);
+  } catch {}
+  
+  try {
+    t2 = await execCmd(`schtasks /Create /TN "LaGrace Print Guardian (Logon)" /SC ONLOGON /TR "${psArg}" /RL HIGHEST /F`);
+  } catch {}
+  
+  // ✅ IMPORTANT: Toujours lancer le Guardian même si les tâches planifiées échouent
+  const launch = await launchGuardianIfNeeded(psPath, logger);
+  
   logger?.info?.(banner("info","Guardian installé", [
-    `script: ${PS_PATH} ${wrote?"(écrit/maj)":"(déjà à jour)"}`,
-    `schtasks Startup: ${t1.ok?"OK":"FAIL"}`,
-    `schtasks Logon:   ${t2.ok?"OK":"FAIL"}`,
+    `script: ${psPath} ${wrote?"(écrit/maj)":"(déjà à jour)"}`,
+    `schtasks Startup: ${t1.ok?"OK":"SKIP (admin requis)"}`,
+    `schtasks Logon:   ${t2.ok?"OK":"SKIP (admin requis)"}`,
+    `process: ${launch.alreadyRunning ? "déjà actif" : (launch.ok ? `lancé (PID ${launch.pid})` : "échec")}`,
   ]));
-  return { ok:true, wrote, schtasks:{ startup:t1, logon:t2 } };
+  
+  return { ok:true, wrote, schtasks:{ startup:t1, logon:t2 }, process: launch };
 }
 
 /* ========= File queue helpers ========= */
@@ -1333,7 +1886,8 @@ function enqueueIfNotQueued(queue, file) {
 export function createPrinterModule({
   io = null,
   logger = console,
-  printDir = null, // Sera déterminé depuis project root
+  printDir = null,
+  express: expressLib = null,
   printerName = process.env.PRINTER_NAME || "",
   templatesDir = null, // Sera déterminé depuis project root
   assetsDir = null, // Sera déterminé depuis project root
@@ -1341,70 +1895,65 @@ export function createPrinterModule({
   retryDelays = [2000, 5000, 10000],
   forceDefault = true,
 } = {}) {
-  // CRITIQUE: Utiliser la même logique que src/core/paths.js pour garantir la cohérence
-  // En build: %APPDATA%\Glowflixprojet\printer
-  // En dev: C:\Glowflixprojet\printer (ou GLOWFLIX_ROOT_DIR si défini)
-  const getDataRoot = () => {
-    if (process.env.LAGRACE_DATA_DIR) return path.resolve(process.env.LAGRACE_DATA_DIR);
-    if (process.env.GLOWFLIX_ROOT_DIR) return path.resolve(process.env.GLOWFLIX_ROOT_DIR);
-    
-    // EN MODE EXE: Utiliser AppData\Roaming
-    // EN DEV: Utiliser C:\Glowflixprojet
-    if (process.platform === "win32") {
-      const appDataRoaming = process.env.APPDATA; // %APPDATA% = AppData\Roaming
-      if (appDataRoaming) {
-        return path.join(appDataRoaming, "Glowflixprojet");
+  // ✅✅✅ CORRECTION PROBLÈME n°1: Single source of truth ✅✅✅
+  // Utiliser RESOLVED_PRINT_DIR (déjà vérifié accessible en écriture au chargement du module)
+  const resolvedPrintDir = printDir
+    ? ensureWritableDir(path.resolve(printDir))
+    : RESOLVED_PRINT_DIR; // ← Utilise la variable globale déjà validée
+  
+  // ✅ CRÉER IMMÉDIATEMENT tous les dossiers AVANT toute autre opération
+  const dataRoot = path.dirname(resolvedPrintDir);
+  const allDirs = [
+    dataRoot,
+    resolvedPrintDir,
+    path.join(resolvedPrintDir, "ok"),
+    path.join(resolvedPrintDir, "err"),
+    path.join(resolvedPrintDir, "tmp"),
+    path.join(resolvedPrintDir, "templates"),
+    path.join(resolvedPrintDir, "assets"),
+  ];
+  
+  for (const dir of allDirs) {
+    if (!fs.existsSync(dir)) {
+      try {
+        fs.mkdirSync(dir, { recursive: true });
+        console.log(`[PRINT-MODULE] ✅ Dossier créé: ${dir}`);
+      } catch (e) {
+        console.error(`[PRINT-MODULE] ❌ Erreur création ${dir}:`, e.message);
       }
-      return "C:\\Glowflixprojet";
     }
-    
-    return path.join(os.homedir(), "Glowflixprojet");
-  };
+  }
   
-  const dataRoot = getDataRoot();
-  
-  // Déterminer le project root
-  const projectRoot = dataRoot;
-  
-  // LOG: Afficher le chemin utilisé (critique pour diagnostic)
+  // LOG: Logger configuré
   const logModule = {
     info:  (...a) => logger?.info ? logger.info(...a)   : console.log(...a),
     warn:  (...a) => logger?.warn ? logger.warn(...a)   : console.warn(...a),
     error: (...a) => logger?.error ? logger.error(...a) : console.error(...a),
   };
   
-  logModule.info('🖨️  [PRINT-MODULE] ==========================================');
-  logModule.info('🖨️  [PRINT-MODULE] INITIALISATION DU MODULE D\'IMPRESSION');
-  logModule.info('🖨️  [PRINT-MODULE] ==========================================');
-  logModule.info(`📁 [PRINT-MODULE] Data Root: ${dataRoot}`);
-  logModule.info(`📁 [PRINT-MODULE] Project Root: ${projectRoot}`);
-  logModule.info(`📁 [PRINT-MODULE] APPDATA: ${process.env.APPDATA || '(non défini)'}`);
-  logModule.info(`📁 [PRINT-MODULE] GLOWFLIX_ROOT_DIR: ${process.env.GLOWFLIX_ROOT_DIR || '(non défini)'}`);
+  // ✅✅✅ LOGS TRÈS VISIBLES AU DÉMARRAGE ✅✅✅
+  console.log('\n');
+  console.log('╔══════════════════════════════════════════════════════════════════════╗');
+  console.log('║  🖨️  MODULE D\'IMPRESSION - LA GRACE POS                               ║');
+  console.log('╠══════════════════════════════════════════════════════════════════════╣');
+  console.log(`║  📁 DOSSIER IMPRESSION: ${String(resolvedPrintDir).padEnd(44)} ║`);
+  console.log(`║  ⚡ IMPRESSION AUTO: ACTIVÉE (immédiate dès l'arrivée du job)        ║`);
+  console.log('╚══════════════════════════════════════════════════════════════════════╝');
+  console.log('\n');
   
-  // Chemins par défaut basés sur project root
-  const defaultPrintDir = printDir || path.join(projectRoot, "printer");
-  const defaultTemplatesDir = templatesDir || resolveTemplatesDir(path.join(projectRoot, "printer", "templates"));
-  const defaultAssetsDir = assetsDir || path.join(projectRoot, "printer", "assets");
+  const PRINT_DIR = resolvedPrintDir;
+  const templatesDirFinal = templatesDir || resolveTemplatesDir(path.join(PRINT_DIR, "templates"));
+  const assetsDirFinal = assetsDir || path.join(PRINT_DIR, "assets");
   
-  // Utiliser les valeurs fournies ou les defaults
-  const PRINT_DIR = defaultPrintDir;
-  const templatesDirFinal = defaultTemplatesDir;
-  const assetsDirFinal = defaultAssetsDir;
-  
-  logModule.info(`📁 [PRINT-MODULE] Print Dir: ${PRINT_DIR}`);
-  logModule.info(`📁 [PRINT-MODULE] Templates Dir: ${templatesDirFinal}`);
-  logModule.info(`📁 [PRINT-MODULE] Assets Dir: ${assetsDirFinal}`);
-  logModule.info('🖨️  [PRINT-MODULE] ==========================================');
+  logModule.info(`📁 [PRINT] Dossier impression: ${PRINT_DIR}`);
+  logModule.info(`📁 [PRINT] Templates: ${templatesDirFinal}`);
+  logModule.info(`📁 [PRINT] Assets: ${assetsDirFinal}`);
   
   const PRINT_OK  = path.join(PRINT_DIR, "ok");
   const PRINT_ERR = path.join(PRINT_DIR, "err");
   const PRINT_TMP = path.join(PRINT_DIR, "tmp");
 
-  fs.mkdirSync(PRINT_DIR, { recursive: true });
-  fs.mkdirSync(PRINT_OK,  { recursive: true });
-  fs.mkdirSync(PRINT_ERR, { recursive: true });
-  fs.mkdirSync(PRINT_TMP, { recursive: true });
-  fs.mkdirSync(assetsDirFinal, { recursive: true });
+  // ✅ Dossiers déjà créés au début de createPrinterModule()
   
   // Copier les templates depuis print/templates vers PRINT_DIR/templates si nécessaire
   const sourceTemplatesDir = path.join(__dirname, "templates");
@@ -1443,7 +1992,14 @@ export function createPrinterModule({
     error: (...a) => logger?.error ? logger.error(...a) : console.error(...a),
   };
 
-  try { TPL.preloadAll?.(); } catch (e) { log.warn(`[PRINT] preload templates failed: ${e?.message || e}`); }
+  try {
+    const p = TPL.preloadAll?.();
+    if (p && typeof p.catch === "function") {
+      p.catch((e) => log.warn(`[PRINT] preload templates failed: ${e?.message || e}`));
+    }
+  } catch (e) {
+    log.warn(`[PRINT] preload templates failed: ${e?.message || e}`);
+  }
 
   const retries = new Map();
   let cachedDefaultPrinter = null;
@@ -1621,7 +2177,10 @@ export function createPrinterModule({
           const ticketWidthMM =
             Number(job.ticketWidthMM || 0) ||
             ((tname.includes("receipt-") || tname.includes("ticket")) ? 80 : 0);
-          const buf = await renderPDFfromHTML(html, ticketWidthMM ? { ticketWidthMM } : {});
+          const buf = await renderPDFfromHTML(html, { 
+            ticketWidthMM: ticketWidthMM || undefined, 
+            templateName: tname 
+          });
           fs.writeFileSync(tmpPdfPath, buf);
           pdfPath = tmpPdfPath;
         }
@@ -1663,11 +2222,20 @@ export function createPrinterModule({
         }
       } catch {}
 
-      log.info(banner("info", "PRINT OK", [
-        `file: ${base}`,
-        `printer: ${usePrinter || "Windows Default"}`,
-        (job?.data?.factureNum || job?.factureNum) ? `facture: ${job?.data?.factureNum || job?.factureNum}` : null,
-      ].filter(Boolean)));
+      // ✅✅✅ LOG TRÈS VISIBLE - IMPRESSION RÉUSSIE ✅✅✅
+      console.log('\n');
+      console.log('┌──────────────────────────────────────────────────┐');
+      console.log('│  ✅ IMPRESSION RÉUSSIE!                           │');
+      console.log('├──────────────────────────────────────────────────┤');
+      console.log(`│  📄 Fichier: ${base.slice(0,35).padEnd(35)} │`);
+      console.log(`│  🖨️  Imprimante: ${(usePrinter || "Windows Default").slice(0,30).padEnd(30)} │`);
+      if (job?.data?.factureNum || job?.factureNum) {
+        console.log(`│  📋 Facture: ${String(job?.data?.factureNum || job?.factureNum).slice(0,34).padEnd(34)} │`);
+      }
+      console.log('└──────────────────────────────────────────────────┘');
+      console.log('\n');
+      
+      log.info(`✅ [PRINT] OK: ${base} → ${usePrinter || "Windows Default"}`);
       io?.emit?.("print:done", { file: base, printer: usePrinter || "Windows Default", factureNum: job?.data?.factureNum || job?.factureNum || null });
 
       // ===== Auto-DETTE (via deep-link uniquement) =====
@@ -1757,92 +2325,151 @@ export function createPrinterModule({
       return;
     }
     
-    // 🖨️  LOGS CONSOLE DIRECTS - TOUJOURS VISIBLES
-    console.log('\n' + '='.repeat(70));
-    console.log('🖨️  [PRINT-MODULE] DÉMARRAGE DU WATCHER D\'IMPRESSION');
-    console.log('='.repeat(70));
-    console.log(`📁 Dossier surveillé: ${PRINT_DIR}`);
-    console.log(`📄 Patterns: *.json, *.pdf`);
-    console.log(`🔄 Max retry: ${maxRetry}`);
-    console.log(`📋 Template par défaut: ${DEFAULT_TEMPLATE}`);
-    console.log('='.repeat(70));
-    console.log('⚠️  IMPORTANT: Déposez les jobs dans le dossier ROOT, pas dans ok/err/tmp');
-    console.log('='.repeat(70) + '\n');
+    // ✅✅✅ LOGS TRÈS VISIBLES - CONSOLE DIRECT ✅✅✅
+    console.log('\n');
+    console.log('╔══════════════════════════════════════════════════════════════════════╗');
+    console.log('║  🖨️  WATCHER D\'IMPRESSION DÉMARRÉ                                     ║');
+    console.log('╠══════════════════════════════════════════════════════════════════════╣');
+    console.log(`║  📁 DOSSIER: ${PRINT_DIR.padEnd(55)} ║`);
+    console.log('║  📄 PATTERNS: *.json, *.pdf                                          ║');
+    console.log('║  ⚡ DÉLAI: 150ms (impression quasi-immédiate)                        ║');
+    console.log('║  🔄 RETRY: ' + String(maxRetry).padEnd(2) + ' tentatives en cas d\'échec                           ║');
+    console.log('╠══════════════════════════════════════════════════════════════════════╣');
+    console.log('║  ⚠️  IMPORTANT: Déposer les fichiers dans le dossier ROOT            ║');
+    console.log('║     PAS dans ok/, err/, tmp/                                         ║');
+    console.log('╚══════════════════════════════════════════════════════════════════════╝');
+    console.log('\n');
     
-    log.info('🖨️  [PRINT] ==========================================');
-    log.info('🖨️  [PRINT] DÉMARRAGE DU WATCHER D\'IMPRESSION');
-    log.info('🖨️  [PRINT] ==========================================');
-    log.info(`📁 [PRINT] Surveillance: ${PRINT_DIR}`);
-    log.info(`📄 [PRINT] Patterns: *.json, *.pdf`);
-    log.info(`🔄 [PRINT] Max retry: ${maxRetry}`);
-    log.info(`📋 [PRINT] Template par défaut: ${DEFAULT_TEMPLATE}`);
-    log.info(`⚠️  [PRINT] CRITIQUE: Les jobs doivent être déposés dans ROOT (${PRINT_DIR})`);
-    log.info(`⚠️  [PRINT] PAS dans les sous-dossiers ok/, err/, tmp/`);
-    log.info('🖨️  [PRINT] ==========================================');
+    log.info(`🖨️  [PRINT] Watcher démarré sur: ${PRINT_DIR}`);
     
-    watcher = chokidar.watch(
-      [path.join(PRINT_DIR, "*.json"), path.join(PRINT_DIR, "*.pdf")],
-      { ignoreInitial: false, awaitWriteFinish: { stabilityThreshold: 500, pollInterval: 100 }, depth: 0 }
-    );
-    watcher.on("add", (file) => {
-      const low = file.toLowerCase();
-      if (low.includes(`${path.sep}ok${path.sep}`) || low.includes(`${path.sep}err${path.sep}`) || low.includes(`${path.sep}tmp${path.sep}`)) {
-        log.warn(`⚠️  [PRINT] Fichier ignoré (sous-dossier): ${file}`);
+    // ✅ Vérifier que le dossier existe
+    if (!fs.existsSync(PRINT_DIR)) {
+      console.error(`❌ [PRINT] ERREUR CRITIQUE: Le dossier ${PRINT_DIR} n'existe pas!`);
+      try {
+        fs.mkdirSync(PRINT_DIR, { recursive: true });
+        console.log(`✅ [PRINT] Dossier créé: ${PRINT_DIR}`);
+      } catch (e) {
+        console.error(`❌ [PRINT] Impossible de créer ${PRINT_DIR}: ${e.message}`);
         return;
       }
-      
-      // 🖨️  LOG CONSOLE DIRECT - TOUJOURS VISIBLE
-      console.log('\n' + '-'.repeat(50));
-      console.log(`🖨️  [PRINT] NOUVEAU JOB DÉTECTÉ!`);
-      console.log(`📄 Fichier: ${path.basename(file)}`);
-      console.log('-'.repeat(50) + '\n');
-      
-      log.info(clr("green", `✅ [PRINT] NOUVEAU JOB DÉTECTÉ`));
-      log.info(`📁 [PRINT] Fichier: ${path.basename(file)}`);
-      log.info(`📁 [PRINT] Chemin: ${file}`);
-      if (enqueueIfNotQueued(queue, file)) {
-        log.info(`📋 [PRINT] Job ajouté à la file d'attente`);
-        console.log(`📋 [PRINT] Job en cours de traitement...`);
-        scheduleDrain();
-      } else {
-        log.warn(`⚠️  [PRINT] Job déjà en file d'attente (skip)`);
+    }
+    
+    // ✅ LISTER les fichiers existants AVANT de démarrer le watcher
+    try {
+      const existingFiles = fs.readdirSync(PRINT_DIR).filter(f => f.endsWith('.json') || f.endsWith('.pdf'));
+      if (existingFiles.length > 0) {
+        console.log(`\n📄 [PRINT] ${existingFiles.length} fichier(s) existant(s) dans ${PRINT_DIR}:`);
+        existingFiles.forEach(f => console.log(`   - ${f}`));
+        console.log('');
       }
-    });
-    watcher.on("error", (e) => {
-      console.log('\n' + '!'.repeat(50));
-      console.log(`❌ [PRINT] ERREUR WATCHER: ${e.message}`);
-      console.log('!'.repeat(50) + '\n');
-      log.error('❌ [PRINT] ==========================================');
-      log.error('❌ [PRINT] ERREUR WATCHER');
-      log.error('❌ [PRINT] ==========================================');
-      log.error(`❌ [PRINT] ${e.message}`);
-      log.error('❌ [PRINT] ==========================================');
-    });
+    } catch (e) {
+      console.error(`[PRINT] Erreur listage: ${e.message}`);
+    }
     
-    // 🖨️  CONFIRMATION FINALE - TRÈS VISIBLE
-    console.log('✅ [PRINT] WATCHER ACTIF ET PRÊT!');
-    console.log(`📁 Surveillance: ${PRINT_DIR}\\*.json et *.pdf\n`);
+    // ✅✅✅ POLLING SIMPLE (Sans chokidar) - 100% compatible EXE ✅✅✅
+    // Note: chokidar supprimé car causait "Cannot find package" en mode EXE
+    console.log(`[PRINT] 👀 Surveillance POLLING de: ${PRINT_DIR}/*.json, *.pdf`);
     
-    log.info(clr("magenta", `✅ [PRINT] Watcher actif sur ${PRINT_DIR}\\*.json et *.pdf`));
-
+    // Variable pour marquer le polling comme actif (remplace watcher)
+    watcher = { active: true, type: "polling" };
+    
+    console.log('\n✅ [PRINT] POLLING PRÊT - Surveillance active (500ms)!\n');
+    log.info(`[PRINT] Polling prêt - ${PRINT_DIR}`);
+    
+    // ✅ TRAITER LES FICHIERS EXISTANTS IMMÉDIATEMENT
     listRootAndEnqueue("startup");
     scheduleDrain();
-    clearInterval(sweepTimer); sweepTimer = setInterval(() => listRootAndEnqueue("periodic"), 1500);
+    
+    // ✅ Polling périodique toutes les 500ms (rapide et stable)
+    clearInterval(sweepTimer); 
+    sweepTimer = setInterval(() => {
+      listRootAndEnqueue("polling");
+    }, 500);
 
-    const auto = (process.env.PRINT_GUARDIAN_AUTO ?? "1") !== "0";
-    if (auto && process.platform === "win32") {
-      log.info(`🔧 [PRINT] Installation du PrintQueueGuardian (auto=${auto})`);
-      installGuardian({ logger, printDir: PRINT_DIR }).catch(e => log.warn(`[guardian] install fail: ${e?.message}`));
+    // ✅ AUTO-CRÉATION ET LANCEMENT DU PrintQueueGuardian (Windows uniquement)
+    if (process.platform === "win32") {
+      const guardianRoot = getGuardianRootFromPrintDir(PRINT_DIR);
+      const psPath = path.join(guardianRoot, "PrintQueueGuardian.ps1");
+      
+      // ✅ Affichage des informations de diagnostic
+      const mode = process.env.NODE_ENV === 'production' ? 'Production' : 'Développement';
+      console.log(`\n╔════════════════════════════════════════════════════════════════════════╗`);
+      console.log(`║  🔧 INITIALISATION PRINTQUEUEGUARDIAN                                  ║`);
+      console.log(`╠════════════════════════════════════════════════════════════════════════╣`);
+      console.log(`║  Mode: ${mode.padEnd(60)} ║`);
+      console.log(`║  SumatraPDF: ${String(SUMATRA_PATH || 'Non trouvé').slice(0,55).padEnd(55)} ║`);
+      console.log(`║  Guardian: ${String(psPath).slice(0,57).padEnd(57)} ║`);
+      console.log(`╚════════════════════════════════════════════════════════════════════════╝\n`);
+      
+      // ✅ Vérifier si le Guardian existe et est valide
+      let guardianNeedsUpdate = true;
+      if (fs.existsSync(psPath)) {
+        try {
+          const content = fs.readFileSync(psPath, 'utf-8');
+          // Vérifier si le script contient la bonne version et le bon chemin
+          if (content.includes('LA GRACE POS v2.6') && content.includes(PRINT_DIR.replace(/\\/g, '\\\\'))) {
+            guardianNeedsUpdate = false;
+            log.info(`✅ [PRINT] PrintQueueGuardian.ps1 à jour`);
+          } else {
+            log.info(`🔄 [PRINT] PrintQueueGuardian.ps1 nécessite une mise à jour`);
+          }
+        } catch (e) {
+          log.warn(`⚠️ [PRINT] Erreur lecture Guardian: ${e.message}`);
+        }
+      }
+      
+      // ✅ Créer/Mettre à jour le Guardian
+      if (guardianNeedsUpdate) {
+        try {
+          fs.mkdirSync(guardianRoot, { recursive: true });
+          const guardianContent = guardianScript(PRINT_DIR, SUMATRA_PATH);
+          fs.writeFileSync(psPath, guardianContent, 'utf-8');
+          log.info(`✅ [PRINT] PrintQueueGuardian.ps1 créé/mis à jour: ${psPath}`);
+          
+          console.log(`\n╔════════════════════════════════════════════════════════════╗`);
+          console.log(`║  ✅ PrintQueueGuardian.ps1 CRÉÉ/MIS À JOUR                  ║`);
+          console.log(`╠════════════════════════════════════════════════════════════╣`);
+          console.log(`║  📁 Chemin: ${String(psPath).slice(0,45).padEnd(45)} ║`);
+          console.log(`║  🖨️  SumatraPDF: ${String(SUMATRA_PATH || 'Auto').slice(0,40).padEnd(40)} ║`);
+          console.log(`╚════════════════════════════════════════════════════════════╝\n`);
+        } catch (guardErr) {
+          log.warn(`⚠️ [PRINT] Erreur création Guardian: ${guardErr.message}`);
+        }
+      }
+      
+      // ✅ TOUJOURS lancer le Guardian (même si script existe déjà)
+      const auto = (process.env.PRINT_GUARDIAN_AUTO ?? "1") !== "0";
+      if (auto) {
+        // Utiliser la fonction améliorée qui vérifie si déjà en cours
+        installGuardian({ logger, printDir: PRINT_DIR })
+          .then(result => {
+            if (result.ok) {
+              if (result.process?.alreadyRunning) {
+                log.info(`✅ [GUARDIAN] Déjà en cours d'exécution`);
+              } else if (result.process?.ok) {
+                log.info(`✅ [GUARDIAN] Lancé avec succès (PID: ${result.process?.pid || 'N/A'})`);
+              }
+            }
+          })
+          .catch(e => log.warn(`[guardian] ${e?.message || 'erreur'}`));
+      }
     }
   }
 
   function stop() {
-    if (watcher) { watcher.close(); watcher = null; }
+    // ✅ watcher est maintenant un objet simple {active: true}, pas chokidar
+    if (watcher) { watcher.active = false; watcher = null; }
     if (sweepTimer) { clearInterval(sweepTimer); sweepTimer = null; }
-    log.warn(clr("yellow", "[PRINT] watcher stopped"));
+    log.warn(clr("yellow", "[PRINT] polling stopped"));
   }
 
   /* ========= REST API ========= */
+  // IMPORTANT (EXE): ne pas importer express depuis app.asar.unpacked (résolution node_modules impossible)
+  // On injecte express depuis src/api/server.js
+  const express = expressLib;
+  if (!express || typeof express.Router !== "function") {
+    throw new Error("express non injecté: createPrinterModule({ express }) requis");
+  }
   const router = express.Router();
 
   router.get("/printers", async (_req, res) => {
@@ -1872,6 +2499,76 @@ export function createPrinterModule({
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
+  // ✅ Route pour vérifier le statut d'impression d'une facture
+  router.get("/status/:invoice", (req, res) => {
+    try {
+      const invoice = String(req.params.invoice || "").trim();
+      if (!invoice) {
+        return res.status(400).json({ status: 'none', error: 'invoice requis' });
+      }
+      
+      // Chercher dans les dossiers ok, err, et racine
+      const patterns = [
+        `*${invoice}*.json`,
+        `*${invoice}*.pdf`,
+        `job-*${invoice}*.json`
+      ];
+      
+      // Vérifier dans OK (imprimé avec succès)
+      const okFiles = fs.existsSync(PRINT_OK) ? fs.readdirSync(PRINT_OK) : [];
+      const foundInOk = okFiles.some(f => f.includes(invoice));
+      if (foundInOk) {
+        return res.json({ 
+          status: 'printed', 
+          message: 'Facture imprimée avec succès',
+          invoice,
+          printedAt: new Date().toISOString()
+        });
+      }
+      
+      // Vérifier dans ERR (erreur d'impression)
+      const errFiles = fs.existsSync(PRINT_ERR) ? fs.readdirSync(PRINT_ERR) : [];
+      const foundInErr = errFiles.some(f => f.includes(invoice));
+      if (foundInErr) {
+        // Lire le fichier d'erreur si possible
+        const errFile = errFiles.find(f => f.includes(invoice) && f.endsWith('.error.json'));
+        let errorInfo = null;
+        if (errFile) {
+          try {
+            errorInfo = JSON.parse(fs.readFileSync(path.join(PRINT_ERR, errFile), 'utf-8'));
+          } catch {}
+        }
+        return res.json({ 
+          status: 'error', 
+          message: 'Erreur lors de l\'impression',
+          invoice,
+          error: errorInfo
+        });
+      }
+      
+      // Vérifier dans la file d'attente / en cours
+      const pendingFiles = fs.existsSync(PRINT_DIR) ? fs.readdirSync(PRINT_DIR).filter(f => !['ok', 'err', 'tmp', 'templates', 'assets'].includes(f)) : [];
+      const foundPending = pendingFiles.some(f => f.includes(invoice));
+      if (foundPending || queue.some(q => q.file.includes(invoice))) {
+        return res.json({ 
+          status: 'pending', 
+          message: 'En attente d\'impression',
+          invoice
+        });
+      }
+      
+      // Non trouvé
+      return res.json({ 
+        status: 'none', 
+        message: 'Aucun job d\'impression trouvé pour cette facture',
+        invoice
+      });
+    } catch (e) {
+      console.error('[PRINT] Erreur status:', e?.message);
+      res.json({ status: 'none', error: e?.message });
+    }
+  });
+
   router.post("/errors/retry", express.json(), (req, res) => {
     try {
       const base = String(req.body?.file || "").trim();
@@ -1888,8 +2585,92 @@ export function createPrinterModule({
   });
 
   router.post("/guardian/install", async (_req, res) => {
-    try { const r = await installGuardian({ logger }); res.json(r); }
+    try { const r = await installGuardian({ logger, printDir: PRINT_DIR }); res.json(r); }
     catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // ✅ Route pour vérifier si le Guardian est en cours d'exécution
+  router.get("/guardian/status", async (_req, res) => {
+    try {
+      const guardianRoot = getGuardianRootFromPrintDir(PRINT_DIR);
+      const psPath = path.join(guardianRoot, "PrintQueueGuardian.ps1");
+      const running = await isGuardianRunning();
+      
+      res.json({
+        success: true,
+        guardian: {
+          scriptPath: psPath,
+          scriptExists: fs.existsSync(psPath),
+          running: running,
+          sumatraPath: SUMATRA_PATH || null,
+          sumatraExists: SUMATRA_PATH ? fs.existsSync(SUMATRA_PATH) : false
+        }
+      });
+    } catch (e) {
+      res.status(500).json({ success: false, error: e.message });
+    }
+  });
+
+  // ✅ Route pour forcer le redémarrage du Guardian
+  router.post("/guardian/restart", async (_req, res) => {
+    try {
+      const guardianRoot = getGuardianRootFromPrintDir(PRINT_DIR);
+      const psPath = path.join(guardianRoot, "PrintQueueGuardian.ps1");
+      
+      // Arrêter les instances existantes
+      try {
+        await execCmd('powershell.exe -NoProfile -Command "Get-Process powershell -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like \'*PrintQueueGuardian*\' } | Stop-Process -Force"');
+      } catch {}
+      
+      // Attendre un peu
+      await new Promise(r => setTimeout(r, 500));
+      
+      // Recréer le script et relancer
+      const result = await installGuardian({ logger, printDir: PRINT_DIR });
+      
+      res.json({ success: true, result });
+    } catch (e) {
+      res.status(500).json({ success: false, error: e.message });
+    }
+  });
+
+  // ✅ Route pour vérifier le statut du système d'impression
+  router.get("/system-status", async (_req, res) => {
+    try {
+      const guardianRoot = getGuardianRootFromPrintDir(PRINT_DIR);
+      const psPath = path.join(guardianRoot, "PrintQueueGuardian.ps1");
+      const guardianRunning = await isGuardianRunning();
+      
+      const status = {
+        mode: process.env.NODE_ENV === 'production' ? 'exe' : 'dev',
+        sumatraPDF: {
+          installed: !!SUMATRA_PATH && fs.existsSync(SUMATRA_PATH),
+          path: SUMATRA_PATH || null
+        },
+        guardian: {
+          scriptExists: fs.existsSync(psPath),
+          path: psPath,
+          running: guardianRunning
+        },
+        printDir: {
+          path: PRINT_DIR,
+          exists: fs.existsSync(PRINT_DIR),
+          subfolders: {
+            ok: fs.existsSync(path.join(PRINT_DIR, 'ok')),
+            err: fs.existsSync(path.join(PRINT_DIR, 'err')),
+            tmp: fs.existsSync(path.join(PRINT_DIR, 'tmp'))
+          }
+        },
+        watcher: {
+          active: !!watcher,
+          queueSize: queue.length,
+          busy: busy
+        }
+      };
+      res.json({ success: true, status });
+    } catch (e) {
+      res.status(500).json({ success: false, error: e.message });
+    }
   });
 
   router.post("/test", async (_req, res) => {
@@ -2220,3 +3001,4 @@ const DEFAULT_80MM_HBS = `<!doctype html>
   </div>
 </body>
 </html>`;
+

@@ -124,13 +124,30 @@ function toNumber(v) {
 }
 
 /**
- * Convertit une valeur en Date (gère formats FR dd/mm/yyyy et ISO)
+ * Convertit une valeur en Date (gère formats FR dd/mm/yyyy, ISO et Excel serial)
  */
 function toDate(v) {
   if (!v) return null;
 
+  // Google Sheets Date object
   if (v instanceof Date) return isNaN(v.getTime()) ? null : v;
+  
+  // Excel serial number (numéro de série Excel)
+  // Les dates Google Sheets sont parfois des nombres comme 45632.5 (jours depuis 1899-12-30)
   if (typeof v === 'number') {
+    // Si c'est un grand nombre (> 1000000), c'est probablement des millisecondes JS
+    if (v > 1000000000000) {
+      const dt = new Date(v);
+      return isNaN(dt.getTime()) ? null : dt;
+    }
+    // Sinon c'est probablement un numéro de série Excel
+    // Excel epoch: 1899-12-30 (avec bug du 29 février 1900)
+    if (v > 1 && v < 100000) {
+      const excelEpoch = new Date(1899, 11, 30); // 30 décembre 1899
+      const dt = new Date(excelEpoch.getTime() + v * 86400 * 1000);
+      return isNaN(dt.getTime()) ? null : dt;
+    }
+    // Fallback: millisecondes depuis epoch
     const dt = new Date(v);
     return isNaN(dt.getTime()) ? null : dt;
   }
@@ -1667,6 +1684,15 @@ function handleSaleItemUpsert(payload) {
  */
 function handleDebtUpsert(payload) {
   const sheet = getSheet(SHEETS.DETTES);
+
+  // ✅ Guard: ne jamais écrire une dette vide
+  const guardInvoice = (payload.invoice_number || '').toString().trim();
+  const guardClient = (payload.client_name || '').toString().trim();
+  const guardTotalFc = toNumber(payload.total_fc);
+  const guardTotalUsd = toNumber(payload.total_usd);
+  if (!guardInvoice || !guardClient || (guardTotalFc <= 0 && guardTotalUsd <= 0)) {
+    return { skipped: true, reason: 'empty_debt', invoice_number: guardInvoice, client_name: guardClient };
+  }
   
   ensureColumn(sheet, 'Client');
   ensureColumn(sheet, 'Produit');
@@ -1724,6 +1750,23 @@ function handleDebtUpsert(payload) {
     if (!searchUuid && searchFacture && searchClient) {
       if (rowFacture === searchFacture && rowClient === searchClient) {
         // si produit est fourni, il doit matcher
+        if (!searchProduit || rowProduit === searchProduit) {
+          rowIndex = i + 1;
+          break;
+        }
+      }
+    }
+  }
+
+  // ✅ Important: si UUID fourni mais pas trouvé, tenter match composite (facture + client + produit)
+  // Cela évite d'ajouter un doublon quand la ligne existante a un _uuid différent.
+  if (rowIndex < 0 && searchUuid && searchFacture && searchClient) {
+    for (let i = 1; i < values.length; i++) {
+      const rowFacture = colFacture > 0 ? String(values[i][colFacture - 1] || '').trim() : '';
+      const rowClient = colClient > 0 ? String(values[i][colClient - 1] || '').trim() : '';
+      const rowProduit = colProduit > 0 ? String(values[i][colProduit - 1] || '').trim() : '';
+
+      if (rowFacture === searchFacture && rowClient === searchClient) {
         if (!searchProduit || rowProduit === searchProduit) {
           rowIndex = i + 1;
           break;
@@ -2934,6 +2977,89 @@ function backfillDettesTechColumns() {
 }
 
 /**
+ * 🧹 Nettoyage Dettes: supprime lignes vides + doublons
+ * - Vide = pas de facture OU pas de client OU montants (FC et USD) à 0
+ * - Doublon = même (facture + client + produit). Conserve la ligne la plus récente (_updated_at)
+ *
+ * À exécuter UNE FOIS dans l'éditeur Apps Script si la feuille contient déjà des doublons/vides.
+ */
+function cleanupDettesDuplicatesAndEmpty() {
+  const sheet = getSheet(SHEETS.DETTES);
+  if (!sheet) {
+    console.error('[cleanupDettesDuplicatesAndEmpty] Feuille Dettes introuvable');
+    return { deleted: 0, duplicates: 0, empty: 0 };
+  }
+
+  ensureTechColumns(sheet);
+
+  const colClient = findColumnIndex(sheet, 'Client');
+  const colProduit = findColumnIndex(sheet, 'Produit');
+  const colFacture = findColumnIndex(sheet, 'numero de facture');
+  const colUpdatedAt = findColumnIndex(sheet, '_updated_at');
+  const colTotalFc = findColumnIndex(sheet, 'prix a payer');
+  const colTotalUsd = findColumnIndex(sheet, 'Dollars');
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) {
+    console.log('[cleanupDettesDuplicatesAndEmpty] Rien à faire (0 ligne)');
+    return { deleted: 0, duplicates: 0, empty: 0 };
+  }
+
+  const values = sheet.getDataRange().getValues();
+
+  const bestByKey = new Map(); // key -> { rowIndex, updatedAt }
+  const rowsToDelete = new Set();
+
+  let emptyCount = 0;
+  let dupCount = 0;
+
+  for (let i = 1; i < values.length; i++) {
+    const rowIndex = i + 1;
+
+    const invoice = colFacture > 0 ? String(values[i][colFacture - 1] || '').trim() : '';
+    const client = colClient > 0 ? String(values[i][colClient - 1] || '').trim() : '';
+    const produit = colProduit > 0 ? String(values[i][colProduit - 1] || '').trim() : '';
+    const totalFc = colTotalFc > 0 ? toNumber(values[i][colTotalFc - 1]) : 0;
+    const totalUsd = colTotalUsd > 0 ? toNumber(values[i][colTotalUsd - 1]) : 0;
+
+    if (!invoice || !client || (totalFc <= 0 && totalUsd <= 0)) {
+      rowsToDelete.add(rowIndex);
+      emptyCount++;
+      continue;
+    }
+
+    const updatedAt = colUpdatedAt > 0 ? toDate(values[i][colUpdatedAt - 1]) : null;
+    const updatedMs = updatedAt ? updatedAt.getTime() : 0;
+    const key = `${invoice}||${client}||${produit}`;
+
+    const prev = bestByKey.get(key);
+    if (!prev) {
+      bestByKey.set(key, { rowIndex, updatedMs });
+      continue;
+    }
+
+    // Doublon: garder le plus récent
+    dupCount++;
+    if (updatedMs >= prev.updatedMs) {
+      rowsToDelete.add(prev.rowIndex);
+      bestByKey.set(key, { rowIndex, updatedMs });
+    } else {
+      rowsToDelete.add(rowIndex);
+    }
+  }
+
+  // Supprimer du bas vers le haut pour ne pas décaler les indices
+  const sorted = Array.from(rowsToDelete).sort((a, b) => b - a);
+  for (const r of sorted) {
+    sheet.deleteRow(r);
+  }
+
+  const deleted = sorted.length;
+  console.log('[cleanupDettesDuplicatesAndEmpty] ✅ Terminé. Supprimées:', deleted, '| Vides:', emptyCount, '| Doublons:', dupCount);
+  return { deleted, duplicates: dupCount, empty: emptyCount };
+}
+
+/**
  * Récupère une page de dettes (pagination PRO)
  * @param {Date} sinceDate - Date depuis laquelle récupérer
  * @param {number} cursor - Ligne de départ (2 = première ligne de données)
@@ -3011,37 +3137,59 @@ function getDebtsPage(sinceDate, cursor, limit) {
   let processedCount = 0;
   let skippedCount = 0;
   let skippedByDate = 0;
+  let skippedEmptyClient = 0;
+  let skippedEmptyDebt = 0;
+  
+  // Log premier row pour diagnostic
+  if (rows.length > 0) {
+    const firstRow = rows[0];
+    console.log('🔍 [getDebtsPage] DIAGNOSTIC première ligne:');
+    console.log('   colDate:', colDate, '→ valeur:', colDate > 0 ? firstRow[colDate - 1] : 'N/A', '| type:', colDate > 0 ? typeof firstRow[colDate - 1] : 'N/A');
+    console.log('   colUpdatedAt:', colUpdatedAt, '→ valeur:', colUpdatedAt > 0 ? firstRow[colUpdatedAt - 1] : 'N/A', '| type:', colUpdatedAt > 0 ? typeof firstRow[colUpdatedAt - 1] : 'N/A');
+    console.log('   colClient:', colClient, '→ valeur:', colClient > 0 ? firstRow[colClient - 1] : 'N/A');
+    console.log('   colFacture:', colFacture, '→ valeur:', colFacture > 0 ? firstRow[colFacture - 1] : 'N/A');
+  }
   
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
     
-    // Utiliser _updated_at si présent, sinon fallback sur date
-    const refVal = (colUpdatedAt > 0) ? r[colUpdatedAt - 1] : r[colDate - 1];
-    const refDate = toDate(refVal);
-    
-    if (!refDate) {
-      console.log(`   ⏭️ Ligne ${startRow + i}: refDate invalide (refVal="${refVal}")`);
-      skippedCount++;
+    // ✅ Skip lignes vides: client ou facture manquants, ou montants à 0
+    const clientName = colClient > 0 ? (r[colClient - 1] || '').toString().trim() : '';
+    const invoiceNumber = colFacture > 0 ? (r[colFacture - 1] || '').toString().trim() : '';
+    const totalFC0 = toNumber(colPrixAPayer > 0 ? r[colPrixAPayer - 1] : 0);
+    const totalUSD0 = toNumber(colDollars > 0 ? r[colDollars - 1] : 0);
+    if (!clientName) {
+      skippedEmptyClient++;
+      continue;
+    }
+    if (!invoiceNumber || (totalFC0 <= 0 && totalUSD0 <= 0)) {
+      skippedEmptyDebt++;
       continue;
     }
     
+    // Utiliser _updated_at si présent, sinon fallback sur date
+    const refVal = (colUpdatedAt > 0) ? r[colUpdatedAt - 1] : r[colDate - 1];
+    let refDate = toDate(refVal);
+    
+    // Si refDate est null, utiliser la date actuelle comme fallback
+    if (!refDate) {
+      console.log(`   ⚠️ Ligne ${startRow + i}: refDate invalide (refVal="${refVal}", type=${typeof refVal}), utilisation date courante`);
+      refDate = new Date(); // Fallback: considérer comme récent
+    }
+    
     if (sinceDate.getTime() > 0 && refDate < sinceDate) {
-      console.log(`   ⏭️ Ligne ${startRow + i}: Rejetée par filtre date (refDate=${refDate.toISOString()} < sinceDate=${sinceDate.toISOString()})`);
       skippedByDate++;
       skippedCount++;
       continue;
     }
     
-    const dateDette = toDate(r[colDate - 1]);
+    // Pour dateDette, utiliser refDate comme fallback
+    let dateDette = toDate(r[colDate - 1]);
     if (!dateDette) {
-      console.log(`   ⏭️ Ligne ${startRow + i}: dateDette invalide`);
-      skippedCount++;
-      continue;
+      dateDette = refDate; // Fallback sur refDate
     }
     
-    console.log(`   ✅ Ligne ${startRow + i}: ${r[colClient - 1] || 'N/A'} - ${r[colProduit - 1] || 'N/A'} (${r[colPrixAPayer - 1] || 0} FC)`);
-    
-    const totalFC = toNumber(colPrixAPayer > 0 ? r[colPrixAPayer - 1] : 0);
+    const totalFC = totalFC0;
     const paidFC = toNumber(colPrixPaye > 0 ? r[colPrixPaye - 1] : 0);
     const remainingFC = toNumber(colReste > 0 ? r[colReste - 1] : 0) || (totalFC - paidFC);
     
@@ -3060,8 +3208,8 @@ function getDebtsPage(sinceDate, cursor, limit) {
       total_fc: totalFC,
       paid_fc: paidFC,
       remaining_fc: remainingFC,
-      invoice_number: colFacture > 0 ? (r[colFacture - 1] || '').toString().trim() : '',
-      total_usd: toNumber(colDollars > 0 ? r[colDollars - 1] : 0),
+      invoice_number: invoiceNumber,
+      total_usd: totalUSD0,
       debt_fc_in_usd: toNumber(colDettesFCUSD > 0 ? r[colDettesFCUSD - 1] : 0),
       note: colDescription > 0 ? (r[colDescription - 1] || '').toString().trim() : '',
       status: status,
@@ -3078,7 +3226,7 @@ function getDebtsPage(sinceDate, cursor, limit) {
   
   console.log('✅ [getDebtsPage] RÉSUMÉ:');
   console.log('   Traité:', processedCount, 'dette(s)');
-  console.log('   Skippé total:', skippedCount, '(dont', skippedByDate, 'par filtre date)');
+  console.log('   Skippé total:', skippedCount, '(dont', skippedByDate, 'par filtre date,', skippedEmptyClient, 'sans client,', skippedEmptyDebt, 'dette(s) vide(s))');
   console.log('   Done:', done, '| Next cursor:', next_cursor);
   console.log('   Retourné:', data.length, 'dettes');
   

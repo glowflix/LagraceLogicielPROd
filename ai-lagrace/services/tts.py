@@ -37,8 +37,19 @@ except ImportError:
     class Style:
         RESET_ALL = BRIGHT = ""
 
-# Configuration
-BASE_DIR = Path(__file__).resolve().parent.parent
+# Configuration - supporte mode dev ET mode packagé (PyInstaller)
+import sys
+
+def get_base_dir():
+    """Obtenir le répertoire de base (supporte PyInstaller)"""
+    if getattr(sys, 'frozen', False):
+        # Mode PyInstaller (EXE)
+        return Path(sys._MEIPASS)
+    else:
+        # Mode développement
+        return Path(__file__).resolve().parent.parent
+
+BASE_DIR = get_base_dir()
 MODELS_DIR = BASE_DIR / "models" / "piper"
 
 # Modèles Piper - UPMC en priorité (référence utilisateur)

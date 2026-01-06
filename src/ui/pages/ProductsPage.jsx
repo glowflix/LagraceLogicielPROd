@@ -234,6 +234,46 @@ const ProductsPage = () => {
   const savingLoopRef = useRef(false); // ✅ Boucle de sauvegarde au lieu d'un lock simple
   const idleSaveTimersRef = useRef(new Map()); // Map<rowId, timeoutId>
   const lastInputAtRef = useRef(new Map());    // Map<rowId, timestamp>
+
+  // ✅ Robustesse: éviter setState après unmount + cleanup timers (évite freeze / fuites)
+  const isMountedRef = useRef(false);
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+
+      // Stopper la boucle de save
+      savingLoopRef.current = false;
+
+      // Nettoyer tous les timers connus
+      try {
+        for (const t of visualValuesTimeoutsRef.current.values()) {
+          clearTimeout(t);
+        }
+        visualValuesTimeoutsRef.current.clear();
+
+        for (const t of idleSaveTimersRef.current.values()) {
+          clearTimeout(t);
+        }
+        idleSaveTimersRef.current.clear();
+
+        pendingSavesRef.current.clear();
+        lastInputAtRef.current.clear();
+      } catch {
+        // noop
+      }
+
+      // Annuler rAF de scroll si actif
+      try {
+        if (scrollCheckTimeoutRef.current) {
+          cancelAnimationFrame(scrollCheckTimeoutRef.current);
+          scrollCheckTimeoutRef.current = null;
+        }
+      } catch {
+        // noop
+      }
+    };
+  }, []);
   
   // ✅ Ref pour éviter les closures stale dans les callbacks
   const editingValuesRef = useRef({});
@@ -311,6 +351,38 @@ const ProductsPage = () => {
     };
   }, [loadProducts, loadCurrentRate, authToken]);
 
+  // ✅ Scroll helpers MUST be declared before effects that reference them (avoid TDZ)
+  const scrollContainerRef = useRef(null);
+  const scrollCheckTimeoutRef = useRef(null);
+  const [scrollPosition, setScrollPosition] = useState('top');
+
+  const captureScrollTop = useCallback(() => {
+    const sc = scrollContainerRef.current;
+    if (!sc) return null;
+    return sc.scrollTop ?? 0;
+  }, []);
+
+  const restoreScrollTopIfJumped = useCallback((savedTop) => {
+    if (savedTop == null) return;
+
+    const restore = () => {
+      const sc = scrollContainerRef.current;
+      if (!sc) return;
+
+      // Évite de casser un scroll volontaire de l'utilisateur.
+      // On restaure uniquement si le scroll est retombé en haut de façon inattendue.
+      if (savedTop > 20 && (sc.scrollTop ?? 0) < 5) {
+        sc.scrollTop = savedTop;
+      }
+    };
+
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(restore);
+    } else {
+      setTimeout(restore, 0);
+    }
+  }, []);
+
   // ✅ Socket.IO listener pour écouter les mises à jour de produits depuis Google Sheets
   useEffect(() => {
     if (!socket) return; // Socket pas encore initialisé
@@ -322,8 +394,10 @@ const ProductsPage = () => {
       }
       
       try {
+        const savedTop = captureScrollTop();
         // Recharger les produits pour avoir les données à jour
         await loadProducts();
+        restoreScrollTopIfJumped(savedTop);
         
         // Afficher une notification à l'utilisateur (optionnel)
         if (IS_DEV) {
@@ -348,7 +422,7 @@ const ProductsPage = () => {
         console.log('🔓 [ProductsPage] Listener Socket.IO "products:updated" désabonné');
       }
     };
-  }, [socket, loadProducts]);
+  }, [socket, captureScrollTop, loadProducts, restoreScrollTopIfJumped]);
 
   // ✅ Socket.IO listener pour la synchronisation automatique intelligente
   useEffect(() => {
@@ -367,7 +441,9 @@ const ProductsPage = () => {
       // Si il y a eu des updates, recharger les produits
       if (data.updated > 0) {
         try {
+          const savedTop = captureScrollTop();
           await loadProducts();
+          restoreScrollTopIfJumped(savedTop);
           if (IS_DEV) {
             console.log(`✅ [AutoSync] Produits rechargés (${data.updated} mises à jour)`);
           }
@@ -389,7 +465,7 @@ const ProductsPage = () => {
         console.log('🔓 [ProductsPage] Listener Socket.IO "products:synced" désabonné');
       }
     };
-  }, [socket, loadProducts]);
+  }, [socket, captureScrollTop, loadProducts, restoreScrollTopIfJumped]);
 
   // Fonction helper pour obtenir les headers d'authentification (optimisée)
   const getAuthHeaders = useCallback(() => {
@@ -598,6 +674,15 @@ const ProductsPage = () => {
     }
   }, [products, activeFilter, calculateFC]);
 
+  // ✅ Accès O(1) aux lignes (évite tableData.find dans les boucles de save)
+  const tableDataById = useMemo(() => {
+    const map = new Map();
+    for (const row of tableData) {
+      if (row?.id != null) map.set(row.id, row);
+    }
+    return map;
+  }, [tableData]);
+
   // Fonction pour générer un code automatique intelligent
   const generateAutoCode = useCallback((unitLevel) => {
     if (unitLevel !== 'CARTON') return null;
@@ -673,11 +758,6 @@ const ProductsPage = () => {
     return -1;
   }, [filteredData]);
 
-  // ✅ FIX #1: Déclarer scrollContainerRef AVANT useVirtualizer (TDZ bug)
-  const scrollContainerRef = useRef(null);
-  const scrollCheckTimeoutRef = useRef(null);
-  const [scrollPosition, setScrollPosition] = useState('top');
-
   // ✅ Virtualisation de table : rendre seulement les lignes visibles
   const rowVirtualizer = useVirtualizer({
     count: Array.isArray(filteredData) ? filteredData.length : 0,
@@ -722,7 +802,7 @@ const ProductsPage = () => {
         
         scrollCheckTimeoutRef.current = requestAnimationFrame(() => {
           try {
-            const scrollContainer = scrollContainerRef.current || document?.querySelector('.overflow-x-auto');
+            const scrollContainer = scrollContainerRef.current;
             
             if (!scrollContainer) {
               if (typeof window !== 'undefined') {
@@ -767,34 +847,27 @@ const ProductsPage = () => {
     };
 
     try {
-      const scrollContainer = document?.querySelector('.overflow-x-auto');
+      const scrollContainer = scrollContainerRef.current;
       if (scrollContainer) {
-        scrollContainerRef.current = scrollContainer;
         scrollContainer.addEventListener('scroll', handleScroll, { passive: true });
         handleScroll();
-        
-        if (typeof window !== 'undefined' && window.addEventListener) {
-          window.addEventListener('scroll', handleScroll, { passive: true });
-        }
-        
+
         return () => {
-          if (scrollContainer && scrollContainer.removeEventListener) {
+          if (scrollContainer.removeEventListener) {
             scrollContainer.removeEventListener('scroll', handleScroll);
-          }
-          if (typeof window !== 'undefined' && window.removeEventListener) {
-            window.removeEventListener('scroll', handleScroll);
           }
           if (scrollCheckTimeoutRef.current) {
             cancelAnimationFrame(scrollCheckTimeoutRef.current);
           }
         };
-      } else if (typeof window !== 'undefined' && window.addEventListener) {
+      }
+
+      // Fallback (rare): si le conteneur n'existe pas, on observe le scroll global
+      if (window?.addEventListener) {
         window.addEventListener('scroll', handleScroll, { passive: true });
         handleScroll();
         return () => {
-          if (window.removeEventListener) {
-            window.removeEventListener('scroll', handleScroll);
-          }
+          window?.removeEventListener?.('scroll', handleScroll);
           if (scrollCheckTimeoutRef.current) {
             cancelAnimationFrame(scrollCheckTimeoutRef.current);
           }
@@ -1142,6 +1215,8 @@ const ProductsPage = () => {
   const handleDeleteProduct = useCallback(async (row) => {
     if (!row || row.is_empty) return;
 
+    const savedTop = captureScrollTop();
+
     const productCode = getProductCode(row);
     if (!productCode) {
       alert('Code produit invalide');
@@ -1173,6 +1248,7 @@ const ProductsPage = () => {
 
       // Recharger les produits via le store
       await loadProducts();
+      restoreScrollTopIfJumped(savedTop);
 
     } catch (error) {
       if (IS_DEV) {
@@ -1193,11 +1269,13 @@ const ProductsPage = () => {
       setSaveMessage({ type: 'error', text: errorMessage });
       setTimeout(() => setSaveMessage({ type: '', text: '' }), 3000);
     }
-  }, [getAuthHeaders, getProductCode, loadProducts]);
+  }, [captureScrollTop, getAuthHeaders, getProductCode, loadProducts, restoreScrollTopIfJumped]);
 
   // Sauvegarder les changements en attente avec boucle (défini avant scheduleSave)
   // ✅ Utilise une boucle au lieu d'un lock pour éviter de perdre les modifications pendant la sauvegarde
   const savePendingChanges = useCallback(async () => {
+    const savedTop = captureScrollTop();
+
     // Empêcher la ré-entrée
     if (savingLoopRef.current) {
       if (IS_DEV) {
@@ -1207,8 +1285,10 @@ const ProductsPage = () => {
     }
     
     savingLoopRef.current = true;
-    setSaving(true);
-    setSaveMessage({ type: 'info', text: 'Sauvegarde en cours...' });
+    if (isMountedRef.current) {
+      setSaving(true);
+      setSaveMessage({ type: 'info', text: 'Sauvegarde en cours...' });
+    }
     
     try {
       // ✅ FIX #3: Track creation flag en dehors de la boucle
@@ -1224,8 +1304,20 @@ const ProductsPage = () => {
           console.log(`💾 [ProductsPage] Sauvegarde de ${batch.length} produit(s) dans cette itération`);
         }
         
-        const promises = batch.map(async (rowId) => {
-          const row = tableData.find(r => r.id === rowId);
+        const batchSize = 12;
+        const yieldToUI = () => new Promise((resolve) => {
+          if (typeof requestAnimationFrame === 'function') {
+            requestAnimationFrame(() => resolve());
+          } else {
+            setTimeout(resolve, 0);
+          }
+        });
+
+        for (let start = 0; start < batch.length; start += batchSize) {
+          const chunk = batch.slice(start, start + batchSize);
+
+          const promises = chunk.map(async (rowId) => {
+            const row = tableDataById.get(rowId);
           // ✅ Utiliser editingValuesRef pour éviter les closures stale
           const editsRaw = editingValuesRef.current[rowId];
           if (!row || !editsRaw) return;
@@ -1361,35 +1453,45 @@ const ProductsPage = () => {
               return copy;
             });
           });
-        });
-        
-        await Promise.all(promises);
+
+          });
+
+          const results = await Promise.allSettled(promises);
+          const rejected = results.find((r) => r.status === 'rejected');
+          if (rejected && rejected.status === 'rejected') {
+            throw rejected.reason;
+          }
+
+          // ✅ Yield pour garder l'UI réactive (clics, navigation, scroll)
+          await yieldToUI();
+        }
         
         // Si de nouveaux changements sont arrivés pendant la sauvegarde, on continue la boucle
         if (IS_DEV && pendingSavesRef.current.size > 0) {
           console.log(`   🔄 Nouveaux changements détectés (${pendingSavesRef.current.size}), nouvelle itération...`);
         }
       }
-      
-      setSaveMessage({ type: 'success', text: 'Sauvegarde réussie' });
+
+      if (isMountedRef.current) {
+        setSaveMessage({ type: 'success', text: 'Sauvegarde réussie' });
+      }
       
       // ✅ FIX #3: hadCreation est tracké dans la boucle while, on l'utilise ici pour reload optionnel
       if (hadCreation) {
-        // Conserver la scroll position (optionnel)
-        const sc = scrollContainerRef.current;
-        const top = sc ? sc.scrollTop : null;
-
         setTimeout(async () => {
           await loadProducts();
-          requestAnimationFrame(() => {
-            if (sc && top != null) sc.scrollTop = top;
-          });
+          restoreScrollTopIfJumped(savedTop);
         }, 150);
       }
+
+      // ✅ Conserver le scroll même sans reload (si un rerender a remis en haut)
+      restoreScrollTopIfJumped(savedTop);
       
       // Effacer le message après 2 secondes
       setTimeout(() => {
-        setSaveMessage({ type: '', text: '' });
+        if (isMountedRef.current) {
+          setSaveMessage({ type: '', text: '' });
+        }
       }, 2000);
     } catch (error) {
       if (IS_DEV) {
@@ -1416,12 +1518,16 @@ const ProductsPage = () => {
         errorMessage = error.response?.data?.error || errorMessage;
       }
       
-      setSaveMessage({ type: 'error', text: errorMessage });
+      if (isMountedRef.current) {
+        setSaveMessage({ type: 'error', text: errorMessage });
+      }
     } finally {
-      setSaving(false);
+      if (isMountedRef.current) {
+        setSaving(false);
+      }
       savingLoopRef.current = false; // ✅ Utiliser savingLoopRef au lieu de savingInFlightRef
     }
-  }, [tableData, loadProducts, handleCreateProduct, handleUpdateProduct, calculateFC, calculateUSD, setVisualForRow]);
+  }, [captureScrollTop, restoreScrollTopIfJumped, tableDataById, loadProducts, handleCreateProduct, handleUpdateProduct, calculateFC, calculateUSD, setVisualForRow]);
 
   // ✅ AUTO-SAVE IA : save si 5s sans frappe ET la ligne reste active (focus dans la ligne)
   // + save immédiat uniquement quand on quitte réellement la ligne (pas quand on change de cellule dans la même ligne)
@@ -1770,9 +1876,14 @@ const ProductsPage = () => {
     return row[field] ?? '';
   };
 
-  // Imprimer la liste
+  // État pour la progression d'impression
+  const [printProgress, setPrintProgress] = useState({ current: 0, total: 0, isActive: false });
+  const printAbortRef = useRef(false);
+
+  // Imprimer la liste - PRO avec progression animée
   const handlePrint = async () => {
     try {
+      printAbortRef.current = false;
       setLoading(true);
       
       // Préparer les données pour l'impression (un ticket par produit)
@@ -1785,16 +1896,16 @@ const ProductsPage = () => {
       }
 
       // Confirmation si beaucoup de tickets
-      if (productsToPrint.length > 80) {
-        const proceed = window.confirm(`Vous allez envoyer ${productsToPrint.length} tickets à l'impression. Continuer ?`);
+      if (productsToPrint.length > 50) {
+        const proceed = window.confirm(`🖨️ Vous allez imprimer ${productsToPrint.length} tickets produits.\n\nCette opération peut prendre quelques minutes.\n\nContinuer ?`);
         if (!proceed) {
           setLoading(false);
           return;
         }
       }
       
-      // Obtenir le label de l'unité
-      const getUnitLabel = (unitLevel) => {
+      // Helpers pour formatage
+      const getUnitLabelPrint = (unitLevel) => {
         const labels = {
           'CARTON': 'CARTON',
           'MILLIER': 'DÉTAIL',
@@ -1804,74 +1915,116 @@ const ProductsPage = () => {
         return labels[unitLevel] || unitLevel;
       };
 
-      // Fonction pour formater le prix en FC
-      const formatPrixFC = (price) => {
+      const formatPrixFCPrint = (price) => {
         return (price || 0).toLocaleString('fr-CD') + ' FC';
       };
 
-      // Fonction pour nettoyer le nom du produit
-      const cleanProductName = (name) => {
-        return String(name || '').trim().replace(/\s+/g, ' ');
+      const cleanProductNamePrint = (name) => {
+        return String(name || '').trim().replace(/\s+/g, ' ').toUpperCase();
       };
 
-      // Délai entre chaque envoi (comme dans prix.js)
+      // Initialiser la progression
+      setPrintProgress({ current: 0, total: productsToPrint.length, isActive: true });
+      
       const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      let successCount = 0;
+      let errorCount = 0;
       
-      // Envoyer un job par produit (séquentiellement avec délai pour éviter surcharge)
-      setSaveMessage({ type: 'info', text: `Envoi des tickets (${productsToPrint.length})…` });
+      // Envoyer les jobs par batch (5 à la fois pour vitesse)
+      const BATCH_SIZE = 5;
       
-      for (const row of productsToPrint) {
-        const prixFc = formatPrixFC(row.sale_price_fc);
-        const nom = cleanProductName(row.product_name);
-        const unite = getUnitLabel(row.unit_level);
-        const mark = row.unit_mark || '';
-        const stock = (row.stock_current || 0).toLocaleString('fr-CD');
-        
-        const job = {
-          template: 'receipt-produit-80mm',
-          ticketWidthMM: 80,
-          copies: 1,
-          data: {
-            prixFc: prixFc,
-            nom: nom,
-            unite: unite,
-            mark: mark,
-            stock: stock
-          }
-        };
-        
-        try {
-          await axios.post(`${PRINT_API_URL}/jobs`, job, getAuthHeaders());
-        } catch (error) {
-          if (IS_DEV) {
-            console.error(`Erreur impression produit ${row.product_code}:`, error);
-          }
-          // Continue avec les autres produits même en cas d'erreur
+      for (let i = 0; i < productsToPrint.length; i += BATCH_SIZE) {
+        if (printAbortRef.current) {
+          setSaveMessage({ type: 'error', text: 'Impression annulée' });
+          break;
         }
         
-        // Délai de 180ms entre chaque ticket (comme dans prix.js)
-        await delay(180);
+        const batch = productsToPrint.slice(i, Math.min(i + BATCH_SIZE, productsToPrint.length));
+        
+        const batchPromises = batch.map(async (row) => {
+          const prixFc = formatPrixFCPrint(row.sale_price_fc);
+          const nom = cleanProductNamePrint(row.product_name);
+          const unite = getUnitLabelPrint(row.unit_level);
+          const mark = (row.unit_mark || '').toUpperCase();
+          const stock = (row.stock_current || 0).toLocaleString('fr-CD');
+          
+          const job = {
+            template: 'receipt-produit-80mm',
+            ticketWidthMM: 80,
+            copies: 1,
+            forceReprint: true, // ✅ Permettre re-impression des produits
+            data: {
+              prixFc: prixFc,
+              nom: nom,
+              unite: unite,
+              mark: mark,
+              stock: stock
+            }
+          };
+          
+          try {
+            await axios.post(`${PRINT_API_URL}/jobs`, job, getAuthHeaders());
+            return { success: true };
+          } catch (error) {
+            if (IS_DEV) {
+              console.error(`❌ Erreur impression ${row.product_code}:`, error?.message);
+            }
+            return { success: false, error };
+          }
+        });
+        
+        const results = await Promise.all(batchPromises);
+        results.forEach(r => {
+          if (r.success) successCount++;
+          else errorCount++;
+        });
+        
+        // Mettre à jour la progression
+        const newCurrent = Math.min(i + BATCH_SIZE, productsToPrint.length);
+        setPrintProgress({ current: newCurrent, total: productsToPrint.length, isActive: true });
+        
+        // Petit délai entre les batchs pour éviter surcharge
+        if (i + BATCH_SIZE < productsToPrint.length) {
+          await delay(100);
+        }
       }
       
-      setSaveMessage({ type: 'success', text: `${productsToPrint.length} ticket(s) envoyé(s) à l'impression` });
-      setTimeout(() => setSaveMessage({ type: '', text: '' }), 2000);
+      // Résultat final
+      setPrintProgress({ current: 0, total: 0, isActive: false });
+      
+      if (errorCount === 0) {
+        setSaveMessage({ 
+          type: 'success', 
+          text: `🎉 ${successCount} ticket(s) envoyé(s) à l'imprimante !` 
+        });
+      } else if (successCount > 0) {
+        setSaveMessage({ 
+          type: 'success', 
+          text: `✅ ${successCount} OK, ⚠️ ${errorCount} erreur(s)` 
+        });
+      } else {
+        setSaveMessage({ type: 'error', text: 'Erreur: aucun ticket imprimé' });
+      }
+      
+      setTimeout(() => setSaveMessage({ type: '', text: '' }), 4000);
     } catch (error) {
       if (IS_DEV) {
         console.error('Erreur impression:', error);
       }
+      setPrintProgress({ current: 0, total: 0, isActive: false });
       setSaveMessage({ type: 'error', text: 'Erreur lors de l\'impression' });
     } finally {
       setLoading(false);
     }
   };
 
-  // Imprimer un seul produit (ticket inverse)
+  // Imprimer un seul produit (ticket vertical PRO)
   const handlePrintSingleProduct = async (row) => {
     if (!row || row.is_empty) return;
     
     try {
-      // Obtenir le label de l'unité
-      const getUnitLabel = (unitLevel) => {
+      // Helpers locaux
+      const getUnitLabelSingle = (unitLevel) => {
         const labels = {
           'CARTON': 'CARTON',
           'MILLIER': 'DÉTAIL',
@@ -1881,26 +2034,25 @@ const ProductsPage = () => {
         return labels[unitLevel] || unitLevel;
       };
 
-      // Formater le prix en FC
-      const formatPrixFC = (price) => {
+      const formatPrixFCSingle = (price) => {
         return (price || 0).toLocaleString('fr-CD') + ' FC';
       };
 
-      // Nettoyer le nom du produit
-      const cleanProductName = (name) => {
-        return String(name || '').trim().replace(/\s+/g, ' ');
+      const cleanProductNameSingle = (name) => {
+        return String(name || '').trim().replace(/\s+/g, ' ').toUpperCase();
       };
 
-      const prixFc = formatPrixFC(row.sale_price_fc);
-      const nom = cleanProductName(row.product_name);
-      const unite = getUnitLabel(row.unit_level);
-      const mark = row.unit_mark || '';
+      const prixFc = formatPrixFCSingle(row.sale_price_fc);
+      const nom = cleanProductNameSingle(row.product_name);
+      const unite = getUnitLabelSingle(row.unit_level);
+      const mark = (row.unit_mark || '').toUpperCase();
       const stock = (row.stock_current || 0).toLocaleString('fr-CD');
       
       const job = {
         template: 'receipt-produit-80mm',
         ticketWidthMM: 80,
         copies: 1,
+        forceReprint: true, // ✅ Permettre re-impression
         data: {
           prixFc: prixFc,
           nom: nom,
@@ -1910,15 +2062,19 @@ const ProductsPage = () => {
         }
       };
       
+      // Animation feedback immédiat
+      setSaveMessage({ type: 'info', text: '🖨️ Envoi en cours...' });
+      
       await axios.post(`${PRINT_API_URL}/jobs`, job, getAuthHeaders());
-      setSaveMessage({ type: 'success', text: 'Ticket envoyé à l\'impression' });
-      setTimeout(() => setSaveMessage({ type: '', text: '' }), 2000);
+      
+      setSaveMessage({ type: 'success', text: `🎉 Ticket "${row.product_name}" envoyé !` });
+      setTimeout(() => setSaveMessage({ type: '', text: '' }), 2500);
     } catch (error) {
       if (IS_DEV) {
         console.error('Erreur impression produit:', error);
       }
-      setSaveMessage({ type: 'error', text: 'Erreur lors de l\'impression' });
-      setTimeout(() => setSaveMessage({ type: '', text: '' }), 2000);
+      setSaveMessage({ type: 'error', text: '❌ Erreur d\'impression' });
+      setTimeout(() => setSaveMessage({ type: '', text: '' }), 3000);
     }
   };
 
@@ -1992,18 +2148,89 @@ const ProductsPage = () => {
             )}
           </p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex gap-2 items-center">
+          {/* Progression d'impression PRO - Style moderne avec animation fluide */}
+          {printProgress.isActive && (
+            <div className="relative flex items-center gap-3 bg-gradient-to-r from-blue-600/25 via-primary-500/20 to-cyan-500/25 px-5 py-3 rounded-2xl border border-blue-400/50 shadow-lg shadow-blue-500/20 overflow-hidden">
+              {/* Effet de brillance animé */}
+              <div className="absolute inset-0 overflow-hidden pointer-events-none">
+                <div 
+                  className="absolute -inset-x-full top-0 h-full w-1/2 bg-gradient-to-r from-transparent via-white/15 to-transparent"
+                  style={{ animation: 'shimmer 2.5s ease-in-out infinite' }} 
+                />
+              </div>
+              
+              {/* Icône d'impression animée */}
+              <div className="relative flex items-center justify-center w-10 h-10 rounded-xl bg-gradient-to-br from-blue-500 to-primary-500 shadow-lg">
+                <Printer className="w-5 h-5 text-white animate-pulse" />
+                <span className="absolute -top-1 -right-1 w-3 h-3 bg-green-400 rounded-full border-2 border-gray-900 animate-ping" />
+              </div>
+              
+              <div className="relative flex flex-col gap-1">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-bold text-white">
+                    Impression en cours
+                  </span>
+                  <span className="px-2 py-0.5 text-xs font-bold bg-blue-500/40 text-blue-200 rounded-full">
+                    {Math.round((printProgress.current / printProgress.total) * 100)}%
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <div className="w-32 h-2 bg-gray-700/60 rounded-full overflow-hidden">
+                    <div 
+                      className="h-full bg-gradient-to-r from-blue-500 via-primary-400 to-cyan-400 transition-all duration-500 ease-out shadow-lg shadow-blue-500/50"
+                      style={{ width: `${Math.round((printProgress.current / printProgress.total) * 100)}%` }}
+                    />
+                  </div>
+                  <span className="text-xs font-mono font-bold text-cyan-300">
+                    {printProgress.current}/{printProgress.total}
+                  </span>
+                </div>
+              </div>
+              
+              <button
+                onClick={() => { printAbortRef.current = true; }}
+                className="relative ml-2 p-1.5 rounded-lg bg-red-500/20 hover:bg-red-500/40 text-red-400 hover:text-red-300 transition-all duration-200"
+                title="Annuler l'impression"
+              >
+                <XCircle className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+          
+          {/* Bouton d'impression PRO avec animation */}
           <button
             onClick={handlePrint}
-            disabled={loading}
-            className="btn-primary flex items-center gap-2"
+            disabled={loading || printProgress.isActive}
+            className={`group relative flex items-center gap-2.5 px-5 py-2.5 rounded-xl font-semibold transition-all duration-300 overflow-hidden ${
+              printProgress.isActive 
+                ? 'bg-gray-700/50 text-gray-400 cursor-not-allowed' 
+                : 'bg-gradient-to-r from-blue-600 via-primary-500 to-cyan-600 text-white hover:shadow-xl hover:shadow-primary-500/40 hover:scale-[1.02] active:scale-[0.98]'
+            }`}
           >
-            <Printer className="w-5 h-5" />
-            Imprimer liste
+            {/* Effet hover brillant */}
+            {!printProgress.isActive && (
+              <span className="absolute inset-0 bg-gradient-to-r from-white/0 via-white/20 to-white/0 -translate-x-full group-hover:translate-x-full transition-transform duration-700" />
+            )}
+            
+            <span className="relative flex items-center gap-2.5">
+              {loading && !printProgress.isActive ? (
+                <Loader2 className="w-5 h-5 animate-spin" />
+              ) : (
+                <div className="relative">
+                  <Printer className="w-5 h-5 transition-transform group-hover:scale-110" />
+                  {!printProgress.isActive && (
+                    <span className="absolute -top-0.5 -right-0.5 w-2 h-2 bg-green-400 rounded-full opacity-0 group-hover:opacity-100 transition-opacity" />
+                  )}
+                </div>
+              )}
+              <span className="hidden sm:inline">Imprimer tous les produits</span>
+              <span className="sm:hidden">Imprimer</span>
+            </span>
           </button>
           <button
             onClick={handleExportCSV}
-            className="btn-secondary flex items-center gap-2"
+            className="btn-secondary flex items-center gap-2 hover:scale-105 transition-transform"
           >
             <Download className="w-5 h-5" />
             CSV
@@ -2458,7 +2685,14 @@ const ProductsPage = () => {
                               if (!Array.isArray(markSuggestions) || markSuggestions.length === 0) return null;
                               
                               return (
-                                <div className="absolute z-[100] mt-1 w-full bg-dark-800 border border-primary-500/30 rounded-lg shadow-xl max-h-32 overflow-y-auto">
+                                <div
+                                  className="absolute z-[100] mt-1 w-full bg-dark-800 border border-primary-500/30 rounded-lg shadow-xl max-h-32 overflow-y-auto"
+                                  onPointerDownCapture={(e) => {
+                                    // Empêche le blur de l'input (et donc le "click-through")
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                  }}
+                                >
                                   {markSuggestions
                                     .filter(m => m && typeof m === 'string' && (!currentMark || m.toLowerCase().includes(currentMark.toLowerCase())))
                                     .slice(0, 8)
@@ -2466,13 +2700,14 @@ const ProductsPage = () => {
                                       <button
                                         key={idx}
                                         type="button"
-                                        onClick={() => {
+                                        onPointerDown={(e) => {
+                                          e.preventDefault();
+                                          e.stopPropagation();
                                           if (row?.id && mark) {
                                             updateEditValue(row.id, 'unit_mark', mark);
-                                            setTimeout(() => {
-                                              setEditingCell(null);
-                                              setFocusedField(null);
-                                            }, 100);
+                                            flushRowNow(row.id, 'mark-suggestion');
+                                            setEditingCell(null);
+                                            setFocusedField(null);
                                           }
                                         }}
                                         className="w-full text-left px-3 py-1.5 hover:bg-primary-500/20 text-gray-200 text-sm border-b border-white/5 last:border-0"

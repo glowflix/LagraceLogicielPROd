@@ -3,6 +3,7 @@ import { productsRepo } from '../../db/repositories/products.repo.js';
 import { syncRepo } from '../../db/repositories/sync.repo.js';
 import { outboxRepo } from '../../db/repositories/outbox.repo.js';
 import { auditRepo } from '../../db/repositories/audit.repo.js';
+import { stockModificationsRepo } from '../../db/repositories/stock-modifications.repo.js';
 import { authenticate, optionalAuth } from '../middlewares/auth.js';
 import { logger } from '../../core/logger.js';
 import { getDb } from '../../db/sqlite.js';
@@ -487,6 +488,29 @@ router.put('/:code/units/:unitId/stock', authenticate, (req, res) => {
       delta: stockDelta,
       reason: reason || (delta !== undefined ? 'adjustment' : 'correction')
     });
+    
+    // ✅ NEW ARRIVAGE: Enregistrer la modification de stock
+    try {
+      const product = productsRepo.findByCode(code);
+      stockModificationsRepo.record({
+        product_id: unit.product_id,
+        product_uuid: unit.product_uuid,
+        product_code: code,
+        product_name: product?.name || '',
+        unit_level: unit.unit_level,
+        unit_mark: unit.unit_mark || '',
+        stock_before: unit.stock_current,
+        stock_after: newStock,
+        sale_price_fc: unit.sale_price_fc || 0,
+        sale_price_usd: unit.sale_price_usd || 0,
+        purchase_price_usd: unit.purchase_price_usd || 0,
+        modification_type: reason || (delta !== undefined ? 'adjustment' : 'correction'),
+        reason: reason || null,
+        modified_by: req.user?.id || null
+      });
+    } catch (modError) {
+      logger.warn('Erreur enregistrement modification stock (non-bloquant):', modError.message);
+    }
     
     logger.info(`📦 Stock mis à jour: ${code}/${unit.unit_level} ${unit.stock_current} → ${newStock} (delta: ${stockDelta > 0 ? '+' : ''}${stockDelta})`);
     

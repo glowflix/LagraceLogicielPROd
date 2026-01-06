@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { m, AnimatePresence } from 'framer-motion';
 import {
   Search,
   Plus,
@@ -23,6 +23,8 @@ import {
   AlertCircle,
 } from 'lucide-react';
 import { useStore } from '../store/useStore';
+import { useCurrentRate, useProducts } from '../store/selectors';
+import { getSellerName } from '../utils/permissions';
 import axios from 'axios';
 import { normalizeUnit, normalizeMark, getQtyPolicy, validateAndCorrectQty } from '../../core/qty-rules.js';
 
@@ -59,12 +61,11 @@ function useDebounce(value, delay) {
 }
 
 const SalesPOS = () => {
-  const {
-    products,
-    currentRate,
-    loadProducts,
-    loadCurrentRate,
-  } = useStore();
+  // ✅ Sélecteurs atomiques: évite re-render POS à chaque changement du store
+  const products = useProducts();
+  const currentRate = useCurrentRate();
+  const loadProducts = useStore((s) => s.loadProducts);
+  const loadCurrentRate = useStore((s) => s.loadCurrentRate);
 
   const [searchQuery, setSearchQuery] = useState('');
   const debouncedSearch = useDebounce(searchQuery, 300);
@@ -87,6 +88,7 @@ const SalesPOS = () => {
       items: [],
       currency: 'FC',
       isDebt: false,
+      paidAmountUsd: 0, // Montant payé partiellement (mode dette)
     }
   ]);
   const [processing, setProcessing] = useState(false);
@@ -111,9 +113,59 @@ const SalesPOS = () => {
   const [hoveredItemIndex, setHoveredItemIndex] = useState(null);
   const [focusedField, setFocusedField] = useState(null);
   const [hoveredButton, setHoveredButton] = useState(null);
+  
+  // ✅ MODE DETTE: Clients chargés depuis "Compte Utilisateur" (table users)
+  const [debtClients, setDebtClients] = useState([]);
+  const [debtClientsLoaded, setDebtClientsLoaded] = useState(false);
+
+  // ✅ Refs: éviter re-attach des listeners globaux et closures stale
+  const processingRef = useRef(false);
+  const activeSaleIndexRef = useRef(0);
+  const activeSaleHasItemsRef = useRef(false);
+  const finalizeSaleRef = useRef(null);
 
   // Obtenir la vente active (doit être défini avant les useEffect qui l'utilisent)
   const activeSale = sales[activeSaleIndex];
+
+  useEffect(() => {
+    processingRef.current = !!processing;
+  }, [processing]);
+
+  useEffect(() => {
+    activeSaleIndexRef.current = activeSaleIndex;
+  }, [activeSaleIndex]);
+
+  useEffect(() => {
+    activeSaleHasItemsRef.current = (activeSale?.items?.length || 0) > 0;
+  }, [activeSale?.items?.length]);
+  
+  // ✅ MODE DETTE: Charger les clients de "Compte Utilisateur" au démarrage
+  useEffect(() => {
+    const loadClientsFromCompteUtilisateur = async () => {
+      try {
+        console.log('🔄 Chargement des clients depuis Compte Utilisateur...');
+        const response = await axios.get(`${API_URL}/api/sales/clients/search?q=`);
+        
+        let clients = [];
+        if (response.data?.results) {
+          clients = response.data.results;
+        } else if (Array.isArray(response.data)) {
+          clients = response.data;
+        }
+        
+        console.log(`✅ ${clients.length} clients chargés depuis Compte Utilisateur:`, 
+          clients.map(c => c.name || c.username).join(', '));
+        
+        setDebtClients(clients);
+        setDebtClientsLoaded(true);
+      } catch (error) {
+        console.error('❌ Erreur chargement clients Compte Utilisateur:', error);
+        setDebtClientsLoaded(true); // Marquer comme chargé même en erreur
+      }
+    };
+    
+    loadClientsFromCompteUtilisateur();
+  }, []); // Charger une seule fois au démarrage
 
   useEffect(() => {
     loadProducts();
@@ -158,6 +210,34 @@ const SalesPOS = () => {
       setShowClientSuggestions(false);
     }
   }, [activeSaleIndex, activeSale]);
+
+  // ✅ RACCOURCI CLAVIER: listener stable (pas de re-attach)
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.key === 'Enter') {
+        const activeElement = document.activeElement;
+        const tagName = activeElement?.tagName?.toLowerCase();
+        const inputType = activeElement?.type?.toLowerCase();
+
+        // Ne pas déclencher si on est dans un textarea ou un input text (sauf recherche)
+        if (tagName === 'textarea') return;
+        if (tagName === 'input' && inputType === 'text' && !activeElement.classList.contains('search-input')) return;
+
+        if (activeSaleHasItemsRef.current && !processingRef.current) {
+          e.preventDefault();
+          finalizeSaleRef.current?.(activeSaleIndexRef.current);
+        }
+      }
+
+      if (e.ctrlKey && e.key === 'f') {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, []);
 
   // Réinitialiser la sélection quand on change de produit ou recherche
   useEffect(() => {
@@ -537,6 +617,7 @@ const SalesPOS = () => {
       items: [],
       currency: 'FC',
       isDebt: false,
+      paidAmountUsd: 0, // Montant payé partiellement (mode dette)
     }]);
     setActiveSaleIndex(sales.length);
   }, [sales]);
@@ -576,6 +657,24 @@ const SalesPOS = () => {
       return;
     }
 
+    // ✅ MODE DETTE: Validation du montant payé
+    if (sale.isDebt) {
+      const paidAmount = parseFloat(sale.paidAmountUsd) || 0;
+      const totalUsd = activeSaleTotals?.usd || 0;
+      
+      // Le montant payé ne peut pas dépasser le total
+      if (paidAmount > totalUsd) {
+        raiseError(`Le montant payé (${paidAmount.toFixed(2)} USD) ne peut pas dépasser le total (${totalUsd.toFixed(2)} USD)`);
+        return;
+      }
+      
+      // Si le montant payé = total, suggérer de passer en mode payant
+      if (paidAmount >= totalUsd && paidAmount > 0) {
+        raiseError('Le client paie le total → utilisez le mode "Payant" au lieu de "Dette"');
+        return;
+      }
+    }
+
     // Sauvegarder le nom dans l'historique
     saveClientName(sale.clientName);
 
@@ -601,28 +700,33 @@ const SalesPOS = () => {
     
     try {
       // Le backend génère automatiquement le numéro de facture au format YYYYMMDDHHmmss
-    const saleData = {
+      // ✅ MODE DETTE: Le backend gère la création de dette si isDebt=true
+      const saleData = {
         // invoice_number sera généré côté backend si non fourni
-      sold_at: new Date().toISOString(),
+        sold_at: new Date().toISOString(),
         client_name: sale.clientName || null,
         client_phone: sale.clientPhone || null,
         client_address: sale.clientAddress || null,
         client_email: sale.clientEmail || null,
-      seller_name: useStore.getState().user?.username || 'System',
+        seller_name: getSellerName(useStore.getState().user),
         total_fc: activeSaleTotals.fc,
         total_usd: activeSaleTotals.usd,
-      rate_fc_per_usd: currentRate,
+        rate_fc_per_usd: currentRate,
         payment_mode: sale.isDebt ? 'dette' : 'cash',
-        paid_fc: sale.isDebt ? 0 : activeSaleTotals.fc,
-        paid_usd: sale.isDebt ? 0 : activeSaleTotals.usd,
-        status: sale.isDebt ? 'unpaid' : 'paid',
+        // ✅ MODE DETTE: Envoyer isDebt et paid_amount_usd pour que le backend crée une dette
+        isDebt: sale.isDebt,
+        paid_amount_usd: sale.isDebt ? (parseFloat(sale.paidAmountUsd) || 0) : activeSaleTotals.usd,
+        // paid_fc/paid_usd calculés par le backend en mode dette
+        paid_fc: sale.isDebt ? ((parseFloat(sale.paidAmountUsd) || 0) * currentRate) : activeSaleTotals.fc,
+        paid_usd: sale.isDebt ? (parseFloat(sale.paidAmountUsd) || 0) : activeSaleTotals.usd,
+        status: sale.isDebt ? (sale.paidAmountUsd > 0 ? 'partial' : 'unpaid') : 'paid',
         items: sale.items.map(item => ({
           ...item,
           // Normaliser les unités et marks pour le backend
           unit_level: item.unit_level, // Déjà normalisé côté UI
           unit_mark: item.unit_mark || '',
         })),
-        printCurrency: sale.currency,
+        printCurrency: sale.isDebt ? 'USD' : sale.currency, // ✅ Forcer USD pour dettes
         autoDette: sale.isDebt,
       };
 
@@ -657,28 +761,15 @@ const SalesPOS = () => {
         // L'impression est gérée automatiquement par le backend via print_job
         // Plus besoin d'appel séparé
 
-        // Si dette, créer automatiquement
-        if (sale.isDebt) {
-          console.log('💳 [SalesPOS] Création de la dette...');
-          try {
-            await axios.post(`${API_URL}/api/debts`, {
-              invoice_number: invoiceNumber,
-              client_name: sale.clientName || 'Client',
-              client_phone: '',
-              total_fc: activeSaleTotals.fc,
-              total_usd: activeSaleTotals.usd,
-              items: sale.items.map(item => ({
-                product_code: item.product_code,
-                product_name: item.product_name,
-                qty: item.qty,
-                unit_price_fc: item.unit_price_fc,
-                total_fc: item.subtotal_fc,
-              })),
-            });
-            console.log('✅ [SalesPOS] Dette créée avec succès');
-          } catch (error) {
-            console.error('❌ [SalesPOS] Erreur création dette:', error);
-          }
+        // ✅ MODE DETTE: La dette est maintenant créée automatiquement par le backend
+        // via le flag isDebt=true dans le payload de POST /api/sales
+        if (response.data.isDebt) {
+          console.log('💳 [SalesPOS] Dette créée par le backend:');
+          console.log(`   ID: ${response.data.debt?.id}`);
+          console.log(`   Total: ${response.data.debt?.total_usd} USD`);
+          console.log(`   Payé: ${response.data.debt?.paid_usd} USD`);
+          console.log(`   Reste: ${response.data.debt?.remaining_usd} USD`);
+          console.log(`   Statut: ${response.data.debt?.status}`);
         }
 
         // Réinitialiser la vente
@@ -694,6 +785,7 @@ const SalesPOS = () => {
           items: [],
           currency: 'FC',
           isDebt: false,
+          paidAmountUsd: 0,
         };
         setSales(newSales);
         if (saleIndex === activeSaleIndex) {
@@ -734,6 +826,11 @@ const SalesPOS = () => {
       console.log('🏁 [SalesPOS] Finalisation terminée, processing = false');
     }
   };
+
+  // ✅ Toujours exposer la dernière version à l'écouteur clavier stable
+  useEffect(() => {
+    finalizeSaleRef.current = finalizeSale;
+  }, [finalizeSale]);
 
   // Obtenir le label de l'unité
   const getUnitLabel = (unitLevel) => {
@@ -777,7 +874,7 @@ const SalesPOS = () => {
       {/* ✅ Message d'erreur UI (remplace alert) */}
       <AnimatePresence>
         {uiError && (
-          <motion.div
+          <m.div
             initial={{ opacity: 0, y: -10 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -10 }}
@@ -787,7 +884,7 @@ const SalesPOS = () => {
               <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
               <p>{uiError}</p>
             </div>
-          </motion.div>
+          </m.div>
         )}
       </AnimatePresence>
 
@@ -796,7 +893,7 @@ const SalesPOS = () => {
         <div className="card p-2">
           <div className="flex gap-2 overflow-x-auto pb-1">
             {/* Bouton Nouveau client - Compact */}
-            <motion.button
+            <m.button
               whileHover={{ scale: 1.05, y: -1 }}
               whileTap={{ scale: 0.95 }}
               transition={{ duration: 0.08, ease: [0.25, 0.1, 0.25, 1] }}
@@ -812,7 +909,7 @@ const SalesPOS = () => {
               <User className="w-3 h-3" />
               <Plus className="w-2.5 h-2.5" />
               Nouveau client
-            </motion.button>
+            </m.button>
 
             {/* Onglets des clients */}
             {sales.map((sale, index) => {
@@ -824,7 +921,7 @@ const SalesPOS = () => {
                 : `Client ${index + 1}`;
               
               return (
-                <motion.div
+                <m.div
                   key={sale.id}
                   role="button"
                   tabIndex={0}
@@ -885,7 +982,7 @@ const SalesPOS = () => {
                       <X className="w-2.5 h-2.5" />
                     </button>
                   )}
-                </motion.div>
+                </m.div>
               );
             })}
           </div>
@@ -895,19 +992,12 @@ const SalesPOS = () => {
         <div className="grid grid-cols-1 md:grid-cols-[60%_40%] gap-4 items-stretch">
           {/* Colonne gauche: Nom du client + DEVISE + PANIER (60% de la largeur) */}
           <div className="flex flex-col gap-4 min-w-0">
-            {/* Nom du client */}
-            <motion.div 
-              className="card p-2.5 flex-shrink-0 relative z-50"
-              animate={{
-                scale: focusedField === 'client' ? 1 : focusedField ? 0.95 : 1,
-                opacity: focusedField === 'client' ? 1 : focusedField ? 0.7 : 1
-              }}
-              transition={{ duration: 0.1, ease: 'easeOut' }}
-            >
+            {/* Nom du client - VERSION SIMPLIFIÉE */}
+            <div className="card p-2.5 flex-shrink-0 relative z-50">
               <label className="block text-xs font-medium text-gray-300 mb-2">
-                Nom du client :
+                {activeSale.isDebt ? '👤 Nom du client (obligatoire) :' : 'Nom du client :'}
               </label>
-              <div className="relative z-[200]">
+              <div className="relative">
                 <input
                   ref={clientNameInputRef}
                   type="text"
@@ -916,122 +1006,123 @@ const SalesPOS = () => {
                     const newSales = [...sales];
                     newSales[activeSaleIndex].clientName = e.target.value;
                     setSales(newSales);
-                    const hasValue = e.target.value.length > 0;
-                    const hasMatches = clientNamesHistory.some(name => 
-                      name.toLowerCase().includes(e.target.value.toLowerCase())
-                    );
-                    setShowClientSuggestions(hasValue && hasMatches && clientNamesHistory.length > 0);
+                    setShowClientSuggestions(true);
                   }}
                   onFocus={() => {
                     setFocusedField('client');
-                    const hasMatches = clientNamesHistory.some(name => 
-                      !activeSale.clientName || 
-                      name.toLowerCase().includes(activeSale.clientName.toLowerCase())
-                    );
-                    setShowClientSuggestions(hasMatches && clientNamesHistory.length > 0);
+                    setShowClientSuggestions(true);
                   }}
-                  onBlur={(e) => {
+                  onBlur={() => {
                     setFocusedField(null);
-                    // Délai pour permettre le clic sur les suggestions
-                    setTimeout(() => {
-                      setShowClientSuggestions(false);
-                    }, 300);
+                    setTimeout(() => setShowClientSuggestions(false), 200);
                   }}
-                  placeholder="Nom du client"
-                  className="input-field w-full text-sm py-2 pr-2 relative z-[200]"
-                  list="client-names-list"
+                  placeholder={activeSale.isDebt ? "Tapez le nom du client..." : "Nom du client"}
+                  className={`input-field w-full text-sm py-2 ${
+                    activeSale.isDebt ? 'border-orange-500/50' : ''
+                  }`}
                 />
-                <AnimatePresence>
-                  {showClientSuggestions && clientNamesHistory.length > 0 && (() => {
-                    const filteredNames = clientNamesHistory
-                      .filter(name => 
-                        !activeSale.clientName || 
-                        name.toLowerCase().includes(activeSale.clientName.toLowerCase())
-                      )
-                      .slice(0, 8);
-                    
-                    if (filteredNames.length === 0) return null;
-                    
+                
+                {/* ✅ LISTE DES CLIENTS - Affiche les noms de "Compte Utilisateur" en mode dette */}
+                {showClientSuggestions && (() => {
+                  // 🔥 MODE DETTE: Utiliser les clients de la base (Compte Utilisateur)
+                  // MODE PAYANT: Utiliser l'historique local
+                  const sourceList = activeSale.isDebt 
+                    ? debtClients.map(c => ({ 
+                        name: c.name || c.username, 
+                        phone: c.phone,
+                        role: c.role,
+                        id: c.id 
+                      }))
+                    : clientNamesHistory.map(n => ({ name: n, phone: null, id: null }));
+                  
+                  // Filtrer selon la saisie (ou montrer tous si vide)
+                  const searchTerm = (activeSale.clientName || '').toLowerCase().trim();
+                  const filtered = sourceList.filter(item => {
+                    if (!item.name) return false;
+                    if (!searchTerm) return true; // Montrer tous si pas de recherche
+                    return item.name.toLowerCase().includes(searchTerm);
+                  }).slice(0, 10); // Max 10 résultats
+                  
+                  // En mode dette: afficher "Chargement" uniquement tant que la requête initiale n'a pas fini
+                  if (activeSale.isDebt && !debtClientsLoaded) {
                     return (
-                      <motion.div
-                        initial={{ opacity: 0, y: -5, scale: 0.95, pointerEvents: 'none' }}
-                        animate={{ opacity: 1, y: 0, scale: 1, pointerEvents: 'auto' }}
-                        exit={{ opacity: 0, y: -5, scale: 0.95, pointerEvents: 'none' }}
-                        transition={{ duration: 0.2, ease: [0.25, 0.1, 0.25, 1] }}
-                        className="absolute z-[300] w-full mt-1.5 bg-gradient-to-br from-green-900/98 via-green-800/98 to-teal-900/98 backdrop-blur-lg rounded-xl border-2 border-green-500/50 shadow-2xl overflow-hidden"
-                        style={{
-                          boxShadow: '0 15px 50px rgba(0, 0, 0, 0.7), 0 0 0 2px rgba(34, 197, 94, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.1)',
-                          top: '100%',
-                          left: 0,
-                          right: 0,
-                          position: 'absolute'
-                        }}
-                      >
-                        <div 
-                          className="max-h-48 overflow-y-auto"
-                          style={{
-                            scrollbarWidth: 'thin',
-                            scrollbarColor: 'rgba(34, 197, 94, 0.5) rgba(20, 83, 45, 0.3)'
-                          }}
-                        >
-                        {filteredNames.map((name, index) => {
-                          const isExactMatch = activeSale.clientName && 
-                            name.toLowerCase() === activeSale.clientName.toLowerCase();
-                          const isPartialMatch = activeSale.clientName && 
-                            name.toLowerCase().includes(activeSale.clientName.toLowerCase());
-                          
-                          return (
-                            <motion.button
-                              key={`${name}-${index}`}
-                              whileHover={{ scale: 1.02, x: 2 }}
-                              whileTap={{ scale: 0.98 }}
-                              onClick={(e) => {
-                                e.preventDefault();
-                                e.stopPropagation();
-                                const newSales = [...sales];
-                                newSales[activeSaleIndex].clientName = name;
-                                setSales(newSales);
-                                setShowClientSuggestions(false);
-                                if (clientNameInputRef.current) {
-                                  clientNameInputRef.current.blur();
-                                }
-                              }}
-                              onMouseDown={(e) => {
-                                e.preventDefault();
-                              }}
-                              className={`w-full text-left px-4 py-3 text-sm font-medium transition-all border-b border-green-700/40 last:border-b-0 ${
-                                isExactMatch 
-                                  ? 'bg-green-600/50 text-green-50 shadow-inner' 
-                                  : isPartialMatch
-                                  ? 'bg-green-700/40 text-green-50 hover:bg-green-600/50 hover:shadow-md'
-                                  : 'text-green-100 hover:bg-green-700/50 hover:shadow-md'
-                              }`}
-                            >
-                              <div className="flex items-center gap-3">
-                                <div className={`w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0 shadow-md ${
-                                  isExactMatch 
-                                    ? 'bg-green-500/50' 
-                                    : 'bg-green-500/30'
-                                }`}>
-                                  <User className={`w-5 h-5 ${
-                                    isExactMatch ? 'text-green-50' : 'text-green-200'
-                                  }`} />
-                                </div>
-                                <span className="flex-1 truncate font-semibold">{name}</span>
-                                {isExactMatch && (
-                                  <div className="flex-shrink-0 w-2.5 h-2.5 rounded-full bg-green-300 shadow-lg animate-pulse"></div>
-                                )}
-                              </div>
-                            </motion.button>
-                          );
-                        })}
+                      <div className="absolute z-[300] w-full mt-1 rounded-lg border shadow-xl bg-orange-900/95 border-orange-500/50 p-3">
+                        <div className="text-orange-200 text-xs text-center">
+                          ⏳ Chargement des clients...
                         </div>
-                      </motion.div>
+                      </div>
                     );
-                  })()}
-                </AnimatePresence>
+                  }
+
+                  // Si chargé mais vide (aucun client ou erreur), éviter l'impression de "recherche infinie"
+                  if (activeSale.isDebt && debtClientsLoaded && debtClients.length === 0) {
+                    return (
+                      <div className="absolute z-[300] w-full mt-1 rounded-lg border shadow-xl bg-orange-900/95 border-orange-500/50 p-3">
+                        <div className="text-orange-200 text-xs text-center">
+                          Aucun client disponible (vérifiez Compte Utilisateur)
+                        </div>
+                      </div>
+                    );
+                  }
+                  
+                  if (filtered.length === 0) {
+                    if (activeSale.isDebt && searchTerm) {
+                      return (
+                        <div className="absolute z-[300] w-full mt-1 rounded-lg border shadow-xl bg-orange-900/95 border-orange-500/50 p-3">
+                          <div className="text-orange-200 text-xs text-center">
+                            Aucun client trouvé pour "{searchTerm}"
+                          </div>
+                        </div>
+                      );
+                    }
+                    return null;
+                  }
+                  
+                  return (
+                    <div 
+                      className={`absolute z-[300] w-full mt-1 rounded-lg border shadow-xl max-h-56 overflow-y-auto ${
+                        activeSale.isDebt 
+                          ? 'bg-orange-900/95 border-orange-500/50' 
+                          : 'bg-green-900/95 border-green-500/50'
+                      }`}
+                    >
+                      {activeSale.isDebt && (
+                        <div className="px-3 py-1.5 text-[10px] uppercase tracking-wider text-orange-300/70 border-b border-orange-500/30 bg-orange-800/30">
+                          👤 Clients depuis Compte Utilisateur ({debtClients.length})
+                        </div>
+                      )}
+                      {filtered.map((item, idx) => (
+                        <button
+                          key={item.id || idx}
+                          type="button"
+                          onMouseDown={(e) => {
+                            e.preventDefault();
+                            const newSales = [...sales];
+                            newSales[activeSaleIndex].clientName = item.name;
+                            if (item.phone) newSales[activeSaleIndex].clientPhone = item.phone;
+                            if (item.id) newSales[activeSaleIndex].clientId = item.id;
+                            setSales(newSales);
+                            setShowClientSuggestions(false);
+                          }}
+                          className={`w-full text-left px-3 py-2 text-sm hover:bg-white/20 flex items-center gap-2 transition-colors ${
+                            activeSale.isDebt ? 'text-orange-100' : 'text-green-100'
+                          }`}
+                        >
+                          <User className="w-4 h-4 opacity-70" />
+                          <span className="flex-1 font-medium truncate">{item.name}</span>
+                          {item.phone && <span className="text-xs opacity-50">{item.phone}</span>}
+                          {item.role && activeSale.isDebt && (
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-orange-600/30 text-orange-200">
+                              {item.role}
+                            </span>
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  );
+                })()}
               </div>
-            </motion.div>
+            </div>
 
             {/* DEVISE - Horizontal, prend toute la largeur */}
             <div className="card flex-shrink-0 p-3">
@@ -1041,7 +1132,7 @@ const SalesPOS = () => {
                     Mode de paiement :
                   </label>
                   <div className="flex gap-2">
-                    <motion.button
+                    <m.button
                       whileHover={{ scale: 1.05, y: -1 }}
                       whileTap={{ scale: 0.98 }}
                       transition={{ duration: 0.08, ease: [0.25, 0.1, 0.25, 1] }}
@@ -1063,8 +1154,8 @@ const SalesPOS = () => {
                       }`}
                     >
                       💵 Payant
-                    </motion.button>
-                    <motion.button
+                    </m.button>
+                    <m.button
                       whileHover={{ scale: 1.05, y: -1 }}
                       whileTap={{ scale: 0.98 }}
                       transition={{ duration: 0.08, ease: [0.25, 0.1, 0.25, 1] }}
@@ -1077,7 +1168,14 @@ const SalesPOS = () => {
                       onClick={() => {
                         const newSales = [...sales];
                         newSales[activeSaleIndex].isDebt = true;
+                        // ✅ MODE DETTE: Forcer la devise USD automatiquement
+                        newSales[activeSaleIndex].currency = 'USD';
+                        newSales[activeSaleIndex].paidAmountUsd = 0;
                         setSales(newSales);
+                        // ✅ Focus sur le champ client
+                        setTimeout(() => {
+                          clientNameInputRef.current?.focus();
+                        }, 100);
                       }}
                       className={`flex-1 px-3 py-2 rounded-lg text-xs sm:text-sm font-semibold transition-all relative z-10 whitespace-nowrap ${
                         activeSale.isDebt
@@ -1086,7 +1184,7 @@ const SalesPOS = () => {
                       }`}
                     >
                       📋 Dette
-                    </motion.button>
+                    </m.button>
                   </div>
                 </div>
                 <div className="flex-shrink-0 min-w-0">
@@ -1094,7 +1192,7 @@ const SalesPOS = () => {
                     Devise :
                   </label>
                   <div className="flex gap-2">
-                    <motion.button
+                    <m.button
                       whileHover={{ scale: 1.1, y: -1 }}
                       whileTap={{ scale: 0.95 }}
                       transition={{ duration: 0.08, ease: [0.25, 0.1, 0.25, 1] }}
@@ -1105,6 +1203,8 @@ const SalesPOS = () => {
                         transform: 'translateZ(0)'
                       }}
                       onClick={() => {
+                        // ✅ Ne pas permettre FC si mode dette actif
+                        if (activeSale.isDebt) return;
                         const newSales = [...sales];
                         newSales[activeSaleIndex].currency = 'FC';
                         setSales(newSales);
@@ -1112,12 +1212,15 @@ const SalesPOS = () => {
                       className={`px-3 py-2 rounded-lg text-xs sm:text-sm font-semibold transition-all relative z-10 whitespace-nowrap ${
                         activeSale.currency === 'FC'
                           ? 'bg-blue-500/30 border-2 border-blue-500/50 text-blue-300 shadow-lg'
-                          : 'glass border-2 border-white/10 text-gray-300 hover:bg-white/10'
+                          : activeSale.isDebt 
+                            ? 'glass border-2 border-white/5 text-gray-500 cursor-not-allowed opacity-50'
+                            : 'glass border-2 border-white/10 text-gray-300 hover:bg-white/10'
                       }`}
+                      disabled={activeSale.isDebt}
                     >
                       FC
-                    </motion.button>
-                    <motion.button
+                    </m.button>
+                    <m.button
                       whileHover={{ scale: 1.1, y: -1 }}
                       whileTap={{ scale: 0.95 }}
                       transition={{ duration: 0.08, ease: [0.25, 0.1, 0.25, 1] }}
@@ -1139,15 +1242,62 @@ const SalesPOS = () => {
                       }`}
                     >
                       USD
-                    </motion.button>
+                    </m.button>
                   </div>
                 </div>
               </div>
+              
+              {/* ✅ MODE DETTE: Champ de paiement partiel */}
+              {activeSale.isDebt && (
+                <m.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                  exit={{ opacity: 0, height: 0 }}
+                  className="mt-3 p-3 rounded-lg bg-orange-500/10 border border-orange-500/30"
+                >
+                  <div className="flex flex-col sm:flex-row gap-3 items-start sm:items-center">
+                    <div className="flex-1">
+                      <label className="block text-xs font-semibold text-orange-300 mb-1">
+                        💵 Montant payé maintenant (USD) :
+                      </label>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          value={activeSale.paidAmountUsd || ''}
+                          onChange={(e) => {
+                            const newSales = [...sales];
+                            newSales[activeSaleIndex].paidAmountUsd = e.target.value;
+                            setSales(newSales);
+                          }}
+                          placeholder="0.00"
+                          className="flex-1 px-3 py-2 rounded-lg bg-white/5 border border-orange-500/30 text-white text-sm focus:outline-none focus:ring-2 focus:ring-orange-500/50 focus:border-orange-500"
+                        />
+                        <span className="text-orange-300 font-semibold">USD</span>
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <div className="text-xs text-gray-400">Reste à payer :</div>
+                      <div className="text-lg font-bold text-orange-300">
+                        {Math.max(0, (activeSaleTotals?.usd || 0) - (parseFloat(activeSale.paidAmountUsd) || 0)).toFixed(2)} USD
+                      </div>
+                    </div>
+                  </div>
+                  <div className="mt-2 text-xs text-gray-400">
+                    ⚠️ <strong>Mode dette :</strong> Seul le montant payé sera comptabilisé dans les statistiques du jour. 
+                    {(parseFloat(activeSale.paidAmountUsd) || 0) > 0 
+                      ? <span className="text-green-400"> +{parseFloat(activeSale.paidAmountUsd).toFixed(2)} USD encaissé aujourd'hui</span>
+                      : <span className="text-orange-400"> Aucun montant encaissé (0 USD)</span>
+                    }
+                  </div>
+                </m.div>
+              )}
             </div>
 
             {/* PANIER - Horizontal, prend toute la largeur, flex-1 pour prendre l'espace restant */}
             <div className="card flex flex-col flex-1 min-h-0 overflow-hidden">
-              <motion.button
+              <m.button
                 whileHover={{ scale: 1.02, y: -1 }}
                 whileTap={{ scale: 0.99 }}
                 transition={{ duration: 0.08, ease: [0.25, 0.1, 0.25, 1] }}
@@ -1190,12 +1340,12 @@ const SalesPOS = () => {
                     </div>
                   )}
                 </div>
-              </motion.button>
+              </m.button>
 
               {/* Contenu du panier (collapsible) */}
               <AnimatePresence>
                 {isCartExpanded && (
-                  <motion.div
+                  <m.div
                     initial={{ height: 0, opacity: 0 }}
                     animate={{ height: 'auto', opacity: 1 }}
                     exit={{ height: 0, opacity: 0 }}
@@ -1247,13 +1397,13 @@ const SalesPOS = () => {
                         </>
                       )}
                     </div>
-                  </motion.div>
+                  </m.div>
                 )}
               </AnimatePresence>
 
               {/* Bouton Finaliser */}
               {activeSale && activeSale.items && activeSale.items.length > 0 && (
-                <motion.div
+                <m.div
                   initial={{ opacity: 0, y: 10 }}
                   animate={{ opacity: 1, y: 0 }}
                   className="mt-3 pt-3 border-t border-primary-500/30 flex-shrink-0"
@@ -1272,7 +1422,7 @@ const SalesPOS = () => {
                           : `≈ $${(Number(activeSaleTotals.usd) || 0).toFixed(2)} USD`}
                       </p>
                     </div>
-                    <motion.button
+                    <m.button
                       whileHover={{ scale: 1.05, y: -2 }}
                       whileTap={{ scale: 0.95 }}
                       onClick={() => finalizeSale(activeSaleIndex)}
@@ -1282,9 +1432,9 @@ const SalesPOS = () => {
                       <Printer className="w-4 h-4 sm:w-5 sm:h-5" />
                       <span className="hidden sm:inline">Finaliser et imprimer</span>
                       <span className="sm:hidden">Finaliser</span>
-                    </motion.button>
+                    </m.button>
                   </div>
-                </motion.div>
+                </m.div>
               )}
             </div>
           </div>
@@ -1298,7 +1448,7 @@ const SalesPOS = () => {
               height: '100%'
             }}>
               {/* Recherche - En haut */}
-              <motion.div 
+              <m.div 
                 className="mb-3 pb-3 border-b border-white/10 flex-shrink-0 relative z-50"
                 animate={{
                   scale: focusedField === 'search' ? 1 : focusedField ? 0.95 : 1,
@@ -1331,7 +1481,7 @@ const SalesPOS = () => {
                   {/* ✅ Afficher seulement si searchQuery non vide (pas debouncedSearch) pour éviter overlay qui bloque */}
                   <AnimatePresence>
                     {searchQuery.trim().length > 0 && debouncedSearch.trim() && groupedFilteredProducts.length > 0 && (
-                      <motion.div
+                      <m.div
                         initial={{ opacity: 0, y: -5, scale: 0.98 }}
                         animate={{ opacity: 1, y: 0, scale: 1 }}
                         exit={{ opacity: 0, y: -5, scale: 0.98 }}
@@ -1351,7 +1501,7 @@ const SalesPOS = () => {
                               if (!group.product) return null;
                               
                               return (
-                                <motion.div 
+                                <m.div 
                                   key={`${group.code}_${group.baseName}`} 
                                   className="w-full mb-2"
                                   initial={{ opacity: 0, y: 10 }}
@@ -1383,7 +1533,7 @@ const SalesPOS = () => {
                                         : `PU: ${displayPrice.toLocaleString()} ${priceSymbol}`;
                                       
                                       return (
-                                        <motion.button
+                                        <m.button
                                           key={`${group.code}-${unit.unit_level}-${unit.unit_mark || ''}-${unitIdx}`}
                                           initial={{ opacity: 0, y: 5, scale: 0.95 }}
                                           animate={{ opacity: 1, y: 0, scale: 1 }}
@@ -1428,7 +1578,7 @@ const SalesPOS = () => {
                                           }}
                                         >
                                           {/* Effet de brillance au survol */}
-                                          <motion.div
+                                          <m.div
                                             className="absolute inset-0 opacity-0 group-hover:opacity-10"
                                             style={{
                                               background: `linear-gradient(135deg, ${shadowColor} 0%, transparent 100%)`
@@ -1437,39 +1587,39 @@ const SalesPOS = () => {
                                           />
                                           
                                           {/* Badge avec nom du produit en haut - Taille améliorée et plus claire */}
-                                          <motion.div 
+                                          <m.div 
                                             className={`absolute top-0 left-0 right-0 px-2 py-1 ${bgGradient} border-b ${borderColor} text-xs font-bold ${textColor} truncate`}
                                             initial={{ opacity: 0 }}
                                             animate={{ opacity: 1 }}
                                             transition={{ delay: unitIdx * 0.05 + 0.1 }}
                                           >
                                             <span className="drop-shadow-sm">{group.baseName}</span>
-                                          </motion.div>
+                                          </m.div>
                                           
                                           {/* Contenu principal avec padding-top pour le badge */}
                                           <div className="pt-4 flex items-start gap-1.5">
                                             {/* Icône avec couleur et animation */}
-                                            <motion.div 
+                                            <m.div 
                                               className={`p-1.5 rounded-md ${bgGradient} border ${borderColor} flex-shrink-0 mt-0.5 group-hover:scale-110 transition-transform duration-200`}
                                               whileHover={{ rotate: [0, -5, 5, 0] }}
                                               transition={{ duration: 0.3 }}
                                             >
                                               <UnitIcon className={`w-3.5 h-3.5 ${iconColor}`} />
-                                            </motion.div>
+                                            </m.div>
                                             
                                             {/* Contenu principal */}
                                             <div className="flex-1 min-w-0">
-                                              <motion.div 
+                                              <m.div 
                                                 className={`text-[10px] font-bold ${textColor} mb-0.5 truncate`}
                                                 initial={{ opacity: 0, x: -5 }}
                                                 animate={{ opacity: 1, x: 0 }}
                                                 transition={{ delay: unitIdx * 0.05 + 0.15 }}
                                               >
                                                 {fullLabel}
-                                              </motion.div>
+                                              </m.div>
                                               
                                               {/* Format : "— Stock: X • PU: Y FC" */}
-                                              <motion.div 
+                                              <m.div 
                                                 className="text-[9px] text-gray-300 leading-tight"
                                                 initial={{ opacity: 0 }}
                                                 animate={{ opacity: 1 }}
@@ -1478,25 +1628,25 @@ const SalesPOS = () => {
                                                 <span className="text-gray-400">—</span> Stock: <span className="font-semibold text-gray-200">{unit.stock_current.toLocaleString()}</span>
                                                 <span className="text-gray-500 mx-0.5">•</span>
                                                 <span className={`font-semibold ${textColor}`}>{priceLabel}</span>
-                                              </motion.div>
+                                              </m.div>
                                             </div>
                                           </div>
-                                        </motion.button>
+                                        </m.button>
                                       );
                                     })}
                                   </div>
-                                </motion.div>
+                                </m.div>
                               );
                             })}
                           </div>
                         </div>
-                      </motion.div>
+                      </m.div>
                     )}
                     
                     {/* Message "Aucun résultat" */}
                     {/* ✅ Afficher seulement si searchQuery non vide pour éviter overlay qui bloque */}
                     {searchQuery.trim().length > 0 && debouncedSearch.trim() && groupedFilteredProducts.length === 0 && (
-                      <motion.div
+                      <m.div
                         initial={{ opacity: 0, y: -5, pointerEvents: 'none' }}
                         animate={{ opacity: 1, y: 0, pointerEvents: 'auto' }}
                         exit={{ opacity: 0, y: -5, pointerEvents: 'none' }}
@@ -1510,11 +1660,11 @@ const SalesPOS = () => {
                           <Search className="w-6 h-6 mx-auto mb-2 opacity-50" />
                           <p>Aucun produit trouvé</p>
                         </div>
-                      </motion.div>
+                      </m.div>
                     )}
                   </AnimatePresence>
                 </div>
-              </motion.div>
+              </m.div>
 
               {/* Sélection du Produit - Juste en dessous de Recherche */}
               <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
@@ -1797,7 +1947,7 @@ const SalesPOS = () => {
                       </div>
                     )}
                     {/* Bouton d'ajout */}
-                    <motion.button
+                    <m.button
                       whileHover={{ scale: 1.08, y: -2 }}
                       whileTap={{ scale: 0.95 }}
                       transition={{ duration: 0.08, ease: [0.25, 0.1, 0.25, 1] }}
@@ -1885,7 +2035,7 @@ const SalesPOS = () => {
                           Ajouter au panier
                         </>
                       ))}
-                    </motion.button>
+                    </m.button>
                   </>
                 );
                   })()}
@@ -2116,7 +2266,7 @@ const CartItem = ({ item, itemIndex, currency, onRemove, onUpdateQty, onUpdatePr
   };
 
   return (
-    <motion.div
+    <m.div
       initial={{ opacity: 0, y: 5 }}
       animate={{ 
         opacity: isHovered ? 1 : 0.5,
@@ -2145,7 +2295,7 @@ const CartItem = ({ item, itemIndex, currency, onRemove, onUpdateQty, onUpdatePr
     >
       {/* Produit - Design professionnel compact */}
       <div className="col-span-4 flex items-center gap-1.5 sm:gap-2 min-w-0">
-        <motion.div 
+        <m.div 
           className="flex-shrink-0"
           whileHover={{ scale: 1.1, rotate: 5 }}
           whileTap={{ scale: 0.95 }}
@@ -2161,7 +2311,7 @@ const CartItem = ({ item, itemIndex, currency, onRemove, onUpdateQty, onUpdatePr
           <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-primary-500/20 border border-primary-500/30 flex items-center justify-center group-hover:bg-primary-500/30 transition-colors shadow-sm">
             <UnitIcon unitLevel={item.unit_level} unitMark={item.unit_mark} />
           </div>
-        </motion.div>
+        </m.div>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-1 mb-0.5">
             <p className="font-semibold text-gray-100 text-xs sm:text-sm truncate">
@@ -2173,7 +2323,7 @@ const CartItem = ({ item, itemIndex, currency, onRemove, onUpdateQty, onUpdatePr
               {getUnitLabel(item.unit_level)}
             </span>
             {item.unit_mark && (
-              <motion.span 
+              <m.span 
                 whileHover={{ scale: 1.08, y: -1 }}
                 whileTap={{ scale: 0.95 }}
                 transition={{ duration: 0.08, ease: [0.25, 0.1, 0.25, 1] }}
@@ -2189,7 +2339,7 @@ const CartItem = ({ item, itemIndex, currency, onRemove, onUpdateQty, onUpdatePr
                 <span className="w-1 h-1 bg-primary-400 rounded-full" />
                 <span className="font-bold text-primary-300">MARK:</span>
                 <span className="text-primary-100 font-semibold">{item.unit_mark}</span>
-              </motion.span>
+              </m.span>
             )}
           </div>
         </div>
@@ -2201,7 +2351,7 @@ const CartItem = ({ item, itemIndex, currency, onRemove, onUpdateQty, onUpdatePr
         
         return (
       <div className="col-span-2 flex items-center justify-center gap-2">
-        <motion.button
+        <m.button
           whileHover={{ scale: 1.15, y: -2 }}
           whileTap={{ scale: 0.9 }}
           transition={{ duration: 0.08, ease: [0.25, 0.1, 0.25, 1] }}
@@ -2220,8 +2370,8 @@ const CartItem = ({ item, itemIndex, currency, onRemove, onUpdateQty, onUpdatePr
           title="Diminuer"
         >
           <Minus className="w-4 h-4 text-gray-300" />
-        </motion.button>
-        <motion.input
+        </m.button>
+        <m.input
           whileFocus={{ scale: 1.05, borderColor: 'rgba(59, 130, 246, 0.5)' }}
           transition={{ duration: 0.08, ease: [0.25, 0.1, 0.25, 1] }}
           type="number"
@@ -2281,7 +2431,7 @@ const CartItem = ({ item, itemIndex, currency, onRemove, onUpdateQty, onUpdatePr
             WebkitBackfaceVisibility: 'hidden'
           }}
         />
-        <motion.button
+        <m.button
           whileHover={{ scale: 1.1, y: -1 }}
           whileTap={{ scale: 0.9 }}
           transition={{ duration: 0.08, ease: [0.25, 0.1, 0.25, 1] }}
@@ -2300,7 +2450,7 @@ const CartItem = ({ item, itemIndex, currency, onRemove, onUpdateQty, onUpdatePr
           title="Augmenter"
         >
           <Plus className="w-3 h-3 sm:w-3.5 sm:h-3.5 text-gray-300" />
-        </motion.button>
+        </m.button>
       </div>
         );
       })()}
@@ -2356,7 +2506,7 @@ const CartItem = ({ item, itemIndex, currency, onRemove, onUpdateQty, onUpdatePr
 
       {/* Action - Bouton supprimer amélioré compact */}
       <div className="col-span-1 text-center">
-        <motion.button
+        <m.button
           whileHover={{ scale: 1.15, rotate: 8, y: -1 }}
           whileTap={{ scale: 0.9 }}
           transition={{ duration: 0.08, ease: [0.25, 0.1, 0.25, 1] }}
@@ -2372,9 +2522,9 @@ const CartItem = ({ item, itemIndex, currency, onRemove, onUpdateQty, onUpdatePr
           title="Supprimer"
         >
           <Trash2 className="w-3 h-3 sm:w-3.5 sm:h-3.5 text-gray-400 group-hover:text-red-400 transition-colors" />
-        </motion.button>
+        </m.button>
       </div>
-    </motion.div>
+    </m.div>
   );
 };
 

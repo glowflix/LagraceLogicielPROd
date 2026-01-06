@@ -20,21 +20,43 @@ function canWrite(dir) {
     fs.unlinkSync(test);
     return true;
   } catch (err) {
-    console.warn(`❌ C:\\Glowflixprojet pas accessible:`, err.message);
+    console.warn(`❌ ${dir} pas accessible:`, err.message);
     return false;
   }
 }
 
 export function getDataRoot() {
-  // Si Windows ET C:\Glowflixprojet accessible → on l'utilise
+  // ✅ PRIORITÉ 1: Variable d'environnement LAGRACE_DATA_DIR (définie par Electron main.cjs)
+  if (process.env.LAGRACE_DATA_DIR) {
+    const dataDir = path.resolve(process.env.LAGRACE_DATA_DIR);
+    console.log(`✅ [PATHS-ELECTRON] Utilisation LAGRACE_DATA_DIR: ${dataDir}`);
+    ensureDir(dataDir);
+    return dataDir;
+  }
+  
+  // ✅ PRIORITÉ 2: app.getPath('userData') en mode EXE/production
+  const isPackaged = 
+    process.env.LAGRACE_IS_ELECTRON === '1' ||
+    process.env.NODE_ENV === 'production' ||
+    app.isPackaged;
+    
+  if (isPackaged) {
+    const userData = app.getPath('userData');
+    console.log(`✅ [PATHS-ELECTRON] Mode PRODUCTION: ${userData}`);
+    ensureDir(userData);
+    return userData;
+  }
+  
+  // ✅ PRIORITÉ 3 (DEV): Si Windows ET C:\Glowflixprojet accessible → on l'utilise
   if (process.platform === "win32" && canWrite(DATA_ROOT_WIN)) {
-    console.log(`✓ Données dans: ${DATA_ROOT_WIN}`);
+    console.log(`✅ [PATHS-ELECTRON] Mode DEV: ${DATA_ROOT_WIN}`);
     return DATA_ROOT_WIN;
   }
 
   // Fallback si C:\ bloqué (sécurité)
   const fallback = path.join(app.getPath("localAppData"), "Glowflixprojet");
-  console.log(`⚠️  Fallback vers: ${fallback}`);
+  console.log(`⚠️  [PATHS-ELECTRON] Fallback vers: ${fallback}`);
+  ensureDir(fallback);
   return fallback;
 }
 

@@ -1,0 +1,205 @@
+est ausis le logiiiel ne pas floude au transition lors au ouvertuer ne pas onne et aussi le deplace ment de l autre a la lutre page ne pas bone ameliore st reduire le retnt de lenteur rednre fluide st rapide avec vitusalisation promax  ouverture de page rend re top est pro est optimise  est aussi on separee le logiciel mais il reste le meme le mode sycrno en arrier plan ne doive pas rendre le logiciel lenteur est rendre l impesion lenteur est aussi otimis epour de millios de miller de venets par anne pro top eets pro est fait que le syncro soit par section pro oubox syncro.worker .js par lot par pro est top est meilleur est aussi push est pull pro est aussi amelior  que l utilisateur qui sro connecter au reesau local via http ip resau meme wofi eux il ne fait rien a la conneion est gere conte serueveur est pc serveur tp est pro est aussi il doive pas rend re le venets impresion lenteur ou kdofucation syncro echoue mem apret des 2 a 4 meme si y a des pbeaucoudp de mdofication est il doive comrpend la syncro pro meme mproduist ou mem champ mdofiier ti syncro nise le dnier champ mdofier ou meme produits meme de champ difffernet modifir tu sycnronise chaque xchamp selon son etat est ptormnnt remnred top est pro stabke a basse resau est pro Prompt optimisé (Pro) — Performance UI + Sync temps réel + LAN + Robustesse
+
+Nous avons un problème majeur de lenteur et manque de fluidité dans l’application (Electron + React + Express + SQLite + sync).
+La synchronisation temps réel (background) semble bloquer / ralentir le frontend, provoquer des transitions non fluides, une ouverture lente, et parfois une impression plus lente. Je veux une solution ultra robuste, stable et scalable, adaptée à des milliers à millions de ventes par an, en mode local et réseau LAN, sans dégrader l’expérience utilisateur.
+
+1) Objectif principal
+
+Le frontend doit rester 100% fluide (navigation rapide, transitions propres, ouverture immédiate).
+
+La sync doit tourner en arrière-plan (push/pull) sans jamais bloquer l’UI.
+
+L’impression doit rester prioritaire (offline-first) et ne doit jamais être ralentie par la sync.
+
+La sync doit être résiliente : même en cas d’échec réseau (2 à 4 fois ou plus), elle doit se rétablir automatiquement sans planter l’app.
+
+2) Problèmes constatés à corriger
+UI / Frontend
+
+L’application n’est pas fluide à l’ouverture.
+
+Les transitions entre pages (route React) sont lentes et peu stables.
+
+Navigation entre pages : “déplacement” / changement d’écran non performant.
+
+Sync / Backend / Réseau
+
+Sync temps réel (toutes les 10 secondes) ralentit le frontend.
+
+Sync provoque des retards lors des actions critiques : ventes, dettes, impression.
+
+Sync échoue souvent si beaucoup de modifications sont faites, puis l’app devient lente ou instable.
+
+Les clients LAN (via IP http sur le réseau Wi-Fi) se connectent mais “ne font rien” : problème de gestion serveur/clients réseau.
+
+3) Exigences techniques (obligatoires)
+A) Séparation des responsabilités (architecture pro)
+
+Mettre une architecture où :
+
+UI (React) = uniquement rendu, pas de logique sync lourde.
+
+API (Express) = répond vite (timeouts, queries optimisées).
+
+Sync Worker (outbox/sync.worker.js) = process/service séparé ou thread isolé.
+
+Print Worker = prioritaire, isolé, offline-first, jamais bloqué.
+
+⚠️ Le principe : la sync ne doit jamais impacter l’UI ni l’impression.
+
+B) Sync “Pro” par sections + par lots (batch)
+
+La synchronisation doit être refaite en mode push/pull structuré :
+
+1) OUTBOX (Push)
+
+Toute modification locale crée un événement dans une outbox :
+
+entity: sales | debts | products | stock | users | rates
+
+entity_id, champs modifiés, timestamp local, uuid, device_id
+
+Le worker envoie par lots (batch) :
+
+ex : 50 / 100 / 500 events par batch selon charge
+
+Retry automatique avec backoff :
+
+2s → 5s → 10s → 30s → 60s (pas de boucle infinie agressive)
+
+2) INBOX (Pull)
+
+Pull périodique des changements serveur (ou Sheets) :
+
+par section (sales/debts/products...)
+
+par fenêtre de temps (since last_sync_token)
+
+Traitement incrémental, pas full refresh.
+
+3) Déduplication / “Last write wins” par champ
+
+Cas critique à gérer :
+
+Si même produit modifié plusieurs fois (champs différents), il faut synchroniser intelligemment :
+
+ne pas écraser un champ récent par un champ ancien
+
+conserver le champ le plus récent par timestamp (ou version)
+
+Si même entity modifiée N fois, la sync doit fusionner avant envoi :
+
+réduire la charge réseau (coalescing)
+
+garantir cohérence des champs
+
+C) Performance : zéro blocage UI
+
+Le frontend ne doit jamais attendre :
+
+la sync
+
+la génération de logs volumineux
+
+des grosses réponses API
+
+Exigences :
+
+Toutes les opérations lourdes (sync, calcul, import/export, analytics) doivent être async et non bloquantes.
+
+Les endpoints API doivent être optimisés (pagination, index SQLite, réponses partielles).
+
+Les événements Socket.IO doivent être throttled/debounced si trop fréquents.
+
+4) LAN / Multi-PC (mode réseau local)
+
+Je veux un mode LAN pro :
+
+Un PC “serveur” héberge l’API + DB + print engine.
+
+Des PCs clients se connectent via http://IP_SERVEUR:PORT.
+
+La connexion doit fonctionner immédiatement :
+
+handshake clair
+
+gestion des timeouts
+
+reconnexion automatique
+
+logs côté serveur montrant : IP client, user, session, statut sync
+
+Problème actuel : les clients LAN se connectent mais l’app “ne fait rien”.
+Il faut diagnostiquer :
+
+CORS / Socket.IO transports
+
+accès DB centralisé
+
+permissions et routes accessibles
+
+latence réseau et payload trop gros
+
+5) Impression : prioritaire et indépendante
+
+L’impression doit fonctionner offline-first.
+
+Le dépôt de jobs dans printer/tmp doit être instantané.
+
+Un watcher/worker doit traiter l’impression sans dépendre de la sync.
+
+Si la sync est en échec, l’impression doit continuer normalement.
+
+6) Objectif scalabilité (milliers / millions de ventes)
+
+Le système doit tenir :
+
+de très gros volumes (annuel)
+
+sans ralentir l’app
+
+avec maintenance simple
+
+Exigences :
+
+DB : indexes + requêtes optimisées + pagination
+
+Logs : rotation + niveaux (ne pas spammer)
+
+Sync : batch + coalescing + retries intelligents
+
+UI : chargement progressif (skeleton), caching, virtualisation listes (si listes longues)
+
+7) Critères d’acceptation (tests)
+
+La solution est validée si :
+
+L’app s’ouvre rapidement et reste fluide (pas de freeze).
+
+Changement de pages rapide (transitions nettes).
+
+Les ventes/dettes s’enregistrent et s’impriment immédiatement.
+
+La sync tourne toutes les 10 secondes (ou adaptative) sans ralentissement UI.
+
+Si réseau coupé, sync échoue sans crash, puis reprend automatiquement.
+
+En LAN, les clients IP se connectent et utilisent l’app normalement.
+
+8) Deliverable attendu
+
+Produire :
+
+une stratégie d’optimisation complète (frontend + backend + sync + print)
+
+refactoring proposé pour outbox, sync.worker.js, push/pull
+
+configuration Socket.IO LAN stable
+
+et recommandations de performance (pagination, indexes, throttling, queue)
+
+Bonus (si possible)
+
+Sync adaptative : si aucune modif → fréquence réduite ; si activité → fréquence augmentée.
+
+Dashboard technique : “sync status”, “queue length”, “last success”, “last error”. 

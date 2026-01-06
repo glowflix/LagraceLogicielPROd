@@ -533,6 +533,233 @@ function applyMigrations() {
       }
     }
     
+    // ✅ MIGRATION: Créer la table stock_modifications pour New Arrivage
+    try {
+      const stockModificationsExists = database.prepare(`
+        SELECT name FROM sqlite_master WHERE type='table' AND name='stock_modifications'
+      `).get();
+      
+      if (!stockModificationsExists) {
+        logger.info('[MIGRATION] Création de la table stock_modifications...');
+        database.exec(`
+          CREATE TABLE IF NOT EXISTS stock_modifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            modification_id TEXT NOT NULL UNIQUE,
+            product_id INTEGER NOT NULL,
+            product_uuid TEXT NOT NULL,
+            product_code TEXT NOT NULL,
+            product_name TEXT,
+            unit_level TEXT NOT NULL,
+            unit_mark TEXT DEFAULT '',
+            stock_before REAL NOT NULL DEFAULT 0,
+            stock_after REAL NOT NULL DEFAULT 0,
+            delta REAL NOT NULL DEFAULT 0,
+            sale_price_fc REAL NOT NULL DEFAULT 0,
+            sale_price_usd REAL NOT NULL DEFAULT 0,
+            purchase_price_usd REAL NOT NULL DEFAULT 0,
+            modification_type TEXT NOT NULL DEFAULT 'manual',
+            reason TEXT,
+            modified_by INTEGER,
+            device_id TEXT,
+            modified_at TEXT NOT NULL DEFAULT (datetime('now')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            synced_at TEXT
+          );
+          
+          CREATE INDEX IF NOT EXISTS idx_stock_modifications_date ON stock_modifications(modified_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_stock_modifications_product ON stock_modifications(product_code, unit_level);
+          CREATE INDEX IF NOT EXISTS idx_stock_modifications_type ON stock_modifications(modification_type);
+          CREATE INDEX IF NOT EXISTS idx_stock_modifications_product_id ON stock_modifications(product_id);
+        `);
+        logger.info('[MIGRATION] ✅ Table stock_modifications créée');
+      }
+    } catch (error) {
+      if (!error.message.includes('already exists')) {
+        logger.warn('[MIGRATION] Erreur création stock_modifications:', error.message);
+      }
+    }
+    
+    // ==================================================================================
+    // ✅ MIGRATION: Module Dettes/Clients amélioré (USD comme référence, paiements)
+    // ==================================================================================
+    
+    // 1. Créer la table clients
+    try {
+      const clientsExists = database.prepare(`
+        SELECT name FROM sqlite_master WHERE type='table' AND name='clients'
+      `).get();
+      
+      if (!clientsExists) {
+        logger.info('[MIGRATION] Création de la table clients...');
+        database.exec(`
+          CREATE TABLE clients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uuid TEXT UNIQUE NOT NULL,
+            client_code TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            phone TEXT,
+            email TEXT,
+            address TEXT,
+            note TEXT,
+            is_active INTEGER DEFAULT 1,
+            device_id TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            synced_at TEXT
+          );
+          
+          CREATE INDEX IF NOT EXISTS idx_clients_uuid ON clients(uuid);
+          CREATE INDEX IF NOT EXISTS idx_clients_code ON clients(client_code);
+          CREATE INDEX IF NOT EXISTS idx_clients_name ON clients(name);
+          CREATE INDEX IF NOT EXISTS idx_clients_phone ON clients(phone);
+        `);
+        logger.info('[MIGRATION] ✅ Table clients créée');
+      }
+    } catch (error) {
+      if (!error.message.includes('already exists')) {
+        logger.warn('[MIGRATION] Erreur création clients:', error.message);
+      }
+    }
+    
+    // 2. Créer la table debt_items (items de dette détaillés)
+    try {
+      const debtItemsExists = database.prepare(`
+        SELECT name FROM sqlite_master WHERE type='table' AND name='debt_items'
+      `).get();
+      
+      if (!debtItemsExists) {
+        logger.info('[MIGRATION] Création de la table debt_items...');
+        database.exec(`
+          CREATE TABLE debt_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uuid TEXT UNIQUE NOT NULL,
+            debt_id INTEGER NOT NULL,
+            product_id INTEGER,
+            product_uuid TEXT,
+            product_code TEXT NOT NULL,
+            product_name TEXT NOT NULL,
+            unit_level INTEGER DEFAULT 1,
+            unit_name TEXT DEFAULT 'Pièce',
+            quantity REAL NOT NULL DEFAULT 1,
+            unit_price_usd REAL NOT NULL,
+            total_usd REAL NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (debt_id) REFERENCES debts(id) ON DELETE CASCADE
+          );
+          
+          CREATE INDEX IF NOT EXISTS idx_debt_items_debt ON debt_items(debt_id);
+          CREATE INDEX IF NOT EXISTS idx_debt_items_product ON debt_items(product_uuid);
+        `);
+        logger.info('[MIGRATION] ✅ Table debt_items créée');
+      }
+    } catch (error) {
+      if (!error.message.includes('already exists')) {
+        logger.warn('[MIGRATION] Erreur création debt_items:', error.message);
+      }
+    }
+    
+    // 3. Nouvelles colonnes pour la table debts
+    ensureColumn('debts', 'client_uuid', 'TEXT');
+    ensureColumn('debts', 'client_code', 'TEXT');
+    ensureColumn('debts', 'paid_usd', 'REAL DEFAULT 0');
+    ensureColumn('debts', 'remaining_usd', 'REAL');
+    ensureColumn('debts', 'items_json', 'TEXT');
+    ensureColumn('debts', 'origin_sale_uuid', 'TEXT');
+    ensureColumn('debts', 'initial_payment_usd', 'REAL DEFAULT 0');
+    ensureColumn('debts', 'initial_payment_fc', 'REAL DEFAULT 0');
+    ensureColumn('debts', 'rate_fc_per_usd', 'REAL');
+    ensureColumn('debts', 'status', "TEXT DEFAULT 'active'");
+    ensureColumn('debts', 'paid_at', 'TEXT');
+    ensureColumn('debts', 'device_id', 'TEXT');
+    
+    // 4. Nouvelles colonnes pour la table debt_payments
+    try {
+      const debtPaymentsExists = database.prepare(`
+        SELECT name FROM sqlite_master WHERE type='table' AND name='debt_payments'
+      `).get();
+      
+      if (debtPaymentsExists) {
+        ensureColumn('debt_payments', 'uuid', 'TEXT');
+        ensureColumn('debt_payments', 'amount_usd', 'REAL');
+        ensureColumn('debt_payments', 'rate_fc_per_usd', 'REAL');
+        ensureColumn('debt_payments', 'note', 'TEXT');
+        ensureColumn('debt_payments', 'device_id', 'TEXT');
+        ensureColumn('debt_payments', 'synced_at', 'TEXT');
+        
+        // Générer UUIDs pour debt_payments existants
+        if (columnExists('debt_payments', 'uuid')) {
+          try {
+            const paymentsWithoutUuid = database.prepare("SELECT id FROM debt_payments WHERE uuid IS NULL OR uuid = ''").all();
+            if (paymentsWithoutUuid.length > 0) {
+              logger.info(`[MIGRATION] Génération de ${paymentsWithoutUuid.length} UUID(s) pour debt_payments...`);
+              const updateStmt = database.prepare('UPDATE debt_payments SET uuid = ? WHERE id = ?');
+              for (const payment of paymentsWithoutUuid) {
+                updateStmt.run(generateUUID(), payment.id);
+              }
+              logger.info(`[MIGRATION] ✅ UUIDs générés pour debt_payments`);
+            }
+          } catch (e) {
+            logger.warn('[MIGRATION] Erreur génération UUIDs debt_payments:', e.message);
+          }
+        }
+        
+        // Index sur debt_payments
+        try {
+          database.exec('CREATE INDEX IF NOT EXISTS idx_debt_payments_uuid ON debt_payments(uuid) WHERE uuid IS NOT NULL');
+          database.exec('CREATE INDEX IF NOT EXISTS idx_debt_payments_date ON debt_payments(payment_date)');
+        } catch (e) {
+          // Ignore si existe
+        }
+      }
+    } catch (error) {
+      logger.warn('[MIGRATION] Erreur colonnes debt_payments:', error.message);
+    }
+    
+    // 5. Backfill remaining_usd pour dettes existantes
+    try {
+      if (columnExists('debts', 'remaining_usd') && columnExists('debts', 'total_usd')) {
+        database.exec(`
+          UPDATE debts 
+          SET remaining_usd = COALESCE(total_usd, 0) - COALESCE(paid_usd, 0)
+          WHERE remaining_usd IS NULL
+        `);
+        logger.info('[MIGRATION] ✅ Backfill remaining_usd effectué');
+      }
+    } catch (error) {
+      logger.warn('[MIGRATION] Erreur backfill remaining_usd:', error.message);
+    }
+    
+    // 6. Génération UUIDs pour dettes existantes (si pas encore fait)
+    try {
+      if (columnExists('debts', 'uuid')) {
+        const debtsWithoutUuid = database.prepare("SELECT id FROM debts WHERE uuid IS NULL OR uuid = '' OR LENGTH(TRIM(uuid)) = 0").all();
+        if (debtsWithoutUuid.length > 0) {
+          logger.info(`[MIGRATION] Génération de ${debtsWithoutUuid.length} UUID(s) pour les dettes existantes...`);
+          const updateStmt = database.prepare('UPDATE debts SET uuid = ? WHERE id = ?');
+          for (const debt of debtsWithoutUuid) {
+            updateStmt.run(generateUUID(), debt.id);
+          }
+          logger.info(`[MIGRATION] ✅ UUIDs générés pour les dettes`);
+        }
+      }
+    } catch (error) {
+      logger.warn('[MIGRATION] Erreur génération UUIDs dettes:', error.message);
+    }
+    
+    // 7. Index supplémentaires pour debts
+    try {
+      database.exec('CREATE INDEX IF NOT EXISTS idx_debts_client_uuid ON debts(client_uuid) WHERE client_uuid IS NOT NULL');
+      database.exec('CREATE INDEX IF NOT EXISTS idx_debts_status ON debts(status)');
+      database.exec('CREATE INDEX IF NOT EXISTS idx_debts_origin_sale ON debts(origin_sale_uuid) WHERE origin_sale_uuid IS NOT NULL');
+    } catch (error) {
+      // Ignorer si existe
+    }
+    
+    logger.info('[MIGRATION] ✅ Module Dettes/Clients amélioré appliqué');
+    // ==================================================================================
+    // FIN: Module Dettes/Clients amélioré
+    // ==================================================================================
+    
     logger.info('[MIGRATION] ✅ Toutes les migrations appliquées avec succès');
   } catch (error) {
     logger.error('[MIGRATION] ❌ Erreur lors des migrations:', error);

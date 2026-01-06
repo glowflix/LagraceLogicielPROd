@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { motion } from 'framer-motion';
+import { m } from 'framer-motion';
 import { 
   TrendingUp, 
   BarChart3, 
@@ -58,6 +58,7 @@ const AnalyticsPage = () => {
     todaySalesUSD: 0,
     todayInvoices: 0,
     todayCollected: 0,
+    todayCollectedFromSales: 0,
     conversionRate: 0,
     averageCart: 0,
   });
@@ -93,7 +94,7 @@ const AnalyticsPage = () => {
   };
 
   const StatCard = ({ title, value, unit, icon: Icon, color, subtext }) => (
-    <motion.div
+    <m.div
       variants={cardVariants}
       initial="initial"
       animate="animate"
@@ -124,13 +125,13 @@ const AnalyticsPage = () => {
           <p className="text-gray-500 text-xs mt-2">{subtext}</p>
         )}
       </div>
-    </motion.div>
+    </m.div>
   );
 
   if (loading) {
     return (
       <div className="flex items-center justify-center h-96">
-        <motion.div
+        <m.div
           animate={{ rotate: 360 }}
           transition={{ duration: 1, repeat: Infinity, ease: 'linear' }}
           className="w-12 h-12 border-4 border-primary-500 border-t-transparent rounded-full"
@@ -139,15 +140,18 @@ const AnalyticsPage = () => {
     );
   }
 
+  const collectedForTodaySales = Number(summary.todayCollectedFromSales || 0);
+  const pendingForTodaySales = Math.max(0, Number(summary.todaySalesFC || 0) - collectedForTodaySales);
+
   const totalRevenuePieData = [
-    { name: 'Collecté', value: summary.todayCollected },
-    { name: 'En attente', value: summary.todaySalesFC - summary.todayCollected },
+    { name: 'Collecté', value: collectedForTodaySales },
+    { name: 'En attente', value: pendingForTodaySales },
   ];
 
   return (
     <div className="space-y-6">
       {/* Header */}
-      <motion.div
+      <m.div
         initial={{ opacity: 0, y: -10 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.3 }}
@@ -157,24 +161,24 @@ const AnalyticsPage = () => {
           <h1 className="text-3xl font-bold text-gray-100 mb-2">Statistiques</h1>
           <p className="text-gray-400">Données d'aujourd'hui - Analyses en temps réel</p>
         </div>
-        <motion.button
+        <m.button
           whileHover={{ scale: 1.05 }}
           whileTap={{ scale: 0.95 }}
           onClick={loadAnalyticsData}
           className="p-2 hover:bg-gray-700 rounded-lg transition-colors"
         >
           <RefreshCw className="w-5 h-5 text-primary-400" />
-        </motion.button>
-      </motion.div>
+        </m.button>
+      </m.div>
 
       {error && (
-        <motion.div
+        <m.div
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           className="p-4 bg-red-900/20 border border-red-500/50 rounded-lg text-red-400"
         >
           {error}
-        </motion.div>
+        </m.div>
       )}
 
       {/* KPI Cards */}
@@ -216,7 +220,7 @@ const AnalyticsPage = () => {
       {/* Charts Grid */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Ventes Horaires - Grande zone */}
-        <motion.div
+        <m.div
           variants={cardVariants}
           initial="initial"
           animate="animate"
@@ -267,10 +271,10 @@ const AnalyticsPage = () => {
               </div>
             )}
           </div>
-        </motion.div>
+        </m.div>
 
         {/* Collecte vs Total */}
-        <motion.div
+        <m.div
           variants={cardVariants}
           initial="initial"
           animate="animate"
@@ -318,11 +322,11 @@ const AnalyticsPage = () => {
               </div>
             )}
           </div>
-        </motion.div>
+        </m.div>
       </div>
 
       {/* Top Produits */}
-      <motion.div
+      <m.div
         variants={cardVariants}
         initial="initial"
         animate="animate"
@@ -367,11 +371,11 @@ const AnalyticsPage = () => {
             </div>
           )}
         </div>
-      </motion.div>
+      </m.div>
 
       {/* Table produits */}
       {topProducts.length > 0 && (
-        <motion.div
+        <m.div
           variants={cardVariants}
           initial="initial"
           animate="animate"
@@ -390,7 +394,7 @@ const AnalyticsPage = () => {
             </thead>
             <tbody>
               {topProducts.map((product, index) => (
-                <motion.tr
+                <m.tr
                   key={product.code}
                   initial={{ opacity: 0, x: -10 }}
                   animate={{ opacity: 1, x: 0 }}
@@ -405,11 +409,11 @@ const AnalyticsPage = () => {
                   <td className="text-right py-3 px-4 text-blue-400 font-semibold">
                     ${product.totalUSD.toFixed(2)}
                   </td>
-                </motion.tr>
+                </m.tr>
               ))}
             </tbody>
           </table>
-        </motion.div>
+        </m.div>
       )}
     </div>
   );

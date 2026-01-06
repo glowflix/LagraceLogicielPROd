@@ -597,121 +597,145 @@ export async function startBackend({
     console.warn('⚠️  ALERTE: getProjectRoot() pointe vers Program Files - check LAGRACE_DATA_DIR!');
   }
 
-  // ✅ CRITIQUE: Charger le module d'impression IMMÉDIATEMENT, AVANT toute synchronisation
-  // C'est le principe OFFLINE-FIRST : l'impression doit fonctionner même sans Internet
-  logger.info('🖨️  [PRINT] ==========================================');
-  logger.info('🖨️  [PRINT] CHARGEMENT MODULE D\'IMPRESSION (OFFLINE-FIRST)');
-  logger.info('🖨️  [PRINT] ==========================================');
+  // ✅ OPTIMISATION: Le module d'impression sera chargé EN ARRIÈRE-PLAN après le démarrage du serveur
+  // Cela permet au health check de répondre rapidement pour Electron
+  logger.info('🖨️  [PRINT] Module d\'impression: chargement différé (après serveur HTTP)');
   
-  // ✅ Charger le module d'impression dynamiquement (depuis RESOURCES_ROOT/print)
-  try {
-    const resourcesRoot = getResourcesRoot();
-    
-    // ✅ STRATÉGIE 1: Essayer depuis resourcesRoot (EXE mode)
-    let printModuleFile = path.join(resourcesRoot, 'print', 'module.js');
-    
-    // ✅ STRATÉGIE 2: Fallback vers le chemin de développement
-    if (!existsSync(printModuleFile)) {
-      printModuleFile = path.join(getProjectRoot(), 'print', 'module.js');
-      logger.info(`[PRINT] Module non trouvé en prod, essai mode dev: ${printModuleFile}`);
-    }
-
-    if (!existsSync(printModuleFile)) {
-      throw new Error(`print/module.js introuvable: ${printModuleFile}`);
-    }
-
-    // 🖨️  LOG TRÈS VISIBLE DANS LE TERMINAL
-    console.log('\n' + '='.repeat(70));
-    console.log('🖨️  [PRINT] CHARGEMENT DU MODULE D\'IMPRESSION');
-    console.log('='.repeat(70));
-    console.log(`📁 Fichier: ${printModuleFile}`);
-    console.log(`📁 PrintDir sera: ${getPrintDir()}`);
-    console.log('='.repeat(70) + '\n');
-    
-    logger.info(`[PRINT] Chargement du module: ${printModuleFile}`);
-
-    const mod = await import(pathToFileURL(printModuleFile).href);
-    // ✅ Tolérer export default si la structure change
-    const createPrinterModule =
-      mod.createPrinterModule || mod.default?.createPrinterModule || mod.default;
-
-    if (!createPrinterModule) {
-      throw new Error('createPrinterModule() introuvable dans print/module.js');
-    }
-
-    const printDir = getPrintDir(); // ✅ writable (userData)
-
-    // ✅ templates/assets: idéalement depuis resources/print/*
-    // Fallback vers dev si pas trouvé en prod
-    let templatesDir = path.join(resourcesRoot, 'print', 'templates');
-    let assetsDir = path.join(resourcesRoot, 'print', 'assets');
-    
-    if (!existsSync(templatesDir)) {
-      templatesDir = path.join(getProjectRoot(), 'print', 'templates');
-      logger.info(`[PRINT] Templates non trouvés en prod, fallback dev: ${templatesDir}`);
-    }
-    if (!existsSync(assetsDir)) {
-      assetsDir = path.join(getProjectRoot(), 'print', 'assets');
-      logger.info(`[PRINT] Assets non trouvés en prod, fallback dev: ${assetsDir}`);
-    }
-
-    // ✅ Vérifier l'existence des dossiers templates/assets
-    if (!existsSync(templatesDir)) logger.warn(`[PRINT] templatesDir manquant: ${templatesDir}`);
-    if (!existsSync(assetsDir)) logger.warn(`[PRINT] assetsDir manquant: ${assetsDir}`);
-
-    printerModule = createPrinterModule({
-      io,
-      logger,
-      printDir,        // writable
-      templatesDir,    // read-only packagé
-      assetsDir,       // read-only packagé
-    });
-
-    // ✅ IMPORTANT: Démarrer le watcher pour l'impression automatique IMMÉDIATEMENT
-    // CRITIQUE: L'impression doit fonctionner OFFLINE-FIRST, avant toute synchronisation
-    if (printerModule && typeof printerModule.start === 'function') {
-      printerModule.start();
+  // ✅ Fonction pour charger le module d'impression en arrière-plan
+  const loadPrintModuleAsync = async () => {
+    try {
+      const resourcesRoot = getResourcesRoot();
       
-      // 🖨️  LOGS TRÈS VISIBLES DANS LE TERMINAL
-      console.log('\n' + '='.repeat(70));
-      console.log('✅ [PRINT] WATCHER D\'IMPRESSION DÉMARRÉ (OFFLINE-FIRST)');
-      console.log('='.repeat(70));
-      console.log(`📁 Dossier surveillé: ${printDir}`);
-      console.log(`🖨️  L'impression est ACTIVE et INDÉPENDANTE de Google Sheets`);
-      console.log(`📋 Les jobs seront traités dès qu'ils apparaissent dans le dossier`);
-      console.log('='.repeat(70) + '\n');
+      // ✅✅✅ RECHERCHE EXHAUSTIVE DU MODULE PRINT (DEV + EXE) ✅✅✅
+      const candidatePaths = [
+        // Mode EXE - Electron resourcesPath
+        resourcesPath ? path.join(resourcesPath, 'print', 'module.js') : null,
+        // Mode EXE - resources root
+        path.join(resourcesRoot, 'print', 'module.js'),
+        // Mode EXE - app.asar.unpacked
+        resourcesPath ? path.join(resourcesPath, 'app.asar.unpacked', 'print', 'module.js') : null,
+        // Mode EXE - dossier parent de resources
+        resourcesPath ? path.join(path.dirname(resourcesPath), 'print', 'module.js') : null,
+        // Mode DEV - process.cwd()
+        path.join(process.cwd(), 'print', 'module.js'),
+        // Mode DEV - __dirname relatif
+        path.resolve('print', 'module.js'),
+      ].filter(Boolean);
       
-      logger.info('✅ Watcher d\'impression démarré (OFFLINE-FIRST)');
-      logger.info(`📁 Dossier impression: ${printDir}`);
-    } else {
-      console.log('\n' + '!'.repeat(70));
-      console.log('❌ [PRINT] ERREUR CRITIQUE: printerModule.start() NON DISPONIBLE');
-      console.log('!'.repeat(70) + '\n');
-      logger.error('❌ CRITIQUE: printerModule.start() non disponible - impression NON fonctionnelle');
-    }
+      console.log('\n');
+      console.log('╔══════════════════════════════════════════════════════════════════════╗');
+      console.log('║  🖨️  RECHERCHE DU MODULE D\'IMPRESSION                                 ║');
+      console.log('╠══════════════════════════════════════════════════════════════════════╣');
+      console.log(`║  📁 resourcesPath: ${(resourcesPath || '(non défini)').slice(0,48).padEnd(48)} ║`);
+      console.log(`║  📁 resourcesRoot: ${resourcesRoot.slice(0,48).padEnd(48)} ║`);
+      console.log(`║  📁 cwd(): ${process.cwd().slice(0,56).padEnd(56)} ║`);
+      console.log('╠══════════════════════════════════════════════════════════════════════╣');
+      
+      let printModuleFile = null;
+      for (const p of candidatePaths) {
+        const exists = existsSync(p);
+        console.log(`║  ${exists ? '✅' : '❌'} ${p.slice(0,64).padEnd(64)} ║`);
+        if (exists && !printModuleFile) {
+          printModuleFile = p;
+        }
+      }
+      console.log('╚══════════════════════════════════════════════════════════════════════╝');
+      console.log('\n');
 
-    printerModuleReady = true;
-    console.log('✅ [PRINT] Module d\'impression chargé avec succès!\n');
-    logger.info('✅ Printer module chargé avec succès');
-  } catch (error) {
-    printerModuleReady = false;
-    printerModule = null;
-    
-    // 🔴 ERREUR TRÈS VISIBLE DANS LE TERMINAL
-    console.log('\n' + '!'.repeat(70));
-    console.log('❌ [PRINT] ERREUR CHARGEMENT MODULE D\'IMPRESSION');
-    console.log('!'.repeat(70));
-    console.log(`❌ Message: ${error.message}`);
-    console.log(`📁 Chemins essayés:`);
-    console.log(`   - ${path.join(getResourcesRoot(), 'print', 'module.js')}`);
-    console.log(`   - ${path.join(getProjectRoot(), 'print', 'module.js')}`);
-    console.log(`🔧 Solution: Vérifier que print/module.js existe et n'a pas d'erreur`);
-    console.log('!'.repeat(70) + '\n');
-    
-    logger.error('❌ Erreur chargement printer module:', error.message);
-    logger.error('   Stack:', error.stack);
-    logger.warn('⚠️  Impression indisponible (le backend continue sans impression)');
-  }
+      if (!printModuleFile) {
+        throw new Error(`print/module.js introuvable dans tous les chemins candidats`);
+      }
+
+      console.log(`🖨️  [PRINT] Module trouvé: ${printModuleFile}`);
+      console.log(`📁 [PRINT] PrintDir: ${getPrintDir()}`);
+      
+      logger.info(`[PRINT] Chargement du module: ${printModuleFile}`);
+
+      const mod = await import(pathToFileURL(printModuleFile).href);
+      // ✅ Tolérer export default si la structure change
+      const createPrinterModule =
+        mod.createPrinterModule || mod.default?.createPrinterModule || mod.default;
+
+      if (!createPrinterModule) {
+        throw new Error('createPrinterModule() introuvable dans print/module.js');
+      }
+
+      const printDir = getPrintDir(); // ✅ writable (userData)
+
+      // ✅ templates/assets: idéalement depuis resources/print/*
+      // Fallback vers dev si pas trouvé en prod
+      let templatesDir = path.join(resourcesRoot, 'print', 'templates');
+      let assetsDir = path.join(resourcesRoot, 'print', 'assets');
+      
+      if (!existsSync(templatesDir)) {
+        templatesDir = path.join(getProjectRoot(), 'print', 'templates');
+        logger.info(`[PRINT] Templates non trouvés en prod, fallback dev: ${templatesDir}`);
+      }
+      if (!existsSync(assetsDir)) {
+        assetsDir = path.join(getProjectRoot(), 'print', 'assets');
+        logger.info(`[PRINT] Assets non trouvés en prod, fallback dev: ${assetsDir}`);
+      }
+
+      // ✅ Vérifier l'existence des dossiers templates/assets
+      if (!existsSync(templatesDir)) logger.warn(`[PRINT] templatesDir manquant: ${templatesDir}`);
+      if (!existsSync(assetsDir)) logger.warn(`[PRINT] assetsDir manquant: ${assetsDir}`);
+
+      printerModule = createPrinterModule({
+        io,
+        logger,
+        printDir,        // writable
+        templatesDir,    // read-only packagé
+        assetsDir,       // read-only packagé
+      });
+
+      // ✅ IMPORTANT: Démarrer le watcher pour l'impression automatique
+      if (printerModule && typeof printerModule.start === 'function') {
+        printerModule.start();
+        
+        // 🖨️  LOGS TRÈS VISIBLES DANS LE TERMINAL
+        console.log('\n' + '='.repeat(70));
+        console.log('✅ [PRINT] WATCHER D\'IMPRESSION DÉMARRÉ (OFFLINE-FIRST)');
+        console.log('='.repeat(70));
+        console.log(`📁 Dossier surveillé: ${printDir}`);
+        console.log(`🖨️  L'impression est ACTIVE et INDÉPENDANTE de Google Sheets`);
+        console.log(`📋 Les jobs seront traités dès qu'ils apparaissent dans le dossier`);
+        console.log('='.repeat(70) + '\n');
+        
+        logger.info('✅ Watcher d\'impression démarré (OFFLINE-FIRST)');
+        logger.info(`📁 Dossier impression: ${printDir}`);
+      } else {
+        console.log('\n' + '!'.repeat(70));
+        console.log('❌ [PRINT] ERREUR CRITIQUE: printerModule.start() NON DISPONIBLE');
+        console.log('!'.repeat(70) + '\n');
+        logger.error('❌ CRITIQUE: printerModule.start() non disponible - impression NON fonctionnelle');
+      }
+
+      printerModuleReady = true;
+      console.log('✅ [PRINT] Module d\'impression chargé avec succès!\n');
+      logger.info('✅ Printer module chargé avec succès');
+    } catch (error) {
+      printerModuleReady = false;
+      printerModule = null;
+      
+      // 🔴 ERREUR TRÈS VISIBLE DANS LE TERMINAL
+      console.log('\n');
+      console.log('╔══════════════════════════════════════════════════════════════════════╗');
+      console.log('║  ❌ ERREUR CHARGEMENT MODULE D\'IMPRESSION                             ║');
+      console.log('╠══════════════════════════════════════════════════════════════════════╣');
+      console.log(`║  Message: ${error.message.slice(0,58).padEnd(58)} ║`);
+      console.log('╠══════════════════════════════════════════════════════════════════════╣');
+      console.log('║  🔧 SOLUTIONS POSSIBLES:                                              ║');
+      console.log('║     1. Vérifier que print/module.js est inclus dans l\'EXE            ║');
+      console.log('║     2. Vérifier les logs ci-dessus pour les chemins testés           ║');
+      console.log('║     3. Rebuild avec: npm run build                                    ║');
+      console.log('╚══════════════════════════════════════════════════════════════════════╝');
+      console.log('\n');
+      
+      logger.error('❌ Erreur chargement printer module:', error.message);
+      if (error.stack) logger.error('   Stack:', error.stack);
+      logger.warn('⚠️  IMPRESSION INDISPONIBLE - Le backend continue sans impression');
+    }
+  };
 
   // ✅ Définir DIST_DIR avec staticDir
   // En production (EXE), utiliser resources/ui au lieu de dist/ui
@@ -800,7 +824,7 @@ export async function startBackend({
   return new Promise((resolve, reject) => {
     httpServer.once('error', reject);
 
-    httpServer.listen(port, host, () => {
+    httpServer.listen(port, host, async () => {
       const networkInterfaces = os.networkInterfaces();
       const addresses = [];
       
@@ -822,26 +846,29 @@ export async function startBackend({
       logger.info(`✅ API disponible sur http://localhost:${port}/api`);
       logger.info(`🔌 WebSocket disponible pour synchronisation temps réel`);
       
-      // Démarrer le worker de synchronisation en arrière-plan (non-bloquant)
+      // ✅✅✅ PRIORITÉ ABSOLUE: Charger le module d'impression IMMÉDIATEMENT ✅✅✅
+      // Chargement SYNCHRONE pour garantir le démarrage
+      console.log('\n🖨️  [PRINT] Chargement IMMÉDIAT du module d\'impression...\n');
+      
+      try {
+        await loadPrintModuleAsync();
+        console.log('✅ [PRINT] Module d\'impression ACTIF et PRÊT!\n');
+      } catch (err) {
+        console.error('❌ [PRINT] ERREUR CRITIQUE:', err.message);
+        logger.error('❌ Erreur chargement module impression:', err.message);
+      }
+      
+      // ✅ PRIORITÉ 2: Démarrer le worker de synchronisation en arrière-plan
       if (process.env.GOOGLE_SHEETS_WEBAPP_URL) {
-        // Utiliser setImmediate pour démarrer la sync après que le serveur soit prêt
-        setImmediate(() => {
+        // Délai de 500ms pour laisser le reste se stabiliser
+        setTimeout(() => {
           syncWorker.start().catch(err => {
             logger.error('❌ Erreur démarrage worker sync:', err);
           });
           logger.info('🔄 Worker de synchronisation démarré (arrière-plan)');
-        });
+        }, 500);
       } else {
         logger.warn('⚠️  GOOGLE_SHEETS_WEBAPP_URL non configuré, synchronisation désactivée');
-      }
-      
-      // ✅ Le module d'impression est DÉJÀ démarré avant le serveur HTTP (ligne ~665)
-      // Ceci est juste un message de confirmation
-      if (printerModuleReady && printerModule) {
-        logger.info('✅ Module d\'impression confirmé actif et prêt');
-        logger.info(`📁 Dossier impression: ${getPrintDir()}`);
-      } else {
-        logger.error('❌ CRITIQUE: Module d\'impression NON actif - vérifier les logs de chargement ci-dessus');
       }
 
       // Démarrer l'auto-check (vérification automatique du stock toutes les 2 secondes)

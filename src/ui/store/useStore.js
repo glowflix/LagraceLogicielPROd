@@ -5,6 +5,7 @@ import { io } from 'socket.io-client';
 import { getApiUrl, getSocketUrl } from '../utils/apiConfig.js';
 import { generateLocalToken, decodeLocalToken, isValidToken } from '../utils/token';
 import AudioHandler from '../utils/audioHandler.js';
+import { throttle, debounce } from '../utils/socketOptimized.js';
 
 // URL API dynamique (détectée automatiquement ou configurée)
 // En mode proxy Vite, API_URL sera '' (chemins relatifs)
@@ -422,51 +423,59 @@ export const useStore = create(
           get().checkConnection();
         });
 
-        socket.on('sale:created', (sale) => {
+        // Throttlers pour éviter trop de re-renders
+        const throttledUpdateSales = throttle((sale) => {
           set((state) => ({
-            sales: [sale, ...state.sales],
+            sales: [sale, ...state.sales].slice(0, 100), // Limiter à 100 dernières
           }));
-        });
+        }, 300);
 
-        socket.on('stock:updated', (stock) => {
+        const throttledUpdateStock = throttle((stock) => {
           set((state) => ({
             stock: state.stock.map((s) =>
               s.id === stock.id ? stock : s
             ),
           }));
-        });
+        }, 500);
 
-        socket.on('product:updated', (product) => {
+        const throttledUpdateProduct = throttle((product) => {
           set((state) => ({
             products: state.products.map((p) =>
               p.id === product.id ? product : p
             ),
           }));
-          // Recharger les produits pour avoir les données complètes
+        }, 500);
+
+        const debouncedReloadProducts = debounce(() => {
           get().loadProducts();
+        }, 1000);
+
+        const throttledUpdateRate = throttle((rate) => {
+          set({ currentRate: rate.rate });
+        }, 2000);
+
+        socket.on('sale:created', throttledUpdateSales);
+
+        socket.on('stock:updated', throttledUpdateStock);
+
+        socket.on('product:updated', (product) => {
+          throttledUpdateProduct(product);
+          // Recharger les produits en arrière-plan avec debounce
+          debouncedReloadProducts();
         });
 
         // ✅ Écouter les mises à jour batch de produits depuis Google Sheets
         socket.on('products:updated', (data) => {
-          // Recharger les produits pour avoir les données à jour
-          // (Plus simple qu'essayer de mettre à jour les produits partiellement)
-          get().loadProducts();
+          // Recharger les produits avec debounce pour éviter trop de requêtes
+          debouncedReloadProducts();
         });
 
-        socket.on('sale:updated', (sale) => {
-          set((state) => ({
-            sales: state.sales.map((s) =>
-              s.invoice_number === sale.invoice_number ? sale : s
-            ),
-          }));
-        });
+        socket.on('sale:updated', throttledUpdateSales);
 
-        socket.on('rate:updated', (rate) => {
-          set({ currentRate: rate.rate });
-        });
+        socket.on('rate:updated', throttledUpdateRate);
 
         socket.on('debt:updated', (debt) => {
-          // Recharger les dettes si nécessaire
+          // Dettes: pas de throttle (critique)
           console.log('Dette mise à jour:', debt);
         });
 

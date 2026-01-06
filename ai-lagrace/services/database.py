@@ -34,13 +34,28 @@ class DatabaseService:
     
     def start(self) -> bool:
         """Démarrer le service de base de données"""
+        import os
+        
+        # En mode EXE, chercher dans AppData (LAGRACE_DATA_DIR)
+        app_data_dir = os.environ.get('LAGRACE_DATA_DIR', '')
+        
         # Chercher la base de données
         possible_paths = [
+            # 1. Chemin prioritaire: AppData de l'application Electron
+            Path(app_data_dir) / "data" / "app.db" if app_data_dir else None,
+            Path(app_data_dir) / "app.db" if app_data_dir else None,
+            # 2. Chemin settings (peut être dev ou prod)
             settings.db_path,
+            # 3. Chemins relatifs (mode dev)
+            settings.base_dir.parent / "app.db",
+            settings.base_dir.parent / "data" / "app.db",
             settings.base_dir.parent / "data" / "lagrace.db",
-            settings.base_dir.parent / "lagrace.db",
+            # 4. Chemin utilisateur
             Path.home() / ".lagrace" / "data" / "lagrace.db"
         ]
+        
+        # Filtrer les chemins None
+        possible_paths = [p for p in possible_paths if p is not None]
         
         for path in possible_paths:
             if path.exists():

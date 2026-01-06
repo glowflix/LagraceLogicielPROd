@@ -1,5 +1,9 @@
 import { getDb } from '../sqlite.js';
 import { logger } from '../../core/logger.js';
+import { SheetsClient } from '../../services/sync/sheets.client.js';
+
+// Instance unique du client Sheets
+const sheetsClient = new SheetsClient();
 
 /**
  * Repository pour la gestion de la synchronisation
@@ -324,6 +328,74 @@ export class SyncRepository {
     } catch (error) {
       logger.error('Erreur isUnitPending:', error);
       return false;
+    }
+  }
+
+  // ========================================
+  // MÉTHODES PUSH/PULL POUR AUTO-SYNC
+  // ========================================
+
+  /**
+   * Pousse un batch d'opérations vers Google Sheets
+   * Utilisé par autoSync.service.js
+   * @param {Array} ops - Opérations à pousser
+   * @returns {Promise<Object>} Résultat du push
+   */
+  async pushOutboxBatch(ops) {
+    if (!ops || ops.length === 0) {
+      return { success: true, applied: [], conflicts: [] };
+    }
+
+    try {
+      // Transformer les opérations au format attendu par SheetsClient
+      const formattedOps = ops.map(op => ({
+        op_id: op.op_id || op.id,
+        entity: op.entity || op.op_type?.toLowerCase().replace('_patch', '').replace('_delta', '') || 'products',
+        entity_id: op.entity_code || op.entity_uuid,
+        op: op.op_type || 'PATCH',
+        payload: typeof op.payload_json === 'string' ? JSON.parse(op.payload_json) : (op.payload || op.payload_json || {})
+      }));
+
+      const result = await sheetsClient.pushBatch(formattedOps);
+      
+      if (result.success) {
+        logger.debug(`✅ [syncRepo] pushOutboxBatch OK: ${result.applied?.length || 0} applied, ${result.conflicts?.length || 0} conflicts`);
+      } else {
+        logger.warn(`⚠️ [syncRepo] pushOutboxBatch partial: ${result.error}`);
+      }
+
+      return result;
+    } catch (error) {
+      logger.error('❌ [syncRepo] pushOutboxBatch error:', error?.message || error);
+      throw error;
+    }
+  }
+
+  /**
+   * Récupère les produits modifiés depuis une date
+   * Utilisé par autoSync.service.js
+   * @param {string} sinceIso - Date ISO depuis laquelle récupérer
+   * @param {number} limit - Nombre max de produits à récupérer
+   * @returns {Promise<Array>} Liste des produits modifiés
+   */
+  async pullProductsSince(sinceIso, limit = 500) {
+    try {
+      const result = await sheetsClient.pull('products', sinceIso, {
+        limit,
+        full: false
+      });
+
+      if (result.success) {
+        const products = result.data || [];
+        logger.debug(`✅ [syncRepo] pullProductsSince OK: ${products.length} produits depuis ${sinceIso}`);
+        return products;
+      } else {
+        logger.warn(`⚠️ [syncRepo] pullProductsSince failed: ${result.error}`);
+        return [];
+      }
+    } catch (error) {
+      logger.error('❌ [syncRepo] pullProductsSince error:', error?.message || error);
+      throw error;
     }
   }
 }

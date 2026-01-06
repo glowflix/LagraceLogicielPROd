@@ -163,61 +163,98 @@ export class DebtsRepository {
    * Crée ou met à jour une dette
    * IMPORTANT: Prend toujours la PLUS RÉCENTE si plusieurs doublons existent
    * SYNC: Crée automatiquement une opération sync_operations pour push vers Sheets
+   * ✅ ANTI-DOUBLON: Détecte les doublons par invoice_number ET UUID
    */
   upsert(debtData) {
     const db = getDb();
     try {
-      // Vérifier si la dette existe (par invoice_number ou uuid)
+      // Vérifier si la dette existe (par invoice_number OU uuid)
       let existing = null;
-      if (debtData.invoice_number) {
+      
+      // ✅ 1. Chercher d'abord par UUID si fourni (priorité)
+      if (debtData.uuid && debtData.uuid.trim()) {
+        existing = db.prepare('SELECT * FROM debts WHERE uuid = ?').get(debtData.uuid);
+        if (existing) {
+          logger.info(`   🔍 [UPSERT] Dette trouvée par UUID: id=${existing.id}, invoice=${existing.invoice_number}`);
+        }
+      }
+      
+      // ✅ 2. Si pas trouvé par UUID, chercher par invoice_number (CRITIQUE pour éviter doublons)
+      if (!existing && debtData.invoice_number && debtData.invoice_number.trim()) {
         // Prendre la plus récente (order by updated_at DESC, id DESC)
-        existing = db.prepare(`
+        const candidates = db.prepare(`
           SELECT * FROM debts
           WHERE invoice_number = ?
           ORDER BY updated_at DESC, id DESC
-          LIMIT 1
-        `).get(debtData.invoice_number);
-      } else if (debtData.uuid) {
-        existing = db.prepare('SELECT * FROM debts WHERE uuid = ?').get(debtData.uuid);
+        `).all(debtData.invoice_number);
+        
+        if (candidates.length > 0) {
+          existing = candidates[0];
+          logger.info(`   🔍 [UPSERT] Dette trouvée par invoice_number: id=${existing.id}, uuid=${existing.uuid || 'N/A'}`);
+          
+          // ⚠️ ALERTE: Si plusieurs dettes avec le même invoice_number, supprimer les doublons
+          if (candidates.length > 1) {
+            logger.warn(`   ⚠️ [UPSERT] ${candidates.length} dettes trouvées avec invoice_number="${debtData.invoice_number}" - Suppression des doublons...`);
+            // Supprimer les doublons (garder seulement la plus récente)
+            for (let i = 1; i < candidates.length; i++) {
+              db.prepare('DELETE FROM debts WHERE id = ?').run(candidates[i].id);
+              logger.info(`      🗑️  Doublon supprimé: id=${candidates[i].id}`);
+            }
+          }
+        }
       }
       
-      // Gérer les UUID null : générer un UUID stable basé sur les données
+      // ✅ 3. Gérer les UUID null : générer un UUID stable basé sur les données
       let debtUuid = existing?.uuid || debtData.uuid;
-      if (!debtUuid) {
+      if (!debtUuid || debtUuid.trim() === '') {
         debtUuid = this.generateStableDebtUuid(debtData);
         logger.info(`   🔑 [UUID] UUID stable généré pour dette ${debtData.invoice_number || 'N/A'}: ${debtUuid.substring(0, 8)}...`);
       }
       
+      // ✅ 4. Vérifier aussi si cet UUID existe déjà (même si pas trouvé par invoice)
+      if (!existing && debtUuid && debtUuid.trim()) {
+        const existingByUuid = db.prepare('SELECT * FROM debts WHERE uuid = ?').get(debtUuid);
+        if (existingByUuid) {
+          existing = existingByUuid;
+          logger.info(`   🔄 [UUID] Dette existante trouvée par UUID généré: id=${existing.id}`);
+        }
+      }
+      
       if (existing) {
-        // Mettre à jour
+        // Mettre à jour (préserver les valeurs existantes si nouvelles valeurs vides/null)
         logger.info(`💾 [SQL] UPDATE debts WHERE id=${existing.id}, invoice=${debtData.invoice_number || 'N/A'}`);
         logger.info(`   📋 Données: client="${debtData.client_name || existing.client_name}", total=${debtData.total_fc !== undefined ? debtData.total_fc : existing.total_fc} FC, reste=${debtData.remaining_fc !== undefined ? debtData.remaining_fc : existing.remaining_fc} FC`);
+        
+        // ✅ Préserver product_description si nouvelle valeur est vide/null
+        const finalProductDesc = (debtData.product_description && debtData.product_description.trim()) 
+          ? debtData.product_description 
+          : (existing.product_description || null);
         
         const updateResult = db.prepare(`
           UPDATE debts SET
             uuid = COALESCE(?, uuid),
-            client_name = ?,
-            product_description = ?,
-            total_fc = ?,
-            paid_fc = ?,
-            remaining_fc = ?,
-            total_usd = ?,
-            debt_fc_in_usd = ?,
-            note = ?,
-            status = ?,
+            client_name = COALESCE(NULLIF(?, ''), client_name),
+            product_description = COALESCE(?, product_description),
+            total_fc = COALESCE(?, total_fc),
+            paid_fc = COALESCE(?, paid_fc),
+            remaining_fc = COALESCE(?, remaining_fc),
+            total_usd = COALESCE(?, total_usd),
+            debt_fc_in_usd = COALESCE(?, debt_fc_in_usd),
+            note = COALESCE(?, note),
+            status = COALESCE(?, status),
             created_at = COALESCE(?, created_at),
             updated_at = datetime('now')
           WHERE id = ?
         `).run(
           debtUuid,
           debtData.client_name || existing.client_name || '',
-          debtData.product_description || existing.product_description || null,
-          debtData.total_fc !== undefined ? debtData.total_fc : existing.total_fc,
-          debtData.paid_fc !== undefined ? debtData.paid_fc : existing.paid_fc,
-          debtData.remaining_fc !== undefined ? debtData.remaining_fc : existing.remaining_fc,
-          debtData.total_usd !== undefined ? debtData.total_usd : existing.total_usd || 0,
-          debtData.debt_fc_in_usd || existing.debt_fc_in_usd || null,
-          debtData.note || existing.note || null,
+          finalProductDesc,
+          debtData.total_fc !== undefined ? debtData.total_fc : null,
+          debtData.paid_fc !== undefined ? debtData.paid_fc : null,
+          debtData.remaining_fc !== undefined ? debtData.remaining_fc : null,
+          debtData.total_usd !== undefined ? debtData.total_usd : null,
+          debtData.debt_fc_in_usd || null,
+          debtData.note || null,
           debtData.status || existing.status || 'open',
           debtData.created_at || existing.created_at,
           existing.id
@@ -225,7 +262,7 @@ export class DebtsRepository {
         
         logger.info(`   ✅ [SQL] UPDATE réussie: ${updateResult.changes} ligne(s) modifiée(s)`);
         const updated = this.findById(existing.id);
-        logger.info(`   📊 [SQL] Dette mise à jour: id=${updated.id}, invoice=${updated.invoice_number}, status=${updated.status}`);
+        logger.info(`   📊 [SQL] Dette mise à jour: id=${updated.id}, invoice=${updated.invoice_number}, status=${updated.status}, product_desc="${updated.product_description || 'N/A'}"`);
         
         // 📤 Créer opération DEBT pour le PUSH vers Sheets
         this.createSyncOperation(updated, 'upsert');
@@ -359,6 +396,58 @@ export class DebtsRepository {
     });
 
     return transaction();
+  }
+
+  /**
+   * Nettoie les doublons dans la table debts
+   * Garde la dette la plus récente pour chaque invoice_number
+   * @returns {number} Nombre de doublons supprimés
+   */
+  cleanupDuplicates() {
+    const db = getDb();
+    try {
+      logger.info('🧹 [CLEANUP] Début nettoyage des doublons de dettes...');
+      
+      // Trouver tous les invoice_number qui ont plusieurs dettes
+      const duplicates = db.prepare(`
+        SELECT invoice_number, COUNT(*) as count
+        FROM debts
+        WHERE invoice_number IS NOT NULL AND invoice_number != ''
+        GROUP BY invoice_number
+        HAVING COUNT(*) > 1
+      `).all();
+      
+      logger.info(`   🔍 [CLEANUP] ${duplicates.length} facture(s) avec doublons trouvée(s)`);
+      
+      let totalDeleted = 0;
+      
+      for (const dup of duplicates) {
+        // Récupérer toutes les dettes pour cette facture
+        const debts = db.prepare(`
+          SELECT * FROM debts
+          WHERE invoice_number = ?
+          ORDER BY updated_at DESC, id DESC
+        `).all(dup.invoice_number);
+        
+        // Garder la première (la plus récente), supprimer les autres
+        const toKeep = debts[0];
+        const toDelete = debts.slice(1);
+        
+        logger.info(`   📋 [CLEANUP] Facture "${dup.invoice_number}": ${debts.length} dette(s), garde id=${toKeep.id}, supprime ${toDelete.length}`);
+        
+        for (const debt of toDelete) {
+          db.prepare('DELETE FROM debts WHERE id = ?').run(debt.id);
+          totalDeleted++;
+          logger.info(`      🗑️  Doublon supprimé: id=${debt.id}, uuid=${debt.uuid || 'N/A'}`);
+        }
+      }
+      
+      logger.info(`✅ [CLEANUP] Nettoyage terminé: ${totalDeleted} doublon(s) supprimé(s)`);
+      return totalDeleted;
+    } catch (error) {
+      logger.error('❌ [CLEANUP] Erreur nettoyage doublons:', error);
+      throw error;
+    }
   }
 }
 

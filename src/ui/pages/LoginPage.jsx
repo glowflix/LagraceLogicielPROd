@@ -1,8 +1,9 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { motion } from 'framer-motion';
-import { LogIn, User, Lock, AlertCircle, WifiOff } from 'lucide-react';
+import { m } from 'framer-motion';
+import { LogIn, User, Lock, AlertCircle, WifiOff, Ban } from 'lucide-react';
 import { useStore } from '../store/useStore';
+import { getUserRole, getDefaultRouteForRole, isUserActive } from '../utils/permissions';
 
 const LoginPage = () => {
   const navigate = useNavigate();
@@ -10,39 +11,70 @@ const LoginPage = () => {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
+  const [isBlocked, setIsBlocked] = useState(false);
   const [loading, setLoading] = useState(false);
 
   const handleLogin = async (e) => {
     e.preventDefault();
     setError('');
+    setIsBlocked(false);
     setLoading(true);
 
     const result = await login(username, password);
 
     if (result.success) {
-      navigate('/dashboard');
+      // Récupérer l'utilisateur connecté depuis le store
+      const user = useStore.getState().user;
+      
+      // Vérifier si le compte est actif
+      if (user && !isUserActive(user)) {
+        setIsBlocked(true);
+        setError('');
+        setLoading(false);
+        // Déconnecter l'utilisateur bloqué
+        useStore.getState().logout();
+        return;
+      }
+      
+      // Déterminer le rôle et la route de redirection
+      const role = getUserRole(user);
+      const defaultRoute = getDefaultRouteForRole(role);
+      
+      console.log('🔐 [LOGIN] Connexion réussie:', {
+        username: user?.username,
+        role,
+        redirectTo: defaultRoute
+      });
+      
+      navigate(defaultRoute);
     } else {
-      setError(result.error || 'Erreur de connexion');
+      // Vérifier si c'est une erreur de compte bloqué
+      if (result.blocked || result.error?.toLowerCase().includes('bloqué')) {
+        setIsBlocked(true);
+        setError('');
+      } else {
+        setError(result.error || 'Erreur de connexion');
+      }
       setLoading(false);
     }
   };
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-dark-900 via-dark-800 to-dark-900 p-4">
-      <motion.div
+      <m.div
         initial={{ opacity: 0, scale: 0.95 }}
         animate={{ opacity: 1, scale: 1 }}
         transition={{ duration: 0.5 }}
         className="glass-strong rounded-2xl p-8 max-w-md w-full"
       >
         {/* Header */}
-        <motion.div
+        <m.div
           initial={{ y: -20, opacity: 0 }}
           animate={{ y: 0, opacity: 1 }}
           transition={{ delay: 0.2 }}
           className="text-center mb-8"
         >
-          <motion.img
+          <m.img
             src="/asset/image/icon/photo.png"
             alt="Logo LA GRACE"
             className="w-16 h-16 mx-auto mb-4 object-contain"
@@ -54,11 +86,11 @@ const LoginPage = () => {
             Connexion
           </h1>
           <p className="text-gray-400">Accédez à votre espace</p>
-        </motion.div>
+        </m.div>
 
         {/* Status offline */}
         {!isOnline && (
-          <motion.div
+          <m.div
             initial={{ x: -20, opacity: 0 }}
             animate={{ x: 0, opacity: 1 }}
             className="flex items-center gap-2 p-3 bg-yellow-500/20 border border-yellow-500/30 rounded-lg mb-6"
@@ -67,12 +99,36 @@ const LoginPage = () => {
             <span className="text-sm text-yellow-300">
               Mode hors ligne - Connexion locale uniquement
             </span>
-          </motion.div>
+          </m.div>
+        )}
+
+        {/* Message compte bloqué */}
+        {isBlocked && (
+          <m.div
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="mb-6 p-4 bg-red-500/20 border border-red-500/50 rounded-xl text-center"
+          >
+            <Ban className="w-12 h-12 text-red-400 mx-auto mb-3" />
+            <h3 className="text-lg font-bold text-red-300 mb-2">
+              Compte Bloqué
+            </h3>
+            <p className="text-sm text-red-200">
+              Votre compte a été désactivé.
+            </p>
+            <p className="text-sm text-red-200 mt-1">
+              Contactez <span className="font-bold text-red-100">La Grâce</span> pour plus d'informations.
+            </p>
+            <p className="text-xs text-red-300/70 mt-3">
+              Tél: +243 89 231 0803
+            </p>
+          </m.div>
         )}
 
         {/* Formulaire */}
-        <form onSubmit={handleLogin} className="space-y-4">
-          <motion.div
+        {!isBlocked && (
+          <form onSubmit={handleLogin} className="space-y-4">
+          <m.div
             initial={{ y: 20, opacity: 0 }}
             animate={{ y: 0, opacity: 1 }}
             transition={{ delay: 0.3 }}
@@ -95,9 +151,9 @@ const LoginPage = () => {
             <p className="text-xs text-gray-500 mt-1">
               Vous pouvez aussi utiliser votre nom d'utilisateur
             </p>
-          </motion.div>
+          </m.div>
 
-          <motion.div
+          <m.div
             initial={{ y: 20, opacity: 0 }}
             animate={{ y: 0, opacity: 1 }}
             transition={{ delay: 0.4 }}
@@ -116,20 +172,20 @@ const LoginPage = () => {
                 required
               />
             </div>
-          </motion.div>
+          </m.div>
 
           {error && (
-            <motion.div
+            <m.div
               initial={{ opacity: 0, y: -10 }}
               animate={{ opacity: 1, y: 0 }}
               className="flex items-center gap-2 p-3 bg-red-500/20 border border-red-500/30 rounded-lg"
             >
               <AlertCircle className="w-5 h-5 text-red-400" />
               <span className="text-sm text-red-300">{error}</span>
-            </motion.div>
+            </m.div>
           )}
 
-          <motion.button
+          <m.button
             type="submit"
             disabled={loading}
             initial={{ y: 20, opacity: 0 }}
@@ -139,12 +195,12 @@ const LoginPage = () => {
           >
             {loading ? (
               <span className="flex items-center justify-center gap-2">
-                <motion.div
+                <m.div
                   animate={{ rotate: 360 }}
                   transition={{ duration: 1, repeat: Infinity, ease: 'linear' }}
                 >
                   <LogIn className="w-5 h-5" />
-                </motion.div>
+                </m.div>
                 Connexion...
               </span>
             ) : (
@@ -153,11 +209,13 @@ const LoginPage = () => {
                 Se connecter
               </span>
             )}
-          </motion.button>
+          </m.button>
         </form>
+        )}
 
-        {/* Lien vers activation de licence */}
-        <motion.div
+        {/* Lien vers activation de licence - visible seulement si pas bloqué */}
+        {!isBlocked && (
+        <m.div
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           transition={{ delay: 0.6 }}
@@ -169,8 +227,30 @@ const LoginPage = () => {
           >
             Ou activer une licence
           </button>
-        </motion.div>
-      </motion.div>
+        </m.div>
+        )}
+
+        {/* Bouton réessayer si bloqué */}
+        {isBlocked && (
+          <m.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            transition={{ delay: 0.3 }}
+            className="mt-6 text-center"
+          >
+            <button
+              onClick={() => {
+                setIsBlocked(false);
+                setUsername('');
+                setPassword('');
+              }}
+              className="text-sm text-primary-400 hover:text-primary-300 transition-colors"
+            >
+              Essayer avec un autre compte
+            </button>
+          </m.div>
+        )}
+      </m.div>
     </div>
   );
 };

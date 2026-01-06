@@ -44,4 +44,30 @@ contextBridge.exposeInMainWorld('electronAPI', {
   logs: {
     getPaths: () => ipcRenderer.invoke('logs:getPaths'),
   },
+  
+  // ============ MENU NAVIGATION ============
+  menu: {
+    // Écouter les événements de navigation depuis le menu
+    onNavigate: (callback) => {
+      const handler = (event, route) => callback(route);
+      ipcRenderer.on('menu:navigate', handler);
+      return () => ipcRenderer.removeListener('menu:navigate', handler);
+    },
+    // Écouter la demande d'export CSV
+    onExportCSV: (callback) => {
+      const handler = () => callback();
+      ipcRenderer.on('menu:export-csv', handler);
+      return () => ipcRenderer.removeListener('menu:export-csv', handler);
+    },
+  },
+  
+  // ============ RACCOURCIS CLAVIER ============
+  shortcuts: {
+    // Écouter les raccourcis globaux
+    onShortcut: (callback) => {
+      const handler = (event, shortcut) => callback(shortcut);
+      ipcRenderer.on('shortcut:triggered', handler);
+      return () => ipcRenderer.removeListener('shortcut:triggered', handler);
+    },
+  },
 });

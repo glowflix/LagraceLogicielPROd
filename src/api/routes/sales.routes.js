@@ -3,8 +3,10 @@ import fs from 'fs';
 import path from 'path';
 import { salesRepo } from '../../db/repositories/sales.repo.js';
 import { productsRepo } from '../../db/repositories/products.repo.js';
+import { debtsRepo } from '../../db/repositories/debts.repo.new.js';
 import { getDb } from '../../db/sqlite.js';
 import { syncRepo } from '../../db/repositories/sync.repo.js';
+import { outboxRepo } from '../../db/repositories/outbox.repo.js';
 import { auditRepo } from '../../db/repositories/audit.repo.js';
 import { printJobsRepo } from '../../db/repositories/print-jobs.repo.js';
 import { authenticate, optionalAuth } from '../middlewares/auth.js';
@@ -13,13 +15,157 @@ import { generateTimestampInvoiceNumber } from '../../core/invoice.js';
 import { normalizeUnit, normalizeMark, validateQtyBackend } from '../../core/qty-rules.js';
 import { getSocketIO } from '../socket.js';
 import { logger } from '../../core/logger.js';
+import { generateUUID } from '../../core/crypto.js';
 
 const router = express.Router();
+
+/**
+ * GET /api/sales/clients/search
+ * Recherche de clients/utilisateurs pour autocomplétion dans le mode dette
+ * Recherche dans la table users (qui contient les clients de UserPage)
+ * Inclut TOUS les utilisateurs actifs (vendeur = client normal)
+ * Exclut uniquement les superadmin
+ */
+router.get('/clients/search', optionalAuth, (req, res) => {
+  try {
+    const db = getDb();
+    const query = req.query.q || '';
+    const limit = parseInt(req.query.limit) || 20;
+    
+    // Si pas de query, retourner tous les clients actifs
+    const searchTerm = query.trim() ? `%${query.trim()}%` : '%';
+    
+    // ✅ Rechercher dans users - TOUS les utilisateurs actifs
+    // Exclut uniquement les superadmin (username = 'superadmin')
+    // Utilise is_admin, is_vendeur pour déterminer le rôle
+    const users = db.prepare(`
+      SELECT 
+        id, 
+        uuid, 
+        username as name, 
+        phone, 
+        CASE 
+          WHEN is_admin = 1 THEN 'Admin'
+          WHEN is_vendeur = 1 THEN 'Vendeur'
+          ELSE 'Client'
+        END as role,
+        'user' as source
+      FROM users 
+      WHERE (username LIKE ? OR phone LIKE ?) 
+        AND is_active = 1
+        AND username != 'superadmin'
+      ORDER BY username ASC
+      LIMIT ?
+    `).all(searchTerm, searchTerm, limit);
+    
+    logger.info(`🔍 [Clients Search] Query: "${query}", Found: ${users.length} users`);
+    
+    // Rechercher aussi dans clients si la table existe
+    let clients = [];
+    try {
+      clients = db.prepare(`
+        SELECT id, uuid, name, phone, client_code, 'client' as source
+        FROM clients 
+        WHERE (name LIKE ? OR phone LIKE ? OR client_code LIKE ?) AND is_active = 1
+        ORDER BY name ASC
+        LIMIT ?
+      `).all(searchTerm, searchTerm, searchTerm, limit);
+    } catch (e) {
+      // Table clients n'existe peut-être pas encore
+    }
+    
+    // Combiner et dédupliquer
+    const combined = [...users, ...clients];
+    const seen = new Set();
+    const unique = combined.filter(c => {
+      const key = (c.name || '').toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).slice(0, limit);
+    
+    // ✅ Format de réponse compatible avec le frontend
+    res.json({ success: true, results: unique, count: unique.length });
+  } catch (error) {
+    logger.error('❌ GET /api/sales/clients/search:', error);
+    res.status(500).json({ success: false, error: error.message, results: [] });
+  }
+});
+
+/**
+ * POST /api/sales/clients
+ * Crée un nouveau client (utilisateur sans rôle admin/vendeur)
+ */
+router.post('/clients', optionalAuth, (req, res) => {
+  try {
+    const db = getDb();
+    const { name, phone } = req.body;
+    
+    if (!name || !name.trim()) {
+      return res.status(400).json({ success: false, error: 'Nom du client requis' });
+    }
+    
+    const trimmedName = name.trim();
+    
+    // Vérifier si le client existe déjà
+    const existing = db.prepare(`
+      SELECT id, uuid, username as name, phone FROM users 
+      WHERE LOWER(TRIM(username)) = LOWER(?) AND is_active = 1
+    `).get(trimmedName);
+    
+    if (existing) {
+      return res.json({ success: true, client: existing, existed: true });
+    }
+    
+    // Créer le client dans la table users
+    const uuid = generateUUID();
+    const hashedPassword = '$2b$10$placeholder'; // Mot de passe placeholder (client ne se connecte pas)
+    
+    const result = db.prepare(`
+      INSERT INTO users (uuid, username, password_hash, phone, is_active, is_admin, is_vendeur, is_gerant_stock)
+      VALUES (?, ?, ?, ?, 1, 0, 0, 0)
+    `).run(uuid, trimmedName, hashedPassword, phone || null);
+    
+    const newClient = {
+      id: result.lastInsertRowid,
+      uuid: uuid,
+      name: trimmedName,
+      phone: phone || null,
+      source: 'user'
+    };
+    
+    logger.info(`✅ [Clients] Nouveau client créé: ${trimmedName} (ID ${newClient.id})`);
+    
+    // Créer opération sync pour le client
+    try {
+      db.prepare(`
+        INSERT OR IGNORE INTO sync_operations (op_id, op_type, entity_uuid, entity_code, payload_json, status)
+        VALUES (?, 'CLIENT', ?, ?, ?, 'pending')
+      `).run(generateUUID(), uuid, trimmedName, JSON.stringify({
+        uuid, name: trimmedName, phone: phone || null, is_active: 1
+      }));
+    } catch (e) {
+      logger.warn(`⚠️ Erreur sync client: ${e.message}`);
+    }
+    
+    res.json({ success: true, client: newClient, existed: false });
+  } catch (error) {
+    logger.error('❌ POST /api/sales/clients:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 
 /**
  * POST /api/sales
  * Crée une nouvelle vente (OFFLINE-FIRST)
  * Pipeline A : Validation + SQL local + sync_queue + print_job
+ * 
+ * MODE DETTE (isDebt: true):
+ * - Devise automatiquement en USD
+ * - Client obligatoire (doit exister dans users ou être créé)
+ * - Champ paid_amount_usd pour paiement initial
+ * - Crée une entrée dans la table debts (pas dans sales du jour)
+ * - Sync vers feuille "Dettes" (pas "Ventes")
  */
 router.post('/', optionalAuth, (req, res) => {
   try {
@@ -123,6 +269,295 @@ router.post('/', optionalAuth, (req, res) => {
     const invoiceNumber = saleData.invoice_number || generateTimestampInvoiceNumber();
     const dateISO = saleData.sold_at || new Date().toISOString();
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // MODE DETTE: Créer vente normale + dette (stock réduit via trigger)
+    // ═══════════════════════════════════════════════════════════════════════
+    const isDebtMode = saleData.isDebt === true || saleData.autoDette === true || saleData.payment_mode === 'dette';
+    
+    if (isDebtMode) {
+      logger.info(`\n${'═'.repeat(70)}`);
+      logger.info(`💳 [DEBT] MODE DETTE - CRÉATION VENTE + DETTE`);
+      logger.info(`${'═'.repeat(70)}`);
+      
+      // Validation: Le client est OBLIGATOIRE
+      if (!saleData.client_name || saleData.client_name.trim() === '') {
+        return res.status(400).json({
+          success: false,
+          error: 'Le nom du client est obligatoire pour une dette',
+          code: 'DEBT_CLIENT_REQUIRED'
+        });
+      }
+      
+      const rateUsed = saleData.rate_fc_per_usd || 2800;
+      const initialPaymentUsd = parseFloat(saleData.paid_amount_usd) || 0;
+      const initialPaymentFc = initialPaymentUsd * rateUsed;
+      const remainingUsd = Math.max(0, finalTotalUSD - initialPaymentUsd);
+      const remainingFc = remainingUsd * rateUsed;
+      
+      // Construire description produit
+      const productDesc = (saleData.items || []).map(i => `${i.product_name} x${i.qty}`).join(', ');
+      
+      // Déterminer le statut dette
+      let debtStatus = 'open';
+      if (remainingUsd <= 0.01) debtStatus = 'paid';
+      else if (initialPaymentUsd > 0) debtStatus = 'partial';
+      
+      logger.info(`   👤 Client: ${saleData.client_name}`);
+      logger.info(`   📦 Produits: ${productDesc}`);
+      logger.info(`   💰 Total: ${finalTotalUSD} USD (${finalTotalFC} FC)`);
+      logger.info(`   💵 Payé maintenant: ${initialPaymentUsd} USD`);
+      logger.info(`   📊 Reste à payer: ${remainingUsd} USD`);
+      logger.info(`   📋 Statut dette: ${debtStatus}`);
+      
+      try {
+        // ══════════════════════════════════════════════════════════════════
+        // ÉTAPE 1: CRÉER LA VENTE NORMALE (réduit le stock via TRIGGER SQL)
+        // ══════════════════════════════════════════════════════════════════
+        logger.info(`   🛒 [1/5] Création de la vente (stock réduit par trigger)...`);
+        
+        const saleDataForRepo = {
+          ...saleData,
+          invoice_number: invoiceNumber,
+          total_fc: finalTotalFC,
+          total_usd: finalTotalUSD,
+          payment_mode: 'dette',
+          paid_fc: initialPaymentFc,
+          paid_usd: initialPaymentUsd,
+          status: debtStatus === 'paid' ? 'paid' : 'unpaid',
+          origin: 'LOCAL'
+        };
+        
+        const sale = salesRepo.create(saleDataForRepo);
+        logger.info(`   ✅ [1/5] Vente créée: ID=${sale.id}, Invoice=${invoiceNumber}`);
+        logger.info(`   📉 Stock réduit automatiquement par le trigger SQL`);
+        
+        // ══════════════════════════════════════════════════════════════════
+        // ÉTAPE 2: CRÉER LA DETTE DANS SQLite
+        // ══════════════════════════════════════════════════════════════════
+        const requestedDebtUuid = generateUUID();
+        const now = new Date().toISOString();
+
+        const deviceId =
+          saleData.device_id ||
+          req.body.device_id ||
+          req.headers['x-device-id'] ||
+          saleData.source_device ||
+          null;
+
+        const itemsJson = saleData.items && Array.isArray(saleData.items)
+          ? JSON.stringify(saleData.items)
+          : null;
+        
+        // ✅ Insert idempotent (invoice_number est unique) + colonnes USD (migration 002)
+        db.prepare(`
+          INSERT OR IGNORE INTO debts (
+            uuid, sale_id, invoice_number,
+            client_name, client_phone, client_uuid,
+            product_description, items_json,
+            total_fc, paid_fc, remaining_fc,
+            total_usd, paid_usd, remaining_usd,
+            debt_fc_in_usd, status, note, device_id, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          requestedDebtUuid,
+          sale.id,
+          invoiceNumber,
+          saleData.client_name.trim(),
+          saleData.client_phone || null,
+          saleData.client_uuid || null,
+          productDesc,
+          itemsJson,
+          finalTotalFC,
+          initialPaymentFc,
+          remainingFc,
+          finalTotalUSD,
+          initialPaymentUsd,
+          remainingUsd,
+          finalTotalFC,
+          debtStatus,
+          saleData.note || null,
+          deviceId,
+          now
+        );
+
+        const persistedDebt = db.prepare(`
+          SELECT id, uuid FROM debts WHERE invoice_number = ? LIMIT 1
+        `).get(invoiceNumber);
+
+        const debtId = persistedDebt?.id;
+        const debtUuid = persistedDebt?.uuid || requestedDebtUuid;
+        logger.info(`   ✅ [2/5] Dette créée: ID=${debtId}, UUID=${debtUuid.substring(0, 8)}...`);
+        
+        // ══════════════════════════════════════════════════════════════════
+        // ÉTAPE 3: SYNC vers Google Sheets (feuille "Dettes")
+        // ══════════════════════════════════════════════════════════════════
+        const debtSyncData = {
+          uuid: debtUuid,
+          invoice_number: invoiceNumber,
+          client_name: saleData.client_name.trim(),
+          client_phone: saleData.client_phone || null,
+          product_description: productDesc,
+          total_fc: finalTotalFC,
+          paid_fc: initialPaymentFc,
+          remaining_fc: remainingFc,
+          total_usd: finalTotalUSD,
+          paid_usd: initialPaymentUsd,
+          remaining_usd: remainingUsd,
+          status: debtStatus,
+          date: dateISO.split('T')[0],
+          note: saleData.note || null
+        };
+        
+        const syncOpId = outboxRepo.enqueueDebt(debtSyncData);
+        logger.info(`   ✅ [3/5] Sync Sheets queued: op_id=${syncOpId || 'skipped'}`);
+        
+        // ══════════════════════════════════════════════════════════════════
+        // ÉTAPE 4: CRÉER JOB D'IMPRESSION (même format que vente normale)
+        // ══════════════════════════════════════════════════════════════════
+        const printPayload = {
+          template: 'receipt-80',
+          isDebt: true,
+          copies: 1,
+          data: {
+            factureNum: invoiceNumber,
+            numero: invoiceNumber,
+            client: saleData.client_name.trim(),
+            clientPhone: saleData.client_phone || '',
+            taux: rateUsed,
+            dateISO: dateISO,
+            isDebt: true,
+            totalDebt: finalTotalUSD,
+            paidInitial: initialPaymentUsd,
+            remaining: remainingUsd,
+            lignes: (saleData.items || []).map(item => ({
+              code: item.product_code,
+              nom: item.product_name,
+              unite: normalizeUnit(item.unit_level) || 'piece',
+              mark: normalizeMark(item.unit_mark || ''),
+              qty: item.qty,
+              puFC: item.unit_price_fc,
+              totalFC: item.subtotal_fc,
+              puUSD: item.unit_price_usd || 0,
+              totalUSD: item.subtotal_usd || 0,
+            })),
+            totalFC: finalTotalFC,
+            totalUSD: finalTotalUSD,
+            printCurrency: 'USD',
+            entreprise: {
+              nom: "ALIMENTATION LA GRACE",
+              rccm: "CD/KIS/RCCM 22-A-00172",
+              impot: "A220883T",
+              tel: "+243 896 885 373 / +243 819 082 637",
+              adresse: "Avenue Lac Tanganyika, Makiso, Kisangani, R.D.Congo"
+            },
+            meta: {
+              vendeur: req.user?.username || req.body.seller_name || 'System',
+              payment_mode: 'dette',
+              autoDette: true,
+              currency: 'USD',
+              ventesUsd: true,
+              debtStatus: debtStatus,
+              paidNow: initialPaymentUsd,
+              remainingToPay: remainingUsd
+            }
+          }
+        };
+        
+        // Sauvegarder dans print_jobs
+        printJobsRepo.create({
+          invoice_number: invoiceNumber,
+          template: 'receipt-80',
+          payload_json: printPayload,
+        });
+        
+        // ✅ ÉCRIRE FICHIER POUR LE WATCHER D'IMPRESSION
+        let printJobCreated = false;
+        try {
+          const printDir = getPrintDir();
+          const safeInvoiceNumber = invoiceNumber.replace(/[^\w\-]/g, '_');
+          const jobFile = path.join(printDir, `job-DEBT-${safeInvoiceNumber}-${Date.now()}.json`);
+          fs.writeFileSync(jobFile, JSON.stringify(printPayload, null, 2), 'utf-8');
+          printJobCreated = true;
+          logger.info(`   ✅ [4/5] Print job créé: ${path.basename(jobFile)}`);
+        } catch (printError) {
+          logger.error(`   ⚠️ [4/5] Erreur création print job: ${printError.message}`);
+        }
+        
+        // ══════════════════════════════════════════════════════════════════
+        // ÉTAPE 5: WEBSOCKET notification temps réel
+        // ══════════════════════════════════════════════════════════════════
+        const io = getSocketIO();
+        if (io) {
+          io.emit('debt:created', {
+            id: debtId,
+            uuid: debtUuid,
+            invoice_number: invoiceNumber,
+            client_name: saleData.client_name,
+            total_usd: finalTotalUSD,
+            paid_usd: initialPaymentUsd,
+            remaining_usd: remainingUsd,
+            status: debtStatus,
+            timestamp: now
+          });
+          io.emit('stock:updated', { 
+            products: (saleData.items || []).map(i => i.product_code) 
+          });
+        }
+        logger.info(`   ✅ [5/5] WebSocket notifications envoyées`);
+        
+        // ✅ AUDIT LOG
+        if (req.user) {
+          auditRepo.log(req.user.id, 'debt_create', {
+            debt_id: debtId,
+            sale_id: sale.id,
+            invoice_number: invoiceNumber,
+            total_usd: finalTotalUSD,
+            paid_usd: initialPaymentUsd,
+            client: saleData.client_name
+          });
+        }
+        
+        logger.info(`${'═'.repeat(70)}`);
+        logger.info(`💳 [DEBT] TRANSACTION COMPLÈTE - Facture ${invoiceNumber}`);
+        logger.info(`${'═'.repeat(70)}\n`);
+        
+        // ✅ RÉPONSE SUCCÈS (compatible avec le frontend)
+        return res.json({
+          success: true,
+          isDebt: true,
+          sale: {
+            id: sale.id,
+            invoice_number: invoiceNumber,
+            items: sale.items || saleData.items
+          },
+          debt: {
+            id: debtId,
+            uuid: debtUuid,
+            invoice_number: invoiceNumber,
+            client_name: saleData.client_name,
+            total_usd: finalTotalUSD,
+            paid_usd: initialPaymentUsd,
+            remaining_usd: remainingUsd,
+            status: debtStatus
+          },
+          print_status: printJobCreated ? 'queued' : 'failed',
+          sync_status: 'queued',
+          message: `Dette de ${finalTotalUSD} USD créée pour ${saleData.client_name}. Payé: ${initialPaymentUsd} USD, Reste: ${remainingUsd} USD`
+        });
+        
+      } catch (debtError) {
+        logger.error(`❌ [DEBT] Erreur création dette:`, debtError);
+        return res.status(500).json({
+          success: false,
+          error: `Erreur création dette: ${debtError.message}`
+        });
+      }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    // MODE VENTE NORMALE (pas dette)
+    // ═══════════════════════════════════════════════════════════════════════
+
     // 3. Préparer les données de vente
     const finalSaleData = {
       ...saleData,
@@ -132,13 +567,21 @@ router.post('/', optionalAuth, (req, res) => {
       seller_name: req.user?.username || req.body.seller_name || 'System',
       total_fc: finalTotalFC,
       total_usd: finalTotalUSD,
-      paid_fc: saleData.isDebt ? 0 : finalTotalFC,
-      paid_usd: saleData.isDebt ? 0 : finalTotalUSD,
+      paid_fc: finalTotalFC,
+      paid_usd: finalTotalUSD,
       origin: 'LOCAL',
     };
 
     // 4. Créer la vente en SQL local (transaction)
     const sale = salesRepo.create(finalSaleData);
+
+    // 4.1 Enqueue la vente dans l'outbox pour sync vers Sheets
+    try {
+      outboxRepo.enqueueSale(sale, sale.items || saleData.items || []);
+      logger.info(`📤 [SALE] Vente ${sale.invoice_number} enqueued pour sync Sheets`);
+    } catch (outboxErr) {
+      logger.warn(`⚠️ [SALE] Erreur enqueue vente (non-bloquant): ${outboxErr.message}`);
+    }
 
     // 5. Créer les jobs de synchronisation (arrière-plan)
     // 5.1 Sync ventes → feuille "Ventes"
@@ -221,13 +664,14 @@ router.post('/', optionalAuth, (req, res) => {
             continue; // Passer au produit suivant
           }
           
-          const stockAbsolute = unitStock.stock_initial || 0;
-          const stockCurrent = unitStock.stock_current || 0;
-          const stockAbsoluteRounded = Math.round(stockAbsolute * 100) / 100; // Arrondir à 2 décimales
+          // ✅ CORRECTION: Utiliser stock_current (APRÈS la vente) et non stock_initial
+          // Le stock a été réduit par le trigger SQL, stock_current = valeur finale
+          const stockAfterSale = unitStock.stock_current || 0;
+          const stockAbsoluteRounded = Math.round(stockAfterSale * 100) / 100; // Arrondir à 2 décimales
           
           logger.info(`   ✅ Stock trouvé:`);
-          logger.info(`      stock_initial (absolu): ${stockAbsolute} → arrondi: ${stockAbsoluteRounded}`);
-          logger.info(`      stock_current: ${stockCurrent}`);
+          logger.info(`      stock_initial (avant): ${unitStock.stock_initial || 0}`);
+          logger.info(`      stock_current (après vente): ${stockAfterSale} → arrondi: ${stockAbsoluteRounded}`);
           
           // CRITIQUE: Convertir product_code en chaîne pour correspondre à Sheets (gérer nombre vs chaîne)
           const productCodeForSync = String(item.product_code || '').trim();
@@ -329,33 +773,22 @@ router.post('/', optionalAuth, (req, res) => {
     // Écrire aussi le fichier JSON pour le watcher (compatibilité avec print/module.js)
     // CRITIQUE: Écrire dans le dossier ROOT du printer (pas dans tmp/) pour que le watcher le détecte
     try {
-      const printDir = getPrintDir();
+      const printDir = getPrintDir(); // ✅ Crée automatiquement les dossiers si nécessaire
+      
+      // ✅ LOG TRÈS VISIBLE DANS LE TERMINAL
+      console.log('\n' + '='.repeat(70));
+      console.log('🖨️  [SALES] CRÉATION JOB D\'IMPRESSION');
+      console.log('='.repeat(70));
+      console.log(`📁 Dossier UNIFIÉ (DEV+EXE): ${printDir}`);
+      console.log(`📄 Facture: ${sale.invoice_number}`);
+      console.log('='.repeat(70) + '\n');
       
       // LOG: Chemin utilisé pour l'impression
       logger.info('🖨️  [PRINT] ==========================================');
       logger.info('🖨️  [PRINT] DÉBUT CRÉATION JOB D\'IMPRESSION');
       logger.info('🖨️  [PRINT] ==========================================');
-      logger.info(`📁 [PRINT] Dossier printer: ${printDir}`);
+      logger.info(`📁 [PRINT] Dossier printer UNIFIÉ: ${printDir}`);
       logger.info(`📄 [PRINT] Facture: ${sale.invoice_number}`);
-      
-      // CRITIQUE: Créer les dossiers s'ils n'existent pas (indispensable en premier lancement)
-      if (!fs.existsSync(printDir)) {
-        logger.info(`📁 [PRINT] Création du dossier printer: ${printDir}`);
-        fs.mkdirSync(printDir, { recursive: true });
-      }
-      
-      // Créer aussi les sous-dossiers ok/err/tmp pour éviter erreurs du watcher
-      const okDir = path.join(printDir, 'ok');
-      const errDir = path.join(printDir, 'err');
-      const tmpDir = path.join(printDir, 'tmp');
-      const templatesDir = path.join(printDir, 'templates');
-      
-      [okDir, errDir, tmpDir, templatesDir].forEach(dir => {
-        if (!fs.existsSync(dir)) {
-          logger.info(`📁 [PRINT] Création du sous-dossier: ${path.basename(dir)}`);
-          fs.mkdirSync(dir, { recursive: true });
-        }
-      });
       
       // Utiliser le numéro de facture pour un nom de fichier unique et identifiable
       const safeInvoiceNumber = sale.invoice_number.replace(/[^\w\-]/g, '_');
@@ -370,6 +803,16 @@ router.post('/', optionalAuth, (req, res) => {
       // Vérifier que le fichier existe bien après écriture
       if (fs.existsSync(jobFile)) {
         const stats = fs.statSync(jobFile);
+        
+        // ✅ LOG TRÈS VISIBLE DANS LE TERMINAL
+        console.log('\n' + '-'.repeat(50));
+        console.log(`✅ [SALES] JOB CRÉÉ AVEC SUCCÈS!`);
+        console.log(`📄 Fichier: ${path.basename(jobFile)}`);
+        console.log(`📁 Chemin: ${jobFile}`);
+        console.log(`📊 Taille: ${stats.size} bytes`);
+        console.log(`⏳ Le watcher devrait le détecter sous peu...`);
+        console.log('-'.repeat(50) + '\n');
+        
         logger.info(`✅ [PRINT] Job créé avec succès!`);
         logger.info(`   - Nom: ${path.basename(jobFile)}`);
         logger.info(`   - Taille: ${stats.size} bytes`);
@@ -377,6 +820,11 @@ router.post('/', optionalAuth, (req, res) => {
         logger.info(`✅ [PRINT] Le watcher devrait détecter ce fichier dans quelques secondes...`);
         logger.info('🖨️  [PRINT] ==========================================');
       } else {
+        console.log('\n' + '!'.repeat(50));
+        console.log(`❌ [SALES] ERREUR: Fichier non créé!`);
+        console.log(`📁 Chemin attendu: ${jobFile}`);
+        console.log('!'.repeat(50) + '\n');
+        
         logger.error(`❌ [PRINT] ERREUR: Fichier non créé après writeFileSync!`);
         logger.error(`   - Chemin attendu: ${jobFile}`);
         logger.error(`   - Vérifier les permissions du dossier`);
@@ -730,6 +1178,247 @@ router.post('/:invoice/print', optionalAuth, (req, res) => {
       file: path.basename(jobFile),
     });
   } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * DELETE /api/sales/:invoiceNumber
+ * ✅ PRO: Supprime une vente et restaure le stock des produits
+ * - Restaure le stock de chaque produit selon l'unité vendue
+ * - Supprime la vente de SQLite immédiatement
+ * - ✅ Enqueue update_stock pour sync vers Sheets
+ * - ✅ Gestion robuste des unités (CARTON, MILLIER, PIECE, DETAIL)
+ */
+router.delete('/:invoiceNumber', optionalAuth, async (req, res) => {
+  const db = getDb();
+  // Décoder l'URL pour gérer les caractères spéciaux
+  const invoiceNumber = decodeURIComponent(req.params.invoiceNumber || '').trim();
+  
+  logger.info(`\n${'═'.repeat(60)}`);
+  logger.info(`🗑️ [DELETE SALE] Requête suppression reçue`);
+  logger.info(`   📄 Invoice Number: "${invoiceNumber}"`);
+  logger.info(`${'═'.repeat(60)}`);
+  
+  // Validation
+  if (!invoiceNumber) {
+    logger.error(`   ❌ Invoice number manquant ou vide`);
+    return res.status(400).json({ success: false, error: 'Numéro de facture requis' });
+  }
+  
+  try {
+    // 1. Récupérer la vente
+    const sale = db.prepare(`
+      SELECT * FROM sales WHERE invoice_number = ? LIMIT 1
+    `).get(invoiceNumber);
+    
+    if (!sale) {
+      logger.warn(`   ⚠️ Facture non trouvée: "${invoiceNumber}"`);
+      return res.status(404).json({ 
+        success: false, 
+        error: `Facture non trouvée: ${invoiceNumber}`
+      });
+    }
+    
+    logger.info(`   ✅ Vente trouvée: ID=${sale.id}, Client=${sale.client_name}`);
+    
+    // 2. Récupérer les items de cette vente
+    const saleItems = db.prepare(`
+      SELECT si.*, p.id as product_id_lookup, p.uuid as product_uuid
+      FROM sale_items si
+      LEFT JOIN products p ON p.code = si.product_code
+      WHERE si.invoice_number = ?
+    `).all(invoiceNumber);
+    
+    logger.info(`   📦 ${saleItems.length} item(s) à restaurer`);
+    
+    // ✅ PRO: Fonction pour normaliser l'unité
+    const normalizeUnitLevel = (unitLevel) => {
+      if (!unitLevel) return 'CARTON';
+      const ul = String(unitLevel).toUpperCase().trim();
+      
+      // Mapping des variantes vers format standard
+      const unitMap = {
+        'MILLIERS': 'MILLIER',
+        'MILLIER': 'MILLIER',
+        'MIL': 'MILLIER',
+        'CARTON': 'CARTON',
+        'CARTONS': 'CARTON',
+        'CTN': 'CARTON',
+        'PIECE': 'PIECE',
+        'PIECES': 'PIECE',
+        'PCS': 'PIECE',
+        'DETAIL': 'PIECE',
+        'DÉTAIL': 'PIECE',
+        'DZ': 'PIECE', // Douzaine = détail
+        'PQT': 'PIECE', // Paquet = détail
+      };
+      
+      return unitMap[ul] || ul;
+    };
+    
+    // ✅ PRO: Mapping unité → feuille Sheets
+    const getSheetName = (unitLevel) => {
+      const normalized = normalizeUnitLevel(unitLevel);
+      const sheetMap = {
+        'CARTON': 'Carton',
+        'MILLIER': 'Milliers',
+        'PIECE': 'Piece'
+      };
+      return sheetMap[normalized] || 'Carton';
+    };
+    
+    // 3. Restaurer le stock pour chaque item
+    const stockRestored = [];
+    
+    for (const item of saleItems) {
+      try {
+        const qty = parseFloat(item.qty) || 0;
+        if (qty <= 0) continue;
+        
+        // Obtenir le product_id
+        let productId = item.product_id || item.product_id_lookup;
+        if (!productId && item.product_code) {
+          const prod = db.prepare('SELECT id, uuid FROM products WHERE code = ? LIMIT 1').get(item.product_code);
+          if (prod) {
+            productId = prod.id;
+            item.product_uuid = item.product_uuid || prod.uuid;
+          }
+        }
+        
+        if (!productId) {
+          logger.warn(`   ⚠️ Produit non trouvé: ${item.product_code}`);
+          continue;
+        }
+        
+        // ✅ PRO: Normaliser unit_level proprement
+        const unitLevel = normalizeUnitLevel(item.unit_level);
+        const unitMark = item.unit_mark || '';
+        
+        logger.info(`   🔄 Restauration: ${item.product_code} x${qty} (${unitLevel})`);
+        
+        // Restaurer stock_initial et stock_current
+        const updateResult = db.prepare(`
+          UPDATE product_units 
+          SET stock_initial = COALESCE(stock_initial, 0) + ?,
+              stock_current = COALESCE(stock_current, 0) + ?,
+              updated_at = datetime('now')
+          WHERE product_id = ? AND unit_level = ?
+        `).run(qty, qty, productId, unitLevel);
+        
+        if (updateResult.changes > 0) {
+          // Récupérer le nouveau stock après restauration
+          const newStock = db.prepare(`
+            SELECT stock_current FROM product_units
+            WHERE product_id = ? AND unit_level = ?
+          `).get(productId, unitLevel);
+          
+          const stockAfter = Math.round((newStock?.stock_current || qty) * 100) / 100;
+          
+          stockRestored.push({
+            product_code: item.product_code,
+            product_uuid: item.product_uuid,
+            qty: qty,
+            unit_level: unitLevel,
+            unit_mark: unitMark,
+            stock_after: stockAfter
+          });
+          logger.info(`      ✅ Stock restauré: +${qty} → ${stockAfter}`);
+          
+          // ✅ PRO: Ajouter à l'outbox pour sync vers Sheets
+          const sheetName = getSheetName(unitLevel);
+          const stockUpdatePayload = {
+            product_code: String(item.product_code),
+            unit_level: unitLevel,
+            unit_mark: unitMark,
+            stock_absolute: stockAfter, // Valeur ABSOLUE après restauration
+            invoice_number: invoiceNumber,
+            reason: 'sale_deleted' // Pour traçabilité
+          };
+          
+          try {
+            const { syncRepo } = await import('../../db/repositories/sync.repo.js');
+            syncRepo.addToOutbox(
+              'product_units', 
+              `${item.product_code}_${unitLevel}_${unitMark}`, 
+              'update_stock', 
+              stockUpdatePayload
+            );
+            logger.info(`      📤 Sync pending: stock=${stockAfter} → Sheets (${sheetName})`);
+          } catch (syncError) {
+            logger.warn(`      ⚠️ Sync error: ${syncError.message}`);
+          }
+          
+        } else {
+          logger.warn(`      ⚠️ Unité non trouvée: product_id=${productId}, unit_level=${unitLevel}`);
+        }
+      } catch (itemError) {
+        logger.error(`      ❌ Erreur restauration: ${itemError.message}`);
+      }
+    }
+    
+    // 4. Supprimer les items de vente
+    const itemsDeleted = db.prepare(`DELETE FROM sale_items WHERE invoice_number = ?`).run(invoiceNumber);
+    logger.info(`   🗑️ ${itemsDeleted.changes} sale_items supprimés`);
+    
+    // 5. Supprimer la vente
+    const saleDeleted = db.prepare(`DELETE FROM sales WHERE invoice_number = ?`).run(invoiceNumber);
+    logger.info(`   🗑️ Vente supprimée (${saleDeleted.changes})`);
+    
+    // 6. Supprimer la dette associée si elle existe
+    try {
+      const debtDeleted = db.prepare(`DELETE FROM debts WHERE invoice_number = ?`).run(invoiceNumber);
+      if (debtDeleted.changes > 0) {
+        logger.info(`   🗑️ Dette associée supprimée`);
+      }
+    } catch (e) {
+      // Pas de dette associée
+    }
+    
+    // 7. Supprimer les voids associés
+    try {
+      db.prepare(`DELETE FROM sale_voids WHERE invoice_number = ?`).run(invoiceNumber);
+    } catch (e) {
+      // Pas critique
+    }
+    
+    // 8. Notifier via WebSocket
+    try {
+      const io = getSocketIO();
+      if (io) {
+        io.emit('sale:deleted', { 
+          invoice_number: invoiceNumber,
+          stock_restored: stockRestored.length 
+        });
+        io.emit('stock:updated', { 
+          products: stockRestored.map(s => s.product_code),
+          reason: 'sale_deleted'
+        });
+        io.emit('products:updated', {
+          ts: new Date().toISOString(),
+          count: stockRestored.length,
+          source: 'SALE_DELETE'
+        });
+      }
+    } catch (e) {
+      // Pas critique
+    }
+    
+    logger.info(`${'═'.repeat(60)}`);
+    logger.info(`✅ [DELETE SALE] Facture ${invoiceNumber} supprimée`);
+    logger.info(`   Stock restauré: ${stockRestored.length} produit(s)`);
+    logger.info(`   Sync pending: ${stockRestored.length} update_stock`);
+    logger.info(`${'═'.repeat(60)}\n`);
+    
+    res.json({
+      success: true,
+      message: `Facture ${invoiceNumber} supprimée`,
+      stockRestored: stockRestored,
+      syncPending: stockRestored.length
+    });
+    
+  } catch (error) {
+    logger.error(`❌ [DELETE SALE] Erreur:`, error);
     res.status(500).json({ success: false, error: error.message });
   }
 });

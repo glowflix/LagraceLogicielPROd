@@ -13,20 +13,9 @@ export class SalesRepository {
   create(saleData) {
     const db = getDb();
     
-    // LOG: Début de création de vente
-    logger.info('🛒 [sales.repo] ==========================================');
-    logger.info('🛒 [sales.repo] DÉBUT CRÉATION DE VENTE (LOCAL)');
-    logger.info('🛒 [sales.repo] ==========================================');
-    logger.info(`📄 [sales.repo] Invoice Number: ${saleData.invoice_number || '(généré)'}`);
-    logger.info(`👤 [sales.repo] Client: ${saleData.client_name || '(vide)'}`);
-    logger.info(`📦 [sales.repo] Nombre d'items: ${saleData.items?.length || 0}`);
-    logger.info(`🏷️  [sales.repo] Origin: ${saleData.origin || 'LOCAL'}`);
+    // Logs de démarrage supprimés pour optimisation
     
-    // SÉCURITÉ: Vérifier que c'est bien une vente LOCALE (pas depuis Sheets)
-    if (saleData.origin && saleData.origin !== 'LOCAL') {
-      logger.warn(`⚠️ [sales.repo] ATTENTION: Origin = ${saleData.origin}, mais create() est appelé!`);
-      logger.warn(`⚠️ [sales.repo] Les ventes depuis Sheets doivent utiliser upsert(), pas create()`);
-    }
+    // Vérification origin silencieuse
     
     const transaction = db.transaction(() => {
       try {
@@ -62,7 +51,6 @@ export class SalesRepository {
         );
 
         const saleId = saleResult.lastInsertRowid;
-        logger.info(`✅ [sales.repo] Vente créée avec ID: ${saleId}`);
 
         // Créer les items de vente et décrémenter le stock
         if (saleData.items && Array.isArray(saleData.items)) {
@@ -80,16 +68,9 @@ export class SalesRepository {
           // Ne PAS réduire manuellement ici pour éviter la double réduction
           // Le trigger vérifie automatiquement que origin != 'SHEETS'
 
-          logger.info(`📋 [sales.repo] Traitement de ${saleData.items.length} item(s)...`);
-          
           for (let itemIdx = 0; itemIdx < saleData.items.length; itemIdx++) {
             const item = saleData.items[itemIdx];
             const itemUuid = item.uuid || generateUUID();
-            
-            logger.info(`📦 [sales.repo] --- Item ${itemIdx + 1}/${saleData.items.length} ---`);
-            logger.info(`   Code: ${item.product_code}, Nom: ${item.product_name}`);
-            logger.info(`   Unité: ${item.unit_level}, Mark: ${item.unit_mark || '(vide)'}`);
-            logger.info(`   Quantité brute: ${item.qty} (type: ${typeof item.qty})`);
             
             // CRITIQUE: Normaliser la quantité une dernière fois pour s'assurer de la précision
             // Gérer tous les formats: 0.5, 0,5, 0.50, 0,50, 1, 1.0, etc.
@@ -101,11 +82,8 @@ export class SalesRepository {
             qty = Number(qty) || 0;
             qty = Math.round(qty * 100) / 100; // Arrondir à 2 décimales
             
-            logger.info(`   Quantité normalisée: ${qty}`);
-            
             // Vérification de sécurité: la quantité doit être > 0
             if (qty <= 0) {
-              logger.warn(`⚠️ [sales.repo] Quantité invalide pour produit ${item.product_code}: ${item.qty} → ${qty}, ignorée`);
               continue; // Ignorer cet item si quantité invalide
             }
             
@@ -135,14 +113,11 @@ export class SalesRepository {
             `).get(item.product_id, unitLevelForDb);
             
             if (!productUnit) {
-              logger.warn(`⚠️ [sales.repo] Unité introuvable pour produit ${item.product_code} (${unitLevelForDb}), créer l'unité d'abord!`);
               continue;
             }
             
             const productUnitUuid = productUnit.uuid;
-            logger.info(`   UUID de l'unité: ${productUnitUuid}`);
             
-            // Récupérer le stock AVANT réduction pour log
             const stockBefore = db.prepare(`
               SELECT stock_initial, stock_current FROM product_units
               WHERE id = ?
@@ -150,10 +125,6 @@ export class SalesRepository {
             
             const stockBeforeInitial = stockBefore?.stock_initial || 0;
             const stockBeforeCurrent = stockBefore?.stock_current || 0;
-            
-            logger.info(`   Stock AVANT réduction: initial=${stockBeforeInitial}, current=${stockBeforeCurrent}`);
-            logger.info(`   Quantité à réduire: ${qty}`);
-            logger.info(`   Stock attendu APRÈS: initial=${stockBeforeInitial - qty}, current=${stockBeforeCurrent - qty}`);
             
             itemStmt.run(
               itemUuid,
@@ -172,23 +143,16 @@ export class SalesRepository {
               item.subtotal_usd || 0
             );
             
-            logger.info(`   ✅ Item inséré dans sale_items`);
-            
             // CRITIQUE: Le stock est réduit automatiquement par le TRIGGER SQL après l'insertion
-            // Le trigger trg_sale_items_stock_decrease_ai réduit stock_initial ET stock_current
             // Vérifier que la réduction a bien eu lieu (après l'insertion)
             if (qty > 0) {
-              logger.info(`   🔄 Vérification de la réduction automatique du stock par le trigger...`);
-              
               // Récupérer le nouveau stock pour confirmation (par uuid, identifiant stable)
               const updatedUnit = db.prepare(`
                 SELECT stock_initial, stock_current FROM product_units
                 WHERE uuid = ?
               `).get(productUnitUuid);
               
-              if (!updatedUnit) {
-                logger.warn(`⚠️ [sales.repo] Unité non trouvée après insertion pour produit ${item.product_code}, unité ${unitLevelForDb}, mark ${item.unit_mark || ''}`);
-              } else {
+              if (updatedUnit) {
                 const stockAfterInitial = updatedUnit.stock_initial || 0;
                 const stockAfterCurrent = updatedUnit.stock_current || 0;
                 
@@ -198,37 +162,15 @@ export class SalesRepository {
                 const diffInitial = Math.abs(stockAfterInitial - expectedInitial);
                 const diffCurrent = Math.abs(stockAfterCurrent - expectedCurrent);
                 
-                logger.info(`   Stock APRÈS réduction (par trigger): initial=${stockAfterInitial}, current=${stockAfterCurrent}`);
-                
                 if (diffInitial > 0.01 || diffCurrent > 0.01) {
-                  logger.error(`❌ [sales.repo] ERREUR: Stock mal réduit par le trigger pour ${item.product_code} (${unitLevelForDb})!`);
-                  logger.error(`   Quantité vendue: ${qty}`);
-                  logger.error(`   Stock avant: initial=${stockBeforeInitial}, current=${stockBeforeCurrent}`);
-                  logger.error(`   Stock après: initial=${stockAfterInitial}, current=${stockAfterCurrent}`);
-                  logger.error(`   Attendu: initial=${expectedInitial}, current=${expectedCurrent}`);
-                  logger.error(`   Différence: initial=${diffInitial}, current=${diffCurrent}`);
-                  logger.error(`   ⚠️ Vérifier que le trigger trg_sale_items_stock_decrease_ai est actif et fonctionne correctement`);
-                } else {
-                  logger.info(`   ✅ Stock réduit correctement par le trigger: ${stockBeforeInitial} - ${qty} = ${stockAfterInitial}`);
-                  logger.info(`   ✅ Stock réduit correctement par le trigger: ${stockBeforeCurrent} - ${qty} = ${stockAfterCurrent}`);
+                  logger.error(`❌ [sales.repo] Stock mal réduit: ${item.product_code} (${unitLevelForDb})`);
                 }
               }
-            } else {
-              logger.warn(`⚠️ [sales.repo] Quantité invalide (${qty}) pour produit ${item.product_code}, le trigger ne réduira pas le stock`);
             }
-            
-            logger.info(`   ✅ Item ${itemIdx + 1} traité avec succès`);
           }
-          
-          logger.info(`✅ [sales.repo] Tous les items ont été traités`);
         }
 
         const createdSale = this.findById(saleId);
-        logger.info(`✅ [sales.repo] ==========================================`);
-        logger.info(`✅ [sales.repo] VENTE CRÉÉE AVEC SUCCÈS`);
-        logger.info(`✅ [sales.repo] ==========================================`);
-        logger.info(`📄 [sales.repo] Invoice Number: ${createdSale?.invoice_number}`);
-        logger.info(`📦 [sales.repo] Nombre d'items: ${createdSale?.items?.length || 0}`);
         
         return createdSale;
       } catch (error) {
@@ -342,17 +284,6 @@ export class SalesRepository {
   upsert(saleData) {
     const db = getDb();
     
-    // LOG: Début de upsert (synchronisation depuis Sheets)
-    logger.info('📥 [sales.repo] ==========================================');
-    logger.info('📥 [sales.repo] DÉBUT UPSERT DE VENTE (DEPUIS SHEETS)');
-    logger.info('📥 [sales.repo] ==========================================');
-    logger.info(`📄 [sales.repo] Invoice Number: ${saleData.invoice_number || '(vide)'}`);
-    logger.info(`👤 [sales.repo] Client: ${saleData.client_name || '(vide)'}`);
-    logger.info(`📦 [sales.repo] Nombre d'items: ${saleData.items?.length || 0}`);
-    logger.info(`🏷️  [sales.repo] Origin: ${saleData.origin || 'SHEETS'}`);
-    logger.info(`⚠️  [sales.repo] ATTENTION: Cette méthode NE RÉDUIT PAS le stock`);
-    logger.info(`⚠️  [sales.repo] Les ventes depuis Sheets ont déjà été comptabilisées`);
-    
     const transaction = db.transaction(() => {
       try {
         // Vérifier si la vente existe déjà
@@ -464,13 +395,10 @@ export class SalesRepository {
           // Requête pour trouver le product_id si non fourni
           const findProductStmt = db.prepare('SELECT id FROM products WHERE code = ? AND is_active = 1 LIMIT 1');
           
-          logger.info(`📋 [sales.repo] Traitement de ${saleData.items.length} item(s) pour l'upsert...`);
+          // Logs détaillés désactivés pour performance (utiliser logger.debug si besoin)
           
           saleData.items.forEach((item, itemIdx) => {
-            logger.info(`📦 [sales.repo] --- Item ${itemIdx + 1}/${saleData.items.length} ---`);
-            logger.info(`   Code: ${item.product_code}, Nom: ${item.product_name}`);
-            logger.info(`   Unité brute: ${item.unit_level}, Mark: ${item.unit_mark || '(vide)'}`);
-            logger.info(`   Quantité brute: ${item.qty} (type: ${typeof item.qty})`);
+            // Logs détaillés désactivés pour performance
             
             // CRITIQUE: Générer UUID unique si non fourni, s'il existe déjà en DB, OU s'il est déjà utilisé dans cette transaction
             let itemUuid = item.uuid;
@@ -479,12 +407,11 @@ export class SalesRepository {
               do {
                 itemUuid = generateUUID();
               } while (existingUuids.has(itemUuid) || uuidsInThisTransaction.has(itemUuid));
-              logger.info(`   ⚠️ UUID dupliqué ou manquant détecté, nouveau UUID généré: ${itemUuid}`);
+              // UUID dupliqué ou manquant détecté, nouveau UUID généré
             }
             // Ajouter l'UUID au Set de cette transaction pour éviter les doublons dans les items suivants
             uuidsInThisTransaction.add(itemUuid);
             existingUuids.add(itemUuid); // Aussi ajouter au Set global pour éviter conflits futurs
-            logger.info(`   UUID: ${itemUuid}`);
             
             // Normaliser unit_level pour correspondre à la base de données
             let unitLevel = item.unit_level || 'PIECE';
@@ -499,7 +426,7 @@ export class SalesRepository {
               // Utiliser tel quel si déjà en majuscules
               unitLevel = (unitLevel || 'PIECE').toString().toUpperCase();
             }
-            logger.info(`   Unité normalisée: ${unitLevel}`);
+            // Unité normalisée
             
             // Trouver product_id et product_unit_uuid si non fournis
             let productId = item.product_id;
@@ -509,12 +436,9 @@ export class SalesRepository {
               const product = findProductStmt.get(item.product_code);
               if (product) {
                 productId = product.id;
-                logger.info(`   Product ID trouvé: ${productId}`);
               } else {
                 logger.warn(`⚠️ Produit non trouvé pour code: ${item.product_code} - item sera créé sans product_id`);
               }
-            } else if (productId) {
-              logger.info(`   Product ID fourni: ${productId}`);
             }
             
             // ✅ Récupérer l'UUID de l'unité (RÉFÉRENCE STABLE)
@@ -526,7 +450,6 @@ export class SalesRepository {
               `).get(productId, unitLevel);
               if (productUnit) {
                 productUnitUuid = productUnit.uuid;
-                logger.info(`   Unit UUID trouvé: ${productUnitUuid}`);
               } else {
                 logger.warn(`⚠️ Unité "${unitLevel}" non trouvée pour le produit`);
               }
@@ -535,10 +458,8 @@ export class SalesRepository {
             // Normaliser la quantité
             let qty = Number(item.qty) || 0;
             qty = Math.round(qty * 100) / 100; // Arrondir à 2 décimales
-            logger.info(`   Quantité normalisée: ${qty}`);
             
             try {
-              logger.info(`   💾 Insertion dans sale_items...`);
               itemStmt.run(
                 itemUuid,
                 saleId,
@@ -556,7 +477,7 @@ export class SalesRepository {
                 item.subtotal_usd || 0
               );
               
-              logger.info(`   ✅ Item ${itemIdx + 1}/${saleData.items.length} inséré dans sale_items (stock NON réduit)`);
+              // Item inséré dans sale_items (stock NON réduit)
             } catch (itemError) {
               // Si erreur d'unité inconnue, essayer de créer l'unité manquante pour les ventes SHEETS
               if (itemError.message && itemError.message.includes('Unité inconnue') && saleData.origin === 'SHEETS' && productId) {
@@ -582,10 +503,7 @@ export class SalesRepository {
                     unitPriceFC,
                     unitPriceUSD
                   );
-                  logger.info(`✅ Unité créée: ${unitLevel}/${item.unit_mark || ''} pour produit ${item.product_code}`);
-                  
-                  // Réessayer l'insertion de l'item
-                  logger.info(`   🔄 Réessai de l'insertion de l'item ${itemIdx + 1}...`);
+                  // Unité créée, réessai de l'insertion
                   itemStmt.run(
                     itemUuid,
                     saleId,
@@ -601,7 +519,7 @@ export class SalesRepository {
                     item.unit_price_usd || 0,
                     item.subtotal_usd || 0
                   );
-                  logger.info(`   ✅ Item ${itemIdx + 1}/${saleData.items.length} inséré avec succès après création de l'unité`);
+                  // Item inséré avec succès après création de l'unité
                 } catch (createUnitError) {
                   logger.error(`❌ Impossible de créer l'unité manquante: ${createUnitError.message}`);
                   throw itemError; // Re-lancer l'erreur originale
@@ -612,16 +530,10 @@ export class SalesRepository {
             }
           }); // Fin du forEach
           
-          logger.info(`✅ [sales.repo] Tous les items ont été créés SANS réduction de stock`);
+          // Tous les items créés SANS réduction de stock
         }
         
         const createdSale = this.findById(saleId);
-        logger.info(`✅ [sales.repo] ==========================================`);
-        logger.info(`✅ [sales.repo] VENTE UPSERTÉE AVEC SUCCÈS (SANS RÉDUCTION DE STOCK)`);
-        logger.info(`✅ [sales.repo] ==========================================`);
-        logger.info(`📄 [sales.repo] Invoice Number: ${createdSale?.invoice_number}`);
-        logger.info(`📦 [sales.repo] Nombre d'items: ${createdSale?.items?.length || 0}`);
-        logger.info(`⚠️  [sales.repo] RAPPEL: Le stock n'a PAS été réduit (vente depuis Sheets)`);
         
         return createdSale;
       } catch (error) {
@@ -667,10 +579,9 @@ export class SalesRepository {
             WHERE product_id = ? AND unit_level = ? AND unit_mark = ?
           `);
 
-          logger.info(`🔄 [sales.repo] Restauration du stock pour ${sale.items.length} item(s)...`);
+          // Restauration du stock
           for (const item of sale.items) {
             const qty = Number(item.qty) || 0;
-            logger.info(`   Restauration: produit ${item.product_code}, quantité ${qty}`);
             stockStmt.run(
               qty, // Pour stock_initial
               qty, // Pour stock_current
@@ -679,7 +590,7 @@ export class SalesRepository {
               item.unit_mark
             );
           }
-          logger.info(`✅ [sales.repo] Stock restauré pour tous les items`);
+          // Stock restauré pour tous les items
         }
 
         return this.findById(sale.id);

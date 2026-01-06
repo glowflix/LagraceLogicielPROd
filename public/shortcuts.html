@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Raccourcis Clavier - La Grâce Pro</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    
+    :root {
+      --bg-dark: #0f0f1a;
+      --bg-card: #1a1a2e;
+      --text-primary: #ffffff;
+      --text-secondary: #a0a0b0;
+      --accent: #6366f1;
+      --accent-pink: #fe2c55;
+      --border: rgba(255, 255, 255, 0.1);
+    }
+    
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: var(--bg-dark);
+      color: var(--text-primary);
+      min-height: 100vh;
+      padding: 2rem;
+    }
+    
+    .container {
+      max-width: 550px;
+      margin: 0 auto;
+    }
+    
+    .header {
+      text-align: center;
+      margin-bottom: 2rem;
+    }
+    
+    .header h1 {
+      font-size: 1.5rem;
+      margin-bottom: 0.5rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+    }
+    
+    .header p {
+      color: var(--text-secondary);
+      font-size: 0.9rem;
+    }
+    
+    .section {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      margin-bottom: 1rem;
+      overflow: hidden;
+    }
+    
+    .section-header {
+      padding: 1rem 1.25rem;
+      background: rgba(255, 255, 255, 0.03);
+      border-bottom: 1px solid var(--border);
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    
+    .shortcut-list {
+      padding: 0.5rem 0;
+    }
+    
+    .shortcut-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0.75rem 1.25rem;
+      border-bottom: 1px solid var(--border);
+    }
+    
+    .shortcut-item:last-child {
+      border-bottom: none;
+    }
+    
+    .shortcut-item:hover {
+      background: rgba(255, 255, 255, 0.02);
+    }
+    
+    .shortcut-label {
+      color: var(--text-secondary);
+      font-size: 0.9rem;
+    }
+    
+    .shortcut-keys {
+      display: flex;
+      gap: 0.25rem;
+    }
+    
+    .key {
+      background: linear-gradient(135deg, var(--accent), var(--accent-pink));
+      color: white;
+      padding: 0.25rem 0.6rem;
+      border-radius: 6px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      font-family: 'Consolas', monospace;
+      box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+    }
+    
+    .key-plain {
+      background: var(--bg-dark);
+      border: 1px solid var(--border);
+    }
+    
+    .highlight {
+      background: linear-gradient(135deg, rgba(99, 102, 241, 0.2), rgba(254, 44, 85, 0.2));
+      border: 1px solid rgba(99, 102, 241, 0.3);
+    }
+    
+    .footer {
+      text-align: center;
+      margin-top: 2rem;
+      color: var(--text-secondary);
+      font-size: 0.8rem;
+    }
+    
+    .tip {
+      background: linear-gradient(135deg, rgba(99, 102, 241, 0.1), rgba(254, 44, 85, 0.1));
+      border: 1px solid rgba(99, 102, 241, 0.2);
+      border-radius: 8px;
+      padding: 1rem;
+      margin-top: 1.5rem;
+      font-size: 0.85rem;
+    }
+    
+    .tip-icon {
+      margin-right: 0.5rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>⌨️ Raccourcis Clavier</h1>
+      <p>Améliorez votre productivité avec ces raccourcis</p>
+    </div>
+    
+    <!-- Ventes -->
+    <div class="section">
+      <div class="section-header">💰 Page Ventes</div>
+      <div class="shortcut-list">
+        <div class="shortcut-item highlight">
+          <span class="shortcut-label">Finaliser & Imprimer la vente</span>
+          <div class="shortcut-keys">
+            <span class="key">Entrée</span>
+          </div>
+        </div>
+        <div class="shortcut-item">
+          <span class="shortcut-label">Ajouter produit au panier</span>
+          <div class="shortcut-keys">
+            <span class="key">+</span>
+          </div>
+        </div>
+        <div class="shortcut-item">
+          <span class="shortcut-label">Retirer du panier</span>
+          <div class="shortcut-keys">
+            <span class="key">-</span>
+          </div>
+        </div>
+        <div class="shortcut-item">
+          <span class="shortcut-label">Focus recherche produit</span>
+          <div class="shortcut-keys">
+            <span class="key key-plain">Ctrl</span>
+            <span class="key">F</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- Navigation -->
+    <div class="section">
+      <div class="section-header">🧭 Navigation</div>
+      <div class="shortcut-list">
+        <div class="shortcut-item">
+          <span class="shortcut-label">Accueil</span>
+          <div class="shortcut-keys">
+            <span class="key key-plain">Ctrl</span>
+            <span class="key">1</span>
+          </div>
+        </div>
+        <div class="shortcut-item">
+          <span class="shortcut-label">Ventes POS</span>
+          <div class="shortcut-keys">
+            <span class="key key-plain">Ctrl</span>
+            <span class="key">2</span>
+          </div>
+        </div>
+        <div class="shortcut-item">
+          <span class="shortcut-label">Produits</span>
+          <div class="shortcut-keys">
+            <span class="key key-plain">Ctrl</span>
+            <span class="key">3</span>
+          </div>
+        </div>
+        <div class="shortcut-item">
+          <span class="shortcut-label">Dettes</span>
+          <div class="shortcut-keys">
+            <span class="key key-plain">Ctrl</span>
+            <span class="key">4</span>
+          </div>
+        </div>
+        <div class="shortcut-item">
+          <span class="shortcut-label">Statistiques</span>
+          <div class="shortcut-keys">
+            <span class="key key-plain">Ctrl</span>
+            <span class="key">5</span>
+          </div>
+        </div>
+        <div class="shortcut-item">
+          <span class="shortcut-label">Paramètres</span>
+          <div class="shortcut-keys">
+            <span class="key key-plain">Ctrl</span>
+            <span class="key">,</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- Fichier/Export -->
+    <div class="section">
+      <div class="section-header">📁 Fichier & Export</div>
+      <div class="shortcut-list">
+        <div class="shortcut-item">
+          <span class="shortcut-label">Imprimer / Export A4</span>
+          <div class="shortcut-keys">
+            <span class="key key-plain">Ctrl</span>
+            <span class="key">P</span>
+          </div>
+        </div>
+        <div class="shortcut-item">
+          <span class="shortcut-label">Export New Arrivage</span>
+          <div class="shortcut-keys">
+            <span class="key key-plain">Ctrl</span>
+            <span class="key key-plain">Shift</span>
+            <span class="key">N</span>
+          </div>
+        </div>
+        <div class="shortcut-item">
+          <span class="shortcut-label">Exporter CSV</span>
+          <div class="shortcut-keys">
+            <span class="key key-plain">Ctrl</span>
+            <span class="key">E</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- Général -->
+    <div class="section">
+      <div class="section-header">🔧 Général</div>
+      <div class="shortcut-list">
+        <div class="shortcut-item">
+          <span class="shortcut-label">Actualiser</span>
+          <div class="shortcut-keys">
+            <span class="key key-plain">Ctrl</span>
+            <span class="key">R</span>
+          </div>
+        </div>
+        <div class="shortcut-item">
+          <span class="shortcut-label">Plein écran</span>
+          <div class="shortcut-keys">
+            <span class="key">F11</span>
+          </div>
+        </div>
+        <div class="shortcut-item">
+          <span class="shortcut-label">Outils développeur</span>
+          <div class="shortcut-keys">
+            <span class="key">F12</span>
+          </div>
+        </div>
+        <div class="shortcut-item">
+          <span class="shortcut-label">Raccourcis (cette fenêtre)</span>
+          <div class="shortcut-keys">
+            <span class="key key-plain">Ctrl</span>
+            <span class="key">/</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <div class="tip">
+      <span class="tip-icon">💡</span>
+      <strong>Astuce :</strong> Sur la page Ventes, appuyez sur <strong>Entrée</strong> pour finaliser et imprimer automatiquement la facture !
+    </div>
+    
+    <div class="footer">
+      La Grâce Pro © 2024-2026 - Glowflix
+    </div>
+  </div>
+</body>
+</html>

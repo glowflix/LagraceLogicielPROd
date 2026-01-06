@@ -3,7 +3,8 @@ import http from 'http';
 import https from 'https';
 import { syncLogger } from '../../core/logger.js';
 
-const VERBOSE = process.env.SYNC_VERBOSE === '1';
+// Utilise le système de niveau de log intelligent du syncLogger
+const VERBOSE = syncLogger.isVerbose();
 
 // Timeouts recommandés pour une sync fréquente (10s)
 // Ajustez par ENV si besoin.
@@ -65,65 +66,68 @@ export class SheetsClient {
 
   /**
    * PUSH 1 opération (fallback / compatibilité)
+   * VERSION OPTIMISÉE: Logs minimaux
    */
   async push(entity, entityId, op, payload, options = {}) {
     const url = this.getWebAppUrl();
     if (!url) {
-      if (VERBOSE) syncLogger.warn('GOOGLE_SHEETS_WEBAPP_URL non configuré, skip push');
+      syncLogger.warn(`[${entity}] URL non configurée`);
       return { success: false, error: 'URL non configurée' };
     }
 
     const timeout = options.timeout ?? (TIMEOUTS[entity] || DEFAULT_TIMEOUT_MS);
 
     try {
-      const res = await this.axios.post(
-        url,
-        { entity, entity_id: entityId, op, payload },
-        { timeout }
-      );
+      const res = await this.axios.post(url, { entity, entity_id: entityId, op, payload }, { timeout });
 
       if (res?.data?.success) {
-        if (VERBOSE) syncLogger.info(`✅ push OK ${entity}/${entityId}`);
+        syncLogger.incrementPushed(entity);
+        syncLogger.verbose(`📤 [${entity}] ↑1 OK`);
         return { success: true, result: res.data.result };
       }
 
       const err = res?.data?.error || `HTTP ${res.status}`;
-      if (VERBOSE) syncLogger.warn(`❌ push FAIL ${entity}/${entityId}: ${err}`);
+      syncLogger.incrementErrors(entity);
       return { success: false, error: err };
     } catch (e) {
-      if (VERBOSE) syncLogger.warn(`❌ push ERROR ${entity}/${entityId}: ${e.message}`);
+      syncLogger.incrementErrors(entity);
       return { success: false, error: e.message };
     }
   }
 
   /**
-   * PUSH BATCH (si votre Apps Script supporte action=batchPush)
-   * Sinon fallback: push en concurrence limitée.
+   * PUSH BATCH - VERSION OPTIMISÉE
+   * Logs résumés uniquement, pas de détail par opération
    */
   async pushBatch(ops, options = {}) {
     const url = this.getWebAppUrl();
     if (!url) {
-      if (VERBOSE) syncLogger.warn('GOOGLE_SHEETS_WEBAPP_URL non configuré, skip pushBatch');
+      syncLogger.warn('[BATCH] URL non configurée');
       return { success: false, error: 'URL non configurée', applied: [], conflicts: [] };
     }
 
     const mode = (process.env.SHEETS_BATCH_MODE || '0') === '1';
     const timeout = options.timeout ?? parseInt(process.env.SHEETS_TIMEOUT_BATCHPUSH_MS || '9000', 10);
+    const t0 = Date.now();
 
     if (mode) {
-      // Mode PRO: 1 requête
       try {
-        const res = await this.axios.post(
-          url,
-          {
-            action: 'batchPush',
-            device_id: process.env.DEVICE_ID || 'PC-1',
-            ops
-          },
-          { timeout }
-        );
+        const res = await this.axios.post(url, {
+          action: 'batchPush',
+          device_id: process.env.DEVICE_ID || 'PC-1',
+          ops
+        }, { timeout });
+
+        const ms = Date.now() - t0;
 
         if (res?.data?.success) {
+          const appliedCount = res.data.applied?.length || ops.length;
+          const conflictCount = res.data.conflicts?.length || 0;
+          
+          // Log résumé unique
+          syncLogger.info(`📤 [BATCH] ↑${appliedCount} OK${conflictCount > 0 ? `, ${conflictCount} conflits` : ''} (${ms}ms)`);
+          syncLogger.incrementPushed('products', appliedCount);
+          
           return {
             success: true,
             applied: res.data.applied || [],
@@ -133,15 +137,17 @@ export class SheetsClient {
         }
 
         const err = res?.data?.error || `HTTP ${res.status}`;
-        if (VERBOSE) syncLogger.warn(`❌ batchPush FAIL: ${err}`);
+        syncLogger.warn(`❌ [BATCH] FAIL: ${err}`);
+        syncLogger.incrementErrors('products', ops.length);
         return { success: false, error: err, applied: [], conflicts: [] };
       } catch (e) {
-        if (VERBOSE) syncLogger.warn(`❌ batchPush ERROR: ${e.message}`);
+        syncLogger.warn(`❌ [BATCH] ERROR: ${e.message}`);
+        syncLogger.incrementErrors('products', ops.length);
         return { success: false, error: e.message, applied: [], conflicts: [] };
       }
     }
 
-    // Fallback compatible: pousser en parallèle limité
+    // Fallback: push en parallèle limité (sans logs par item)
     const applied = [];
     const conflicts = [];
     await runPool(ops, PUSH_CONCURRENCY, async (op) => {
@@ -150,26 +156,27 @@ export class SheetsClient {
       else conflicts.push({ op_id: op.op_id || op.id, error: r.error });
     });
 
+    const ms = Date.now() - t0;
+    syncLogger.info(`📤 [BATCH-FALLBACK] ↑${applied.length} OK, ${conflicts.length} conflits (${ms}ms)`);
+
     return { success: true, applied, conflicts, server_time: null };
   }
 
   /**
    * PULL 1 entité (mode paginé PRO)
-   * IMPORTANT: pas de JSON.stringify massif, pas de logs lourds
+   * VERSION OPTIMISÉE: Logs minimaux par défaut, détaillés si VERBOSE
    */
   async pull(entity, since, options = {}) {
     const url = this.getWebAppUrl();
     if (!url) {
-      if (VERBOSE) syncLogger.warn('GOOGLE_SHEETS_WEBAPP_URL non configuré, skip pull');
+      syncLogger.warn(`[${entity}] URL non configurée`);
       return { success: false, data: [], error: 'URL non configurée' };
     }
 
-    const sinceDate =
-      since ? (typeof since === 'string' ? since : since.toISOString()) : new Date(0).toISOString();
-
+    const sinceDate = since ? (typeof since === 'string' ? since : since.toISOString()) : new Date(0).toISOString();
     const timeout = options.timeout ?? (TIMEOUTS[entity] || DEFAULT_TIMEOUT_MS);
-    const maxRetries = options.maxRetries ?? 1; // en sync normale: 1 retry max
-    const retryDelay = options.retryDelay ?? 400; // petit délai
+    const maxRetries = options.maxRetries ?? 1;
+    const retryDelay = options.retryDelay ?? 400;
     const full = options.full || false;
     const cursor = options.cursor || null;
     const limit = options.limit || 300;
@@ -191,68 +198,54 @@ export class SheetsClient {
           if (unitLevel) params.unit_level = unitLevel;
         }
 
-        // Logs DÉTAILLÉS pour diagnostic
-        const fullUrl = `${url}?${new URLSearchParams(params).toString()}`;
-        syncLogger.info(`📥 [${entity.toUpperCase()}] Pull${full ? ' (FULL)' : ''}${cursor ? ` cursor=${cursor}` : ''} | Tentative ${attempt}/${maxRetries + 1}`);
-        syncLogger.info(`   🔗 URL: ${fullUrl.substring(0, 200)}${fullUrl.length > 200 ? '...' : ''}`);
-        syncLogger.info(`   📅 Since: ${sinceDate} (${new Date(sinceDate).toLocaleString('fr-FR')})`);
-        syncLogger.info(`   ⏱️  Timeout: ${timeout}ms`);
+        // Log condensé (niveau 2+)
+        syncLogger.verbose(`📥 [${entity}] Pull${full ? ' FULL' : ''} attempt ${attempt}/${maxRetries + 1}`);
 
-        const res = await this.axios.get(url, {
-          params,
-          timeout,
-        });
-
+        const res = await this.axios.get(url, { params, timeout });
         const ms = Date.now() - t0;
-
-        // Logs DÉTAILLÉS de la réponse
-        syncLogger.info(`   📥 [${entity.toUpperCase()}] Réponse reçue en ${ms}ms`);
-        syncLogger.info(`   📊 [${entity.toUpperCase()}] Réponse Apps Script: success=${res?.data?.success}, count=${res?.data?.count || 0}, data.length=${Array.isArray(res?.data?.data) ? res.data.data.length : 'N/A'}`);
-        if (res?.data?.error) {
-          syncLogger.warn(`   ⚠️  [${entity.toUpperCase()}] Erreur Apps Script: ${res.data.error}`);
-        }
 
         if (res?.data?.success) {
           const data = Array.isArray(res.data.data) ? res.data.data : [];
           const nextCursor = res.data.next_cursor || null;
           const done = res.data.done || false;
           
-          syncLogger.info(`✅ [${entity.toUpperCase()}] Pull OK: ${data.length} item(s) en ${ms}ms${nextCursor ? ` | Next cursor: ${nextCursor}` : ''}${done ? ' | ✅ Terminé' : ''}`);
+          // Log résumé unique (niveau 2)
+          syncLogger.info(`📥 [${entity}] ↓${data.length} items (${ms}ms)${done ? ' ✓' : ''}`);
           
-          // Logs DÉTAILLÉS des premiers items si disponibles
-          if (data.length > 0) {
-            syncLogger.info(`   📋 [${entity.toUpperCase()}] Premiers items:`);
-            data.slice(0, 3).forEach((item, idx) => {
+          // Incrémenter le compteur
+          syncLogger.incrementPulled(entity, data.length);
+          
+          // Logs détaillés uniquement si VERBOSE (niveau 3+)
+          if (syncLogger.isVerbose() && data.length > 0) {
+            data.slice(0, 2).forEach((item, idx) => {
               if (entity === 'products') {
-                syncLogger.info(`      [${idx + 1}] Code: "${item.code || 'N/A'}", Nom: "${item.name || 'N/A'}", Unités: ${item.units?.length || 0}`);
+                syncLogger.verbose(`   [${idx + 1}] ${item.code}: ${item.name}`);
               } else if (entity === 'sales') {
-                syncLogger.info(`      [${idx + 1}] Facture: ${item.invoice_number || 'N/A'}, Client: ${item.client_name || 'N/A'}, Date: ${item.sold_at || 'N/A'}`);
-              } else if (entity === 'debts') {
-                syncLogger.info(`      [${idx + 1}] Client: ${item.client_name || 'N/A'}, Facture: ${item.invoice_number || 'N/A'}, Total: ${item.total_fc || 0} FC`);
+                syncLogger.verbose(`   [${idx + 1}] ${item.invoice_number}: ${item.client_name}`);
               }
             });
-          } else {
-            syncLogger.warn(`   ⚠️  [${entity.toUpperCase()}] Aucun item retourné (data.length=0) - Vérifier la date 'since' ou les données dans Sheets`);
+            if (data.length > 2) syncLogger.verbose(`   ... +${data.length - 2} items`);
           }
           
-          return { 
-            success: true, 
-            data,
-            next_cursor: nextCursor,
-            done: done
-          };
+          return { success: true, data, next_cursor: nextCursor, done };
         }
 
         const err = res?.data?.error || `HTTP ${res.status}`;
         lastErr = err;
-        syncLogger.warn(`❌ [${entity.toUpperCase()}] Pull FAIL (tentative ${attempt}): ${err}`);
+        
+        // Log d'erreur (toujours affiché niveau 1+)
+        if (attempt === maxRetries + 1) {
+          syncLogger.warn(`❌ [${entity}] Pull FAIL: ${err}`);
+          syncLogger.incrementErrors(entity);
+        }
 
-        // 4xx = généralement pas "retryable"
         if (res.status >= 400 && res.status < 500) break;
       } catch (e) {
         lastErr = e.message;
-        syncLogger.warn(`❌ [${entity.toUpperCase()}] Pull ERROR (tentative ${attempt}): ${e.message}`);
-        // timeout / réseau : retryable
+        if (attempt === maxRetries + 1) {
+          syncLogger.warn(`❌ [${entity}] Pull ERROR: ${e.message}`);
+          syncLogger.incrementErrors(entity);
+        }
       }
     }
 
@@ -286,10 +279,7 @@ export class SheetsClient {
 
   /**
    * PULL PAGINÉ (PRO) - Récupère toutes les pages d'une entité avec auto-retry
-   * @param {string} entity - Entité à récupérer
-   * @param {string} since - Date since
-   * @param {Object} options - Options (full, unitLevel, maxRetries, etc.)
-   * @returns {Promise<{success: boolean, data: Array, error?: string}>}
+   * VERSION OPTIMISÉE: Logs minimaux, compteurs intelligents
    */
   async pullAllPaged(entity, since, options = {}) {
     const url = this.getWebAppUrl();
@@ -305,22 +295,19 @@ export class SheetsClient {
     
     const sinceDate = since ? (typeof since === 'string' ? since : since.toISOString()) : new Date(0).toISOString();
     const allData = [];
-    const seenUuids = new Set(); // DEDUPLICATION: Track UUIDs to prevent duplicates across pages
+    const seenUuids = new Set();
     let cursor = options.startCursor || null;
     let tries = 0;
     let pageCount = 0;
     let duplicatesRemoved = 0;
+    const startTime = Date.now();
 
-    syncLogger.info(`📥 [${entity.toUpperCase()}] Début pull paginé${full ? ' (FULL IMPORT)' : ''}${unitLevel ? ` | Unit level: ${unitLevel}` : ''}`);
+    // Log de démarrage condensé
+    syncLogger.start(entity.toUpperCase(), full ? 'FULL IMPORT' : 'incremental');
 
     while (true) {
       try {
-        const params = {
-          entity,
-          since: sinceDate,
-          limit: limit.toString()
-        };
-        
+        const params = { entity, since: sinceDate, limit: limit.toString() };
         if (full) params.full = '1';
         if (cursor) params.cursor = cursor.toString();
         if (unitLevel) params.unit_level = unitLevel;
@@ -335,12 +322,11 @@ export class SheetsClient {
           const nextCursor = res.data.next_cursor || null;
           const done = res.data.done || false;
 
-          // DEDUPLICATION: Filter out duplicates based on UUID
+          // DEDUPLICATION silencieuse
           const filteredPageData = [];
           for (const item of pageData) {
             if (item.uuid && seenUuids.has(item.uuid)) {
               duplicatesRemoved++;
-              syncLogger.warn(`   ⚠️ [${entity.toUpperCase()}] UUID dupliquée détectée et filtrée: ${item.uuid}`);
             } else {
               if (item.uuid) seenUuids.add(item.uuid);
               filteredPageData.push(item);
@@ -348,54 +334,39 @@ export class SheetsClient {
           }
 
           allData.push(...filteredPageData);
-          syncLogger.info(`   ✅ [${entity.toUpperCase()}] Page ${pageCount}: ${filteredPageData.length}/${pageData.length} item(s) en ${ms}ms (${duplicatesRemoved} doublons supprimés) | Total: ${allData.length}${nextCursor ? ` | Next: ${nextCursor}` : ''}${done ? ' | ✅ Terminé' : ''}`);
+          
+          // Log de progression condensé (niveau 3 seulement)
+          syncLogger.verbose(`   [${entity}] Page ${pageCount}: +${filteredPageData.length} (total: ${allData.length})${done ? ' ✓' : ''}`);
 
           if (done || !nextCursor) {
-            syncLogger.info(`✅ [${entity.toUpperCase()}] Pull paginé terminé: ${allData.length} item(s) en ${pageCount} page(s) (${duplicatesRemoved} doublons supprimés)`);
-            return { 
-              success: true, 
-              data: allData,
-              last_cursor: null, // Fin de pagination
-              done: true
-            };
+            const totalMs = Date.now() - startTime;
+            syncLogger.end(entity.toUpperCase(), `${allData.length} items, ${pageCount} pages${duplicatesRemoved > 0 ? `, ${duplicatesRemoved} dups` : ''}`, totalMs);
+            syncLogger.incrementPulled(entity, allData.length);
+            return { success: true, data: allData, last_cursor: null, done: true };
           }
 
           cursor = nextCursor;
-          tries = 0; // Reset retry après succès
+          tries = 0;
           
-          // Pour les ventes, appliquer par batch au lieu d'attendre la fin complète
-          // Cela évite les timeouts et permet de traiter les données progressivement
+          // Batch intermédiaire pour les ventes (sans log détaillé)
           if (entity === 'sales' && allData.length >= limit * 2) {
-            // Appliquer les données accumulées jusqu'ici et continuer avec le cursor
-            syncLogger.info(`   📦 [${entity.toUpperCase()}] Batch intermédiaire: ${allData.length} item(s) accumulé(s), application et continuation...`);
-            return {
-              success: true,
-              data: allData,
-              last_cursor: cursor, // Continuer avec ce cursor
-              done: false
-            };
+            syncLogger.progress(entity.toUpperCase(), allData.length, '?', 'batch intermédiaire');
+            return { success: true, data: allData, last_cursor: cursor, done: false };
           }
         } else {
-          const err = res?.data?.error || `HTTP ${res.status}`;
-          throw new Error(err);
+          throw new Error(res?.data?.error || `HTTP ${res.status}`);
         }
       } catch (e) {
         tries++;
-        const waitMs = Math.min(60000, 2000 * Math.pow(1.6, tries)); // Backoff exponentiel
-        
-        syncLogger.warn(`   ⚠️ [${entity.toUpperCase()}] Erreur page ${pageCount + 1} (tentative ${tries}/${maxRetries}): ${e.message}`);
+        const waitMs = Math.min(60000, 2000 * Math.pow(1.6, tries));
         
         if (tries >= maxRetries) {
-          syncLogger.error(`   ❌ [${entity.toUpperCase()}] Max retries atteint, arrêt du pull paginé`);
-          return { 
-            success: false, 
-            data: allData, // Retourner ce qu'on a récupéré jusqu'ici
-            error: `Max retries atteint: ${e.message}`,
-            last_cursor: cursor // Pour reprendre plus tard
-          };
+          syncLogger.error(`❌ [${entity}] Max retries (${maxRetries}): ${e.message}`);
+          syncLogger.incrementErrors(entity);
+          return { success: false, data: allData, error: e.message, last_cursor: cursor };
         }
 
-        syncLogger.info(`   🔄 [${entity.toUpperCase()}] Retry dans ${(waitMs / 1000).toFixed(1)}s...`);
+        syncLogger.verbose(`   [${entity}] Retry ${tries}/${maxRetries} dans ${(waitMs / 1000).toFixed(0)}s...`);
         await sleep(waitMs);
       }
     }

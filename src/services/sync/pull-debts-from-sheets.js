@@ -51,7 +51,7 @@ function hashLineKey(line) {
 }
 
 function computeStatus(remaining_fc, paid_fc, total_fc) {
-  if (remaining_fc <= 0) return 'closed';
+  if (remaining_fc <= 0) return 'paid';
   if (paid_fc > 0 && remaining_fc < total_fc) return 'partial';
   return 'open';
 }
@@ -88,7 +88,7 @@ export async function pullDebtsFromSheets() {
     const rows = result.data;
     logger.info(`📥 [PULL-DEBTS] ${rows.length} ligne(s) lues de Sheets`);
 
-    // 2. Normaliser et mapper les lignes
+    // 2. Normaliser et mapper les lignes - FILTRER LES ENTRÉES VIDES
     const mappedLines = rows
       .filter(r => r && Object.keys(r).length)
       .map(r => {
@@ -135,29 +135,73 @@ export async function pullDebtsFromSheets() {
           _updated_at: normStr(r._updated_at),
         };
       })
-      .filter(x => x.client_name && x.invoice_number);
+      // ✅ FILTRER LES ENTRÉES VIDES: client_name ET invoice_number ET total_fc > 0
+      .filter(x => {
+        const hasClient = x.client_name && x.client_name.trim().length > 0;
+        const hasInvoice = x.invoice_number && x.invoice_number.trim().length > 0;
+        const hasAmount = x.total_fc > 0 || x.total_usd > 0;
+        return hasClient && hasInvoice && hasAmount;
+      });
 
     logger.info(`📋 [PULL-DEBTS] ${mappedLines.length} ligne(s) mappée(s)`);
 
-    // 3. Déduplication (beaucoup de doublons chez toi)
+    // 3. Déduplication intelligente - PRIORITÉ: invoice_number + UUID
+    // ✅ Stratégie: Utiliser invoice_number comme clé principale, UUID comme clé secondaire
     const uniq = new Map();
+    const byInvoice = new Map(); // Pour gérer les doublons par facture
+    
     for (const l of mappedLines) {
-      const k = l._uuid || hashLineKey(l);
-      if (!uniq.has(k)) {
-        uniq.set(k, l);
+      // Clé principale: invoice_number (si disponible)
+      const invoiceKey = l.invoice_number && l.invoice_number.trim() 
+        ? `invoice:${l.invoice_number}` 
+        : null;
+      
+      // Clé secondaire: UUID ou hash de la ligne
+      const uuidKey = l._uuid && l._uuid.trim() 
+        ? `uuid:${l._uuid}` 
+        : `hash:${hashLineKey(l)}`;
+      
+      // ✅ PRIORITÉ 1: Si invoice_number existe, utiliser comme clé principale
+      if (invoiceKey) {
+        if (!byInvoice.has(invoiceKey)) {
+          byInvoice.set(invoiceKey, l);
+          uniq.set(uuidKey, l);
+        } else {
+          // Doublon par invoice_number - garder le plus récent (par _updated_at)
+          const existing = byInvoice.get(invoiceKey);
+          const existingDate = existing._updated_at || existing.date || '';
+          const newDate = l._updated_at || l.date || '';
+          
+          if (newDate > existingDate) {
+            // Remplacer par la version plus récente
+            byInvoice.set(invoiceKey, l);
+            uniq.set(uuidKey, l);
+          }
+          // Sinon, ignorer cette ligne (doublon plus ancien)
+        }
+      } else {
+        // ✅ PRIORITÉ 2: Pas d'invoice_number, utiliser UUID/hash
+        if (!uniq.has(uuidKey)) {
+          uniq.set(uuidKey, l);
+        }
       }
     }
-    const uniqueLines = [...uniq.values()];
+    
+    // Combiner les résultats (invoice_number prioritaire)
+    const uniqueLines = [...new Set([
+      ...byInvoice.values(),
+      ...uniq.values()
+    ])];
 
     logger.info(`🔄 [PULL-DEBTS] ${uniqueLines.length} ligne(s) unique(s) (doublons supprimés)`);
 
     // 4. Agrégation par facture (client + invoice = une dette)
-    const byInvoice = new Map();
+    const byInvoiceAgg = new Map();
     for (const l of uniqueLines) {
       const invKey = `${l.client_name}__${l.invoice_number}`;
       
-      if (!byInvoice.has(invKey)) {
-        byInvoice.set(invKey, {
+      if (!byInvoiceAgg.has(invKey)) {
+        byInvoiceAgg.set(invKey, {
           invoice_number: l.invoice_number,
           client_name: l.client_name,
           product_description: '',
@@ -170,7 +214,7 @@ export async function pullDebtsFromSheets() {
         });
       }
 
-      const agg = byInvoice.get(invKey);
+      const agg = byInvoiceAgg.get(invKey);
       agg.total_fc += l.total_fc;
       agg.paid_fc += l.paid_fc;
       agg.remaining_fc += l.remaining_fc;
@@ -190,15 +234,30 @@ export async function pullDebtsFromSheets() {
       }
     }
 
-    const invoices = [...byInvoice.values()].map(d => {
+    // 4.5. Collecter les UUIDs de Sheets pour chaque facture (priorité au premier UUID non vide)
+    const invoiceUuids = new Map();
+    for (const l of uniqueLines) {
+      const invKey = `${l.client_name}__${l.invoice_number}`;
+      if (l._uuid && l._uuid.trim() && !invoiceUuids.has(invKey)) {
+        invoiceUuids.set(invKey, l._uuid.trim());
+      }
+    }
+
+    const invoices = [...byInvoiceAgg.values()].map(d => {
       const remaining_fc = d.remaining_fc || Math.max(0, d.total_fc - d.paid_fc);
       const status = computeStatus(remaining_fc, d.paid_fc, d.total_fc);
 
-      // UUID stable par facture
-      const uuid = crypto.createHash('sha1')
-        .update(`${d.client_name}|${d.invoice_number}`)
-        .digest('hex')
-        .substring(0, 32);
+      const invKey = `${d.client_name}__${d.invoice_number}`;
+      
+      // ✅ PRIORITÉ: Utiliser l'UUID de Sheets s'il existe, sinon générer un UUID stable
+      let uuid = invoiceUuids.get(invKey);
+      if (!uuid || uuid.trim() === '') {
+        // UUID stable par facture (même génération à chaque fois)
+        uuid = crypto.createHash('sha1')
+          .update(`${d.client_name}|${d.invoice_number}`)
+          .digest('hex')
+          .substring(0, 32);
+      }
 
       return {
         uuid,

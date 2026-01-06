@@ -1,5 +1,5 @@
 import { useNavigate, useLocation } from 'react-router-dom';
-import { motion } from 'framer-motion';
+import { m } from 'framer-motion';
 import { ShieldX, ArrowLeft, Home } from 'lucide-react';
 import { useStore } from '../store/useStore';
 import { canAccessRoute, getUserRole } from '../utils/permissions';
@@ -39,13 +39,13 @@ const UnauthorizedPage = () => {
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-dark-900 via-dark-800 to-dark-900 p-4">
-      <motion.div
+      <m.div
         initial={{ opacity: 0, scale: 0.95 }}
         animate={{ opacity: 1, scale: 1 }}
         transition={{ duration: 0.5 }}
         className="glass-strong rounded-2xl p-8 max-w-md w-full text-center"
       >
-        <motion.div
+        <m.div
           initial={{ scale: 0 }}
           animate={{ scale: 1 }}
           transition={{ delay: 0.2, type: 'spring', stiffness: 200 }}
@@ -54,7 +54,7 @@ const UnauthorizedPage = () => {
           <div className="w-20 h-20 rounded-full bg-red-500/20 flex items-center justify-center">
             <ShieldX className="w-10 h-10 text-red-400" />
           </div>
-        </motion.div>
+        </m.div>
 
         <h1 className="text-3xl font-bold text-gray-100 mb-4">
           Accès refusé
@@ -69,7 +69,7 @@ const UnauthorizedPage = () => {
         </p>
 
         <div className="flex flex-col gap-3">
-          <motion.button
+          <m.button
             onClick={() => navigate(redirectTo)}
             whileHover={{ scale: 1.05 }}
             whileTap={{ scale: 0.95 }}
@@ -77,10 +77,10 @@ const UnauthorizedPage = () => {
           >
             <Home className="w-5 h-5" />
             {redirectLabel}
-          </motion.button>
+          </m.button>
           
           {from !== redirectTo && (
-            <motion.button
+            <m.button
               onClick={() => navigate(from)}
               whileHover={{ scale: 1.02 }}
               whileTap={{ scale: 0.98 }}
@@ -88,10 +88,10 @@ const UnauthorizedPage = () => {
             >
               <ArrowLeft className="w-5 h-5" />
               Retour à la page précédente
-            </motion.button>
+            </m.button>
           )}
         </div>
-      </motion.div>
+      </m.div>
     </div>
   );
 };

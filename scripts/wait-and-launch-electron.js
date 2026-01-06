@@ -15,7 +15,8 @@ const projectRoot = resolve(__dirname, '..');
 const BACKEND_URL = 'http://localhost:3030/api/health';
 const VITE_URL = 'http://localhost:5173';
 const MAX_ATTEMPTS = 60; // 30 secondes max (500ms * 60)
-const DELAY_MS = 500;
+const DELAY_MS = 250; // Réduit de 500ms à 250ms pour réponse plus rapide
+const PATIENCE_MODE = true; // Continue d'attendre même après le timeout initial
 
 /**
  * ✅ IMPORTANT (Fix ESM en production)
@@ -50,8 +51,10 @@ function ensureSrcEsmModuleMarker() {
 
 function checkServer(url) {
   return new Promise((resolve) => {
-    const req = http.get(url, { timeout: 500 }, (res) => {
-      resolve(res.statusCode === 200 || res.statusCode === 304);
+    const req = http.get(url, { timeout: 300 }, (res) => {
+      // Accepter 200, 304, et les redirections 301/302 (Vite peut rediriger)
+      const ok = res.statusCode >= 200 && res.statusCode < 400;
+      resolve(ok);
     });
     
     req.on('error', () => resolve(false));
@@ -67,17 +70,25 @@ async function waitForServers() {
   console.log(`   Backend: ${BACKEND_URL}`);
   console.log(`   Vite: ${VITE_URL}`);
   
-  // Vérifier immédiatement d'abord (sans délai)
-  let backendReady = await checkServer(BACKEND_URL);
-  let viteReady = await checkServer(VITE_URL);
+  // Vérifier immédiatement d'abord (en parallèle)
+  let [backendReady, viteReady] = await Promise.all([
+    checkServer(BACKEND_URL),
+    checkServer(VITE_URL)
+  ]);
   
   if (backendReady && viteReady) {
     console.log('✅ Tous les serveurs sont déjà prêts !');
     return true;
   }
   
-  // Si pas prêts, vérifier rapidement avec des tentatives parallèles
-  for (let i = 1; i < MAX_ATTEMPTS; i++) {
+  let attempt = 0;
+  let timeoutWarningShown = false;
+  const startTime = Date.now();
+  
+  // Boucle d'attente (infinie en mode patience si le backend prend du temps)
+  while (true) {
+    attempt++;
+    
     // Vérifier les deux serveurs en parallèle pour plus de rapidité
     [backendReady, viteReady] = await Promise.all([
       checkServer(BACKEND_URL),
@@ -85,24 +96,42 @@ async function waitForServers() {
     ]);
     
     if (backendReady && viteReady) {
-      const elapsed = (i * DELAY_MS / 1000).toFixed(1);
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
       console.log(`✅ Tous les serveurs sont prêts après ${elapsed}s !`);
       return true;
     }
     
-    // Afficher le statut toutes les 2 secondes (toutes les 4 tentatives)
-    if (i % 4 === 0) {
-      const elapsed = (i * DELAY_MS / 1000).toFixed(1);
-      console.log(`   [${elapsed}s] Backend: ${backendReady ? '✅' : '⏳'} | Vite: ${viteReady ? '✅' : '⏳'}`);
+    // Afficher le statut toutes les 1 secondes (toutes les 4 tentatives avec 250ms delay)
+    if (attempt % 4 === 0) {
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      const backendStatus = backendReady ? '✅' : '⏳';
+      const viteStatus = viteReady ? '✅' : '⏳';
+      console.log(`   [${elapsed}s] Backend: ${backendStatus} | Vite: ${viteStatus}`);
+    }
+    
+    // Vérifier si on a atteint le timeout initial
+    if (attempt >= MAX_ATTEMPTS) {
+      if (PATIENCE_MODE) {
+        // Mode patience: continuer d'attendre si au moins un serveur progresse
+        if (!timeoutWarningShown) {
+          console.log('⚠️  Timeout initial dépassé, mais le mode patience est activé...');
+          console.log('   💡 Le backend peut prendre du temps à charger les modules (impression, etc.)');
+          console.log('   ⏳ Attente prolongée...');
+          timeoutWarningShown = true;
+        }
+        // Continuer d'attendre, mais avec des intervalles plus longs
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        continue;
+      } else {
+        console.error('❌ Timeout: Les serveurs ne sont pas prêts après 90 secondes');
+        return false;
+      }
     }
     
     // Délai réduit pour les premières tentatives
-    const delay = i < 10 ? 200 : DELAY_MS; // Plus rapide au début
+    const delay = attempt < 10 ? 200 : DELAY_MS; // Plus rapide au début
     await new Promise(resolve => setTimeout(resolve, delay));
   }
-  
-  console.error('❌ Timeout: Les serveurs ne sont pas prêts après 30 secondes');
-  return false;
 }
 
 async function launchElectron() {

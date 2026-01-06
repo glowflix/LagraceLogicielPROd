@@ -1,6 +1,6 @@
 import { useEffect, useState, useMemo, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
-import { motion, AnimatePresence } from 'framer-motion';
+import { m, AnimatePresence } from 'framer-motion';
 import { 
   User, 
   UserPlus, 
@@ -26,9 +26,12 @@ import {
   ShoppingCart,
   Database,
   Key,
-  Hash
+  Hash,
+  Ban,
+  Lock
 } from 'lucide-react';
 import { useStore } from '../store/useStore';
+import { isUserAdmin, getUserRole, hasPermission, PERMISSIONS } from '../utils/permissions';
 import axios from 'axios';
 import { format, parseISO, isValid } from 'date-fns';
 
@@ -90,6 +93,15 @@ const UsersPage = () => {
   const { user: currentUser } = useStore();
   const saveTimeoutRef = useRef(null);
   const pendingSavesRef = useRef(new Map());
+
+  // Vérifier si l'utilisateur actuel est admin
+  const isCurrentUserAdmin = useMemo(() => {
+    return isUserAdmin(currentUser);
+  }, [currentUser]);
+
+  // Vérifier les permissions de l'utilisateur
+  const userRole = useMemo(() => getUserRole(currentUser), [currentUser]);
+  const canManageUsers = useMemo(() => hasPermission(userRole, PERMISSIONS.MANAGE_USERS), [userRole]);
 
   // Charger les utilisateurs
   useEffect(() => {
@@ -204,9 +216,13 @@ const UsersPage = () => {
     await saveFieldChange(userId, field, newValue);
   }, [users, saveFieldChange]);
 
-  // Édition inline - Tous les utilisateurs peuvent modifier tous les comptes
+  // Édition inline - Seuls les admins peuvent modifier les comptes
   const handleInlineEdit = (user, field) => {
-    // TOUJOURS autoriser l'édition - pas de restriction
+    // Vérifier si l'utilisateur actuel peut éditer
+    if (!canManageUsers) {
+      alert('⚠️ Vous n\'avez pas la permission de modifier les utilisateurs');
+      return;
+    }
     setEditingField({ userId: user.id, field });
     if (field === 'password') {
       setEditingValue('');
@@ -215,11 +231,11 @@ const UsersPage = () => {
     }
   };
   
-  // Vérifier si l'utilisateur peut modifier un autre utilisateur - TOUS peuvent modifier TOUS
+  // Vérifier si l'utilisateur peut modifier un autre utilisateur
   const canEditUser = useCallback((user) => {
-    // TOUJOURS autoriser la modification - pas de restriction
-    return true;
-  }, []);
+    // Seuls les admins peuvent modifier
+    return canManageUsers;
+  }, [canManageUsers]);
 
   const handleInlineSave = useCallback((userId, field) => {
     if (field === 'password' && !editingValue.trim()) {
@@ -566,6 +582,32 @@ const UsersPage = () => {
     }
   };
 
+  // ⚠️ Si l'utilisateur n'est pas admin, afficher un message d'accès refusé
+  if (!canManageUsers) {
+    return (
+      <div className="min-h-[60vh] flex items-center justify-center">
+        <m.div
+          initial={{ opacity: 0, scale: 0.9 }}
+          animate={{ opacity: 1, scale: 1 }}
+          className="text-center max-w-md mx-auto p-8 glass rounded-2xl"
+        >
+          <div className="w-20 h-20 mx-auto mb-6 rounded-full bg-red-500/20 flex items-center justify-center">
+            <Lock className="w-10 h-10 text-red-400" />
+          </div>
+          <h2 className="text-2xl font-bold text-red-400 mb-3">
+            Accès Restreint
+          </h2>
+          <p className="text-gray-400 mb-4">
+            Seuls les <span className="text-primary-400 font-semibold">Administrateurs</span> peuvent gérer les comptes utilisateurs.
+          </p>
+          <p className="text-sm text-gray-500">
+            Contactez un administrateur si vous avez besoin d'accéder à cette fonctionnalité.
+          </p>
+        </m.div>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-6">
       {/* En-tête */}
@@ -573,10 +615,16 @@ const UsersPage = () => {
         <div>
           <h1 className="text-3xl font-bold text-gray-100 mb-2">Compte Utilisateur</h1>
           <p className="text-gray-400">Gestion des utilisateurs et permissions</p>
+          {isCurrentUserAdmin && (
+            <p className="text-xs text-primary-400 mt-1 flex items-center gap-1">
+              <Shield className="w-3 h-3" />
+              Mode Administrateur
+            </p>
+          )}
         </div>
         <div className="flex gap-3">
           {/* Bouton visible pour tous les utilisateurs */}
-            <motion.button
+            <m.button
             onClick={() => {
               setShowCreateForm(true);
               setNewUserForm({
@@ -599,11 +647,11 @@ const UsersPage = () => {
             >
               <UserPlus className="w-5 h-5" />
               Créer Nouveau Compte
-          </motion.button>
+          </m.button>
           
           {/* Bouton toggle pour afficher/masquer le formulaire */}
           {showCreateForm && (
-            <motion.button
+            <m.button
               onClick={() => setShowCreateForm(false)}
               whileHover={{ scale: 1.05 }}
               whileTap={{ scale: 0.95 }}
@@ -611,14 +659,14 @@ const UsersPage = () => {
             >
               <X className="w-5 h-5" />
               Annuler
-            </motion.button>
+            </m.button>
           )}
         </div>
       </div>
 
       {/* Formulaire de création inline - Visible pour tous */}
       {showCreateForm && (
-        <motion.div
+        <m.div
           initial={{ opacity: 0, height: 0 }}
           animate={{ opacity: 1, height: 'auto' }}
           exit={{ opacity: 0, height: 0 }}
@@ -818,7 +866,7 @@ const UsersPage = () => {
               </button>
             </div>
           </form>
-          </motion.div>
+          </m.div>
       )}
 
       {/* Statistiques - animations rapides */}
@@ -829,7 +877,7 @@ const UsersPage = () => {
           { label: 'Administrateurs', value: stats.admin, color: 'text-yellow-400' },
           { label: 'Avec devices', value: stats.withDevices, color: 'text-blue-400' },
         ].map((stat, index) => (
-        <motion.div
+        <m.div
             key={stat.label}
             initial={{ opacity: 0, y: 10 }}
           animate={{ opacity: 1, y: 0 }}
@@ -840,7 +888,7 @@ const UsersPage = () => {
             <div className={`text-2xl font-bold ${stat.color}`}>
               {stat.value}
             </div>
-          </motion.div>
+          </m.div>
         ))}
       </div>
 
@@ -867,7 +915,7 @@ const UsersPage = () => {
                 const isAdmin = user.is_admin === 1 || user.is_admin === true;
                 
                 return (
-                  <motion.div
+                  <m.div
                     key={user.id}
                     variants={cardVariants}
                     initial="initial"
@@ -1240,7 +1288,7 @@ const UsersPage = () => {
                       </div>
                     )}
                     </div>
-                  </motion.div>
+                  </m.div>
                 );
               })}
             </AnimatePresence>
@@ -1274,7 +1322,7 @@ const UsersPage = () => {
       {typeof document !== 'undefined' && createPortal(
         <AnimatePresence mode="wait">
           {showProfileModal && profileUser && (
-            <motion.div
+            <m.div
               key="profile-modal-backdrop"
               variants={backdropVariants}
               initial="hidden"
@@ -1294,7 +1342,7 @@ const UsersPage = () => {
               closeProfileModal();
             }}
           >
-            <motion.div
+            <m.div
               variants={modalVariants}
               initial="hidden"
               animate="visible"
@@ -1628,8 +1676,8 @@ const UsersPage = () => {
                   </div>
             </form>
               </div>
-              </motion.div>
-            </motion.div>
+              </m.div>
+            </m.div>
           )}
         </AnimatePresence>
         ,

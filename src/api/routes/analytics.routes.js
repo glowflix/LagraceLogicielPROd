@@ -1,6 +1,7 @@
 import express from 'express';
 import { salesRepo } from '../../db/repositories/sales.repo.js';
 import { debtsRepo } from '../../db/repositories/debts.repo.js';
+import { debtPaymentsRepo } from '../../db/repositories/debt-payments.repo.js';
 import { stockRepo } from '../../db/repositories/stock.repo.js';
 import { optionalAuth } from '../middlewares/auth.js';
 
@@ -28,9 +29,28 @@ router.get('/today', optionalAuth, (req, res) => {
 
     const todayInvoices = sales.filter((s) => s.status !== 'void').length;
 
-    const todayCollected = sales
-      .filter((s) => s.status === 'paid')
-      .reduce((sum, s) => sum + (s.paid_fc || 0), 0);
+    // Cash collecté sur les ventes créées aujourd'hui (inclut ventes en dette/partial si paid_* > 0)
+    const todayCollectedFromSales = sales
+      .filter((s) => s.status !== 'void')
+      .reduce((sum, s) => {
+        const paid = Number(s.paid_fc || 0);
+        return paid > 0 ? sum + paid : sum;
+      }, 0);
+
+    const todayCollectedUSDFromSales = sales
+      .filter((s) => s.status !== 'void')
+      .reduce((sum, s) => {
+        const paid = Number(s.paid_usd || 0);
+        return paid > 0 ? sum + paid : sum;
+      }, 0);
+
+    // Paiements de dettes effectués aujourd'hui (doivent compter dans le cash du jour)
+    const debtPaymentsToday = debtPaymentsRepo.getDayTotal(new Date().toISOString());
+    const todayDebtPaymentsFC = Number(debtPaymentsToday?.total_fc || 0);
+    const todayDebtPaymentsUSD = Number(debtPaymentsToday?.total_usd || 0);
+
+    const todayCollected = todayCollectedFromSales + todayDebtPaymentsFC;
+    const todayCollectedUSD = todayCollectedUSDFromSales + todayDebtPaymentsUSD;
 
     const allDebts = debtsRepo.findAll();
     const openDebts = allDebts.filter((d) => d.status === 'open' || d.status === 'partial');
@@ -43,6 +63,11 @@ router.get('/today', optionalAuth, (req, res) => {
       todaySalesUSD,
       todayInvoices,
       todayCollected,
+      todayCollectedUSD,
+      todayCollectedFromSales,
+      todayCollectedUSDFromSales,
+      todayDebtPaymentsFC,
+      todayDebtPaymentsUSD,
       openDebts: openDebtsTotal,
       openDebtsCount: openDebts.length,
       lowStock: lowStock.map((item) => ({
@@ -198,9 +223,26 @@ router.get('/summary', optionalAuth, (req, res) => {
 
     const todayInvoices = sales.filter((s) => s.status !== 'void').length;
 
-    const todayCollected = sales
-      .filter((s) => s.status === 'paid')
-      .reduce((sum, s) => sum + (s.paid_fc || 0), 0);
+    const todayCollectedFromSales = sales
+      .filter((s) => s.status !== 'void')
+      .reduce((sum, s) => {
+        const paid = Number(s.paid_fc || 0);
+        return paid > 0 ? sum + paid : sum;
+      }, 0);
+
+    const todayCollectedUSDFromSales = sales
+      .filter((s) => s.status !== 'void')
+      .reduce((sum, s) => {
+        const paid = Number(s.paid_usd || 0);
+        return paid > 0 ? sum + paid : sum;
+      }, 0);
+
+    const debtPaymentsToday = debtPaymentsRepo.getDayTotal(new Date().toISOString());
+    const todayDebtPaymentsFC = Number(debtPaymentsToday?.total_fc || 0);
+    const todayDebtPaymentsUSD = Number(debtPaymentsToday?.total_usd || 0);
+
+    const todayCollected = todayCollectedFromSales + todayDebtPaymentsFC;
+    const todayCollectedUSD = todayCollectedUSDFromSales + todayDebtPaymentsUSD;
 
     // Calcul du taux de conversion (invoices payées / total)
     const conversionRate = todayInvoices > 0 
@@ -215,6 +257,11 @@ router.get('/summary', optionalAuth, (req, res) => {
       todaySalesUSD,
       todayInvoices,
       todayCollected,
+      todayCollectedUSD,
+      todayCollectedFromSales,
+      todayCollectedUSDFromSales,
+      todayDebtPaymentsFC,
+      todayDebtPaymentsUSD,
       conversionRate,
       averageCart,
       lastUpdate: new Date().toISOString(),

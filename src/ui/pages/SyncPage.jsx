@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { motion } from 'framer-motion';
+import { m } from 'framer-motion';
 import { RefreshCw, Wifi, WifiOff, CheckCircle2, XCircle } from 'lucide-react';
 import { useStore } from '../store/useStore';
 import axios from 'axios';
@@ -54,7 +54,7 @@ const SyncPage = () => {
 
       {/* Status */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        <motion.div
+        <m.div
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
           className="card"
@@ -73,9 +73,9 @@ const SyncPage = () => {
               </div>
             )}
           </div>
-        </motion.div>
+        </m.div>
 
-        <motion.div
+        <m.div
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ delay: 0.1 }}
@@ -100,11 +100,11 @@ const SyncPage = () => {
               </span>
             </div>
           </div>
-        </motion.div>
+        </m.div>
       </div>
 
       {/* Actions */}
-      <motion.div
+      <m.div
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ delay: 0.2 }}
@@ -124,12 +124,12 @@ const SyncPage = () => {
           >
             {syncing ? (
               <>
-                <motion.div
+                <m.div
                   animate={{ rotate: 360 }}
                   transition={{ duration: 1, repeat: Infinity, ease: 'linear' }}
                 >
                   <RefreshCw className="w-5 h-5" />
-                </motion.div>
+                </m.div>
                 Synchronisation...
               </>
             ) : (
@@ -140,7 +140,7 @@ const SyncPage = () => {
             )}
           </button>
         </div>
-      </motion.div>
+      </m.div>
     </div>
   );
 };

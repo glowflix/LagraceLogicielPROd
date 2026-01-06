@@ -1,7 +1,8 @@
-import { useEffect, useState, useMemo } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
-import { Search, Receipt, Printer, Eye, Calendar, ChevronLeft, ChevronRight, Package, X, ChevronDown, ChevronUp, Clock, DollarSign, User, Cloud, CloudOff, CheckCircle, AlertCircle } from 'lucide-react';
-import { useStore } from '../store/useStore';
+import { useEffect, useState, useMemo, useCallback, memo, useRef } from 'react';
+import { m, AnimatePresence } from 'framer-motion';
+import { Search, Receipt, Printer, Eye, Calendar, ChevronLeft, ChevronRight, Package, X, ChevronDown, ChevronUp, Clock, DollarSign, User, Cloud, CloudOff, CheckCircle, AlertCircle, Trash2 } from 'lucide-react';
+import { useOfflineSales } from '../hooks/useOfflineFirst';
+import VirtualList from '../components/VirtualList';
 import axios from 'axios';
 import { format, startOfMonth, endOfMonth, parseISO, getHours, getMinutes } from 'date-fns';
 import { fr } from 'date-fns/locale';
@@ -10,26 +11,68 @@ import { fr } from 'date-fns/locale';
 const API_URL = import.meta.env.DEV ? '' : (import.meta.env.VITE_API_URL || '');
 
 /**
- * Convertit unit_level en texte lisible
+ * Convertit unit_level en texte lisible avec icône
  * unit_level peut être: 'MILLIER', 'CARTON', 'PIECE' (string) ou 1, 2, 3 (number)
  */
-const formatUnitLevel = (unitLevel) => {
-  if (!unitLevel) return 'Pièce';
+const formatUnitLevel = (unitLevel, withIcon = false) => {
+  if (!unitLevel) return withIcon ? '📦 Pièce' : 'Pièce';
   
   const normalized = String(unitLevel).toUpperCase().trim();
   
-  if (normalized === 'MILLIER' || normalized === '1' || normalized === 'MILLIERS') {
-    return 'Millier';
+  if (normalized === 'MILLIER' || normalized === '1' || normalized === 'MILLIERS' || normalized === 'DETAIL') {
+    return withIcon ? '📦 Millier' : 'Millier';
   }
   if (normalized === 'CARTON' || normalized === '2' || normalized === 'CARTONS') {
-    return 'Carton';
+    return withIcon ? '🗃️ Carton' : 'Carton';
   }
   if (normalized === 'PIECE' || normalized === '3' || normalized === 'PIÈCE' || normalized === 'PIECES') {
-    return 'Pièce';
+    return withIcon ? '🎯 Pièce' : 'Pièce';
   }
   
   // Fallback: retourner la valeur telle quelle si non reconnue
-  return normalized;
+  return withIcon ? `📦 ${normalized}` : normalized;
+};
+
+/**
+ * Obtient la couleur CSS pour un type d'unité
+ */
+const getUnitColor = (unitLevel) => {
+  if (!unitLevel) return 'text-gray-400';
+  
+  const normalized = String(unitLevel).toUpperCase().trim();
+  
+  if (normalized === 'MILLIER' || normalized === '1' || normalized === 'MILLIERS' || normalized === 'DETAIL') {
+    return 'text-amber-400';
+  }
+  if (normalized === 'CARTON' || normalized === '2' || normalized === 'CARTONS') {
+    return 'text-blue-400';
+  }
+  if (normalized === 'PIECE' || normalized === '3' || normalized === 'PIÈCE' || normalized === 'PIECES') {
+    return 'text-green-400';
+  }
+  
+  return 'text-gray-400';
+};
+
+/**
+ * Obtient les classes CSS de badge pour un type d'unité
+ */
+const getUnitBadgeClass = (unitLevel) => {
+  if (!unitLevel) return 'badge-ghost';
+  
+  const normalized = String(unitLevel).toUpperCase().trim();
+  
+  if (normalized === 'MILLIER' || normalized === '1' || normalized === 'MILLIERS' || normalized === 'DETAIL') {
+    return 'badge bg-amber-500/20 text-amber-400 border-amber-500/30';
+  }
+  if (normalized === 'CARTON' || normalized === '2' || normalized === 'CARTONS') {
+    return 'badge bg-blue-500/20 text-blue-400 border-blue-500/30';
+  }
+  if (normalized === 'PIECE' || normalized === '3' || normalized === 'PIÈCE' || normalized === 'PIECES') {
+    return 'badge bg-green-500/20 text-green-400 border-green-500/30';
+  }
+  
+  return 'badge-ghost';
 };
 
 /**
@@ -43,61 +86,218 @@ const isUnitValue = (value) => {
          normalized === 'piece' || normalized === 'pièce' || normalized === 'pieces';
 };
 
+// Composant de ligne de vente memoizé
+const SaleRow = memo(({ sale, index, printStatuses, onSelect, onPrint, onDelete, deleting }) => {
+  const printStatus = printStatuses[sale.invoice_number];
+  const status = printStatus?.status || 'none';
+  
+  return (
+    <div
+      className="p-4 glass rounded-lg hover:bg-white/5 transition-all cursor-pointer"
+      onClick={() => onSelect(sale)}
+    >
+      <div className="flex items-center justify-between">
+        <div className="flex-1">
+          <div className="flex items-center gap-3 mb-2">
+            <User className="w-5 h-5 text-primary-400" />
+            <div className="flex flex-col">
+              <span className="font-semibold text-lg text-gray-200">
+                {sale.client_name || 'Client'}
+              </span>
+              <span className="text-xs text-gray-400 flex items-center gap-1 mt-0.5">
+                <Receipt className="w-3 h-3 text-primary-400" />
+                {sale.invoice_number}
+              </span>
+            </div>
+            {sale.duplicateCount > 1 && (
+              <span className="badge badge-warning" title={`${sale.duplicateCount} articles dans cette facture`}>
+                <Package className="w-3 h-3 inline mr-1" />
+                {sale.duplicateCount} article{sale.duplicateCount > 1 ? 's' : ''}
+              </span>
+            )}
+            <span
+              className={`badge ${
+                sale.status === 'paid'
+                  ? 'badge-success'
+                  : sale.status === 'void'
+                  ? 'badge-error'
+                  : 'badge-warning'
+              }`}
+            >
+              {sale.status === 'paid'
+                ? 'Payé'
+                : sale.status === 'void'
+                ? 'Annulé'
+                : 'En attente'}
+            </span>
+            <span
+              className={`badge ${
+                sale.synced_at
+                  ? 'badge-success'
+                  : 'badge-warning'
+              }`}
+              title={sale.synced_at ? `Synchronisé le ${format(new Date(sale.synced_at), 'dd/MM/yyyy HH:mm', { locale: fr })}` : 'En attente de synchronisation'}
+            >
+              {sale.synced_at ? (
+                <>
+                  <Cloud className="w-3 h-3 inline mr-1" />
+                  Sync
+                </>
+              ) : (
+                <>
+                  <CloudOff className="w-3 h-3 inline mr-1" />
+                  Sync
+                </>
+              )}
+            </span>
+            <span
+              className={`badge ${
+                status === 'printed'
+                  ? 'badge-success'
+                  : status === 'error'
+                  ? 'badge-error'
+                  : status === 'processing'
+                  ? 'badge-info'
+                  : 'badge-warning'
+              }`}
+              title={
+                status === 'printed' ? 'Imprimé' :
+                status === 'error' ? `Erreur: ${printStatus?.last_error || ''}` :
+                status === 'processing' ? 'En cours d\'impression...' :
+                'En attente d\'impression'
+              }
+            >
+              {status === 'printed' ? (
+                <>
+                  <CheckCircle className="w-3 h-3 inline mr-1" />
+                  Print
+                </>
+              ) : status === 'error' ? (
+                <>
+                  <AlertCircle className="w-3 h-3 inline mr-1" />
+                  Print
+                </>
+              ) : (
+                <>
+                  <Printer className="w-3 h-3 inline mr-1" />
+                  Print
+                </>
+              )}
+            </span>
+          </div>
+          <div className="flex items-center gap-4 text-sm text-gray-400">
+            <span className="flex items-center gap-1">
+              <Calendar className="w-4 h-4" />
+              {format(new Date(sale.sold_at), 'dd MMM yyyy HH:mm', {
+                locale: fr,
+              })}
+            </span>
+            {sale.seller_name && !isUnitValue(sale.seller_name) && (
+              <span>Vendeur: {sale.seller_name}</span>
+            )}
+          </div>
+        </div>
+        <div className="text-right mr-4">
+          <p className="text-xl font-bold text-primary-400">
+            {sale.total_fc.toLocaleString()} FC
+          </p>
+          <p className="text-sm text-gray-400">
+            {sale.payment_mode === 'cash' ? 'Cash' : 'Dette'}
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onPrint(sale.invoice_number);
+            }}
+            className="p-2 glass rounded-lg hover:bg-white/10"
+            title="Imprimer"
+          >
+            <Printer className="w-5 h-5 text-gray-400" />
+          </button>
+          <button
+            onClick={(e) => onDelete(sale.invoice_number, e)}
+            disabled={deleting === sale.invoice_number}
+            className={`p-2 glass rounded-lg transition-colors ${
+              deleting === sale.invoice_number 
+                ? 'bg-red-900/50 cursor-not-allowed' 
+                : 'hover:bg-red-600/30'
+            }`}
+            title="Supprimer et restaurer le stock"
+          >
+            <Trash2 className={`w-5 h-5 ${
+              deleting === sale.invoice_number 
+                ? 'text-red-300 animate-pulse' 
+                : 'text-red-400 hover:text-red-300'
+            }`} />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+});
+
+SaleRow.displayName = 'SaleRow';
+
 const SalesHistory = () => {
-  const { sales, loadSales } = useStore();
+  const isMountedRef = useRef(true);
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  // Par défaut, afficher le mois actuel
+  const today = new Date();
+  const [currentDisplayDate, setCurrentDisplayDate] = useState(today);
   const [searchQuery, setSearchQuery] = useState('');
-  const [loading, setLoading] = useState(true);
   const [searchAllMonths, setSearchAllMonths] = useState(false);
   const [selectedSale, setSelectedSale] = useState(null);
   const [saleDetails, setSaleDetails] = useState(null);
   const [loadingDetails, setLoadingDetails] = useState(false);
   const [expandedItems, setExpandedItems] = useState(false);
   const [printStatuses, setPrintStatuses] = useState({});
+  const [deleting, setDeleting] = useState(null);
 
-  // Par défaut, afficher le mois actuel
-  const today = new Date();
-  const [currentDisplayDate, setCurrentDisplayDate] = useState(today);
-
-  useEffect(() => {
-    if (!searchQuery || !searchAllMonths) {
-      loadSalesData();
+  // Calculer les filtres pour useOfflineSales
+  const filters = useMemo(() => {
+    if (searchAllMonths && searchQuery) {
+      return {}; // Toutes les ventes
     }
-  }, [currentDisplayDate]); // Recharger quand le mois affiché change
+    
+    const startOfSelectedMonth = startOfMonth(currentDisplayDate);
+    const endOfSelectedMonth = endOfMonth(currentDisplayDate);
+    const fromDate = format(startOfSelectedMonth, 'yyyy-MM-dd') + 'T00:00:00.000Z';
+    const toDate = format(endOfSelectedMonth, 'yyyy-MM-dd') + 'T23:59:59.999Z';
+    
+    return {
+      from: fromDate,
+      to: toDate,
+      exclude_status: 'pending',
+    };
+  }, [currentDisplayDate, searchAllMonths, searchQuery]);
 
-  // Charger toutes les ventes si recherche globale activée
-  useEffect(() => {
-    if (searchQuery && searchAllMonths) {
-      loadAllSales();
-    }
-  }, [searchQuery, searchAllMonths]);
+  // Utiliser useOfflineSales pour données locales instantanées
+  const { data: sales = [], loading, refresh } = useOfflineSales(filters, {
+    refetchOnMount: true,
+  });
 
   // Grouper les ventes par (client_name, invoice_number) et limiter à 50
   const uniqueSales = useMemo(() => {
     // IMPORTANT: Filtrer les ventes avec status='pending' (ne pas les afficher)
-    // Ces ventes sont en attente de synchronisation et ne doivent pas apparaître dans l'historique
     let salesToProcess = sales.filter((sale) => sale.status !== 'pending');
     
-    // D'abord, filtrer par mois si recherche globale désactivée
-    if (!searchQuery || !searchAllMonths) {
-      const startOfSelectedMonth = startOfMonth(currentDisplayDate);
-      const endOfSelectedMonth = endOfMonth(currentDisplayDate);
-      const startTime = startOfSelectedMonth.getTime();
-      const endTime = endOfSelectedMonth.getTime();
-
-      salesToProcess = salesToProcess.filter((sale) => {
-        if (!sale.sold_at) return false;
-        const saleDate = parseISO(sale.sold_at).getTime();
-        return saleDate >= startTime && saleDate <= endTime;
-      });
-    }
-
     // Appliquer le filtre de recherche
-    const filtered = salesToProcess.filter(
-      (sale) =>
-        sale.invoice_number.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        (sale.client_name &&
-          sale.client_name.toLowerCase().includes(searchQuery.toLowerCase()))
-    );
+    const filtered = searchQuery
+      ? salesToProcess.filter(
+          (sale) =>
+            sale.invoice_number?.toLowerCase().includes(searchQuery.toLowerCase()) ||
+            (sale.client_name &&
+              sale.client_name.toLowerCase().includes(searchQuery.toLowerCase()))
+        )
+      : salesToProcess;
 
     // Grouper par (client_name, invoice_number)
     const groupedMap = new Map();
@@ -135,7 +335,7 @@ const SalesHistory = () => {
 
     // Limiter à 50 ventes uniques
     return uniqueSalesArray.slice(0, 50);
-  }, [sales, searchQuery, currentDisplayDate, searchAllMonths]);
+  }, [sales, searchQuery]);
 
   // Charger les détails de la vente sélectionnée
   useEffect(() => {
@@ -144,102 +344,90 @@ const SalesHistory = () => {
     }
   }, [selectedSale]);
 
-  // Charger les statuts d'impression pour toutes les ventes
+  // Charger les statuts d'impression pour toutes les ventes (en arrière-plan)
   useEffect(() => {
+    if (uniqueSales.length === 0) return;
+    
+    // Charger les statuts en batch pour éviter trop de requêtes
     const loadPrintStatuses = async () => {
-      if (uniqueSales.length === 0) return;
+      if (!isMountedRef.current) return;
       const statuses = {};
-      for (const sale of uniqueSales.slice(0, 50)) {
+      const promises = uniqueSales.slice(0, 50).map(async (sale) => {
         try {
-          const response = await axios.get(`${API_URL}/api/print/status/${sale.invoice_number}`);
+          const response = await axios.get(`${API_URL}/api/print/status/${sale.invoice_number}`, {
+            timeout: 2000,
+          });
           statuses[sale.invoice_number] = response.data;
         } catch {
           statuses[sale.invoice_number] = { status: 'none' };
         }
-      }
-      setPrintStatuses(statuses);
-    };
-    if (!loading && uniqueSales.length > 0) {
-      loadPrintStatuses();
-    }
-  }, [uniqueSales, loading]);
-
-  const loadSalesData = async () => {
-    setLoading(true);
-    try {
-      // Calculer le début et la fin du mois sélectionné
-      const startOfSelectedMonth = startOfMonth(currentDisplayDate);
-      const endOfSelectedMonth = endOfMonth(currentDisplayDate);
-
-      // Formater les dates au format ISO pour l'API
-      const fromDate = format(startOfSelectedMonth, 'yyyy-MM-dd') + 'T00:00:00.000Z';
-      const toDate = format(endOfSelectedMonth, 'yyyy-MM-dd') + 'T23:59:59.999Z';
-
-      console.log(`📅 Chargement des ventes pour le mois: ${format(currentDisplayDate, 'MMMM yyyy', { locale: fr })}`);
-      console.log(`   Du: ${fromDate} au: ${toDate}`);
-
-      // Charger les ventes pour ce mois uniquement
-      await loadSales({
-        from: fromDate,
-        to: toDate
       });
-    } catch (error) {
-      console.error('Erreur chargement ventes:', error);
-    } finally {
-      setLoading(false);
-    }
-  };
+      
+      await Promise.allSettled(promises);
 
-  const loadAllSales = async () => {
-    setLoading(true);
-    try {
-      // Charger toutes les ventes sans filtre de date
-      await loadSales({});
-    } catch (error) {
-      console.error('Erreur chargement toutes les ventes:', error);
-    } finally {
-      setLoading(false);
+      if (isMountedRef.current) {
+        setPrintStatuses(statuses);
+      }
+    };
+    
+    // Utiliser requestIdleCallback si disponible pour ne pas bloquer l'UI
+    let idleId = null;
+    let timeoutId = null;
+    if (window.requestIdleCallback) {
+      idleId = window.requestIdleCallback(loadPrintStatuses, { timeout: 2000 });
+    } else {
+      timeoutId = setTimeout(loadPrintStatuses, 100);
     }
-  };
+
+    return () => {
+      if (idleId != null) window.cancelIdleCallback?.(idleId);
+      if (timeoutId != null) clearTimeout(timeoutId);
+    };
+  }, [uniqueSales]);
 
   const loadSaleDetails = async (invoiceNumber) => {
+    if (!isMountedRef.current) return;
     setLoadingDetails(true);
     try {
       const response = await axios.get(`${API_URL}/api/sales/${invoiceNumber}`);
-      setSaleDetails(response.data);
+      if (isMountedRef.current) {
+        setSaleDetails(response.data);
+      }
     } catch (error) {
       console.error('Erreur chargement détails:', error);
     } finally {
-      setLoadingDetails(false);
+      if (isMountedRef.current) {
+        setLoadingDetails(false);
+      }
     }
   };
 
-  const handlePreviousMonth = () => {
+  const handlePreviousMonth = useCallback(() => {
     setCurrentDisplayDate(prev => {
       const newDate = new Date(prev);
       newDate.setMonth(newDate.getMonth() - 1);
       return newDate;
     });
-  };
+  }, []);
 
-  const handleNextMonth = () => {
+  const handleNextMonth = useCallback(() => {
     setCurrentDisplayDate(prev => {
       const newDate = new Date(prev);
       newDate.setMonth(newDate.getMonth() + 1);
       return newDate;
     });
-  };
+  }, []);
 
-  const handleToday = () => {
+  const handleToday = useCallback(() => {
     setCurrentDisplayDate(new Date());
     setSearchAllMonths(false);
-  };
+  }, []);
 
-  const handleMonthChange = (e) => {
+  const handleMonthChange = useCallback((e) => {
     const selectedDate = new Date(e.target.value + '-01');
     setCurrentDisplayDate(selectedDate);
     setSearchAllMonths(false);
-  };
+  }, []);
 
   // Calculer les statistiques du mois
   const monthStats = useMemo(() => {
@@ -267,7 +455,13 @@ const SalesHistory = () => {
     return { hours, currentHour: hour, currentMinute: minute };
   }, [saleDetails]);
 
-  const handlePrint = async (invoiceNumber) => {
+  const closeModal = useCallback(() => {
+    setSelectedSale(null);
+    setSaleDetails(null);
+    setExpandedItems(false);
+  }, []);
+
+  const handlePrint = useCallback(async (invoiceNumber) => {
     try {
       await axios.post(`${API_URL}/api/sales/${invoiceNumber}/print`);
       // Optionnel: notification de succès
@@ -275,18 +469,87 @@ const SalesHistory = () => {
       console.error('Erreur impression:', error);
       alert('Erreur lors de l\'impression');
     }
-  };
+  }, []);
 
-  const handleSaleClick = (sale) => {
+  // ✅ Supprimer une vente et restaurer le stock
+  const handleDeleteSale = useCallback(async (invoiceNumber, e) => {
+    e?.stopPropagation();
+    
+    console.log(`🗑️ [SalesHistory] Demande suppression: "${invoiceNumber}"`);
+    
+    if (!invoiceNumber) {
+      console.error('❌ Invoice number manquant!');
+      return;
+    }
+    
+    // Message de confirmation plus détaillé
+    const confirmMsg = `🗑️ Supprimer la facture ${invoiceNumber} ?
+
+Cette action va :
+• Restaurer le stock de tous les articles
+• Synchroniser les modifications avec Google Sheets
+• Supprimer définitivement la facture
+
+Continuer ?`;
+    
+    if (!confirm(confirmMsg)) {
+      console.log('   ❌ Suppression annulée par utilisateur');
+      return;
+    }
+    
+    setDeleting(invoiceNumber);
+    
+    try {
+      // Encoder l'invoice number pour l'URL
+      const encodedInvoice = encodeURIComponent(invoiceNumber);
+      console.log(`   📤 DELETE ${API_URL}/api/sales/${encodedInvoice}`);
+      
+      const response = await axios.delete(`${API_URL}/api/sales/${encodedInvoice}`);
+      
+      console.log(`   📥 Réponse:`, response.data);
+      
+      if (response.data.success) {
+        // Log détaillé des restaurations de stock
+        if (response.data.stockRestored && response.data.stockRestored.length > 0) {
+          console.log(`✅ Facture supprimée, stock restauré:`);
+          response.data.stockRestored.forEach((item) => {
+            console.log(`   📦 ${item.product}: +${item.restored} ${formatUnitLevel(item.unit)} (${item.stock_before} → ${item.stock_after})`);
+          });
+        } else {
+          console.log(`✅ Facture supprimée (aucun stock à restaurer)`);
+        }
+        
+        // Fermer le modal si ouvert
+        if (selectedSale?.invoice_number === invoiceNumber) {
+          closeModal();
+        }
+        
+        // Recharger les ventes
+        refresh();
+        
+        // Notification de succès (optionnel)
+        const restoredCount = response.data.stockRestored?.length || 0;
+        if (restoredCount > 0) {
+          console.log(`🎉 ${restoredCount} produit(s) restauré(s) - Sync en attente`);
+        }
+      } else {
+        console.error('❌ Erreur serveur:', response.data.error);
+        alert(`Erreur: ${response.data.error || 'Erreur inconnue'}`);
+      }
+    } catch (error) {
+      console.error('❌ Erreur suppression:', error);
+      console.error('   Status:', error.response?.status);
+      console.error('   Data:', error.response?.data);
+      alert(`Erreur lors de la suppression:\n${error.response?.data?.error || error.message}`);
+    } finally {
+      setDeleting(null);
+    }
+  }, [refresh, selectedSale, closeModal]);
+
+  const handleSaleClick = useCallback((sale) => {
     setSelectedSale(sale);
     setExpandedItems(false);
-  };
-
-  const closeModal = () => {
-    setSelectedSale(null);
-    setSaleDetails(null);
-    setExpandedItems(false);
-  };
+  }, []);
 
   return (
     <div className="space-y-6">
@@ -394,7 +657,7 @@ const SalesHistory = () => {
       <div className="card">
         {loading ? (
           <div className="text-center py-12">
-            <motion.div
+            <m.div
               animate={{ rotate: 360 }}
               transition={{ duration: 1, repeat: Infinity, ease: 'linear' }}
               className="w-12 h-12 border-4 border-primary-500 border-t-transparent rounded-full mx-auto"
@@ -402,7 +665,7 @@ const SalesHistory = () => {
             <p className="mt-4 text-gray-400">Chargement des ventes...</p>
           </div>
         ) : uniqueSales.length > 0 ? (
-          <div className="space-y-3">
+          <div>
             <div className="flex items-center justify-between mb-4 pb-2 border-b border-gray-700">
               <p className="text-sm text-gray-400">
                 Affichage de <span className="font-semibold text-gray-200">{uniqueSales.length}</span> vente(s) unique(s)
@@ -412,147 +675,25 @@ const SalesHistory = () => {
                 <p className="text-xs text-gray-500">Limité aux 50 plus récentes</p>
               )}
             </div>
-            {uniqueSales.map((sale, index) => (
-              <motion.div
-                key={`${sale.client_name}_${sale.invoice_number}_${sale.id}`}
-                initial={{ opacity: 0, y: 20 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ delay: index * 0.05 }}
-                className="p-4 glass rounded-lg hover:bg-white/5 transition-all cursor-pointer"
-                onClick={() => handleSaleClick(sale)}
-              >
-                <div className="flex items-center justify-between">
-                  <div className="flex-1">
-                    <div className="flex items-center gap-3 mb-2">
-                      <User className="w-5 h-5 text-primary-400" />
-                      <div className="flex flex-col">
-                        <span className="font-semibold text-lg text-gray-200">
-                          {sale.client_name || 'Client'}
-                        </span>
-                        <span className="text-xs text-gray-400 flex items-center gap-1 mt-0.5">
-                          <Receipt className="w-3 h-3 text-primary-400" />
-                          {sale.invoice_number}
-                        </span>
-                      </div>
-                      {sale.duplicateCount > 1 && (
-                        <span className="badge badge-warning" title={`${sale.duplicateCount} articles dans cette facture`}>
-                          <Package className="w-3 h-3 inline mr-1" />
-                          {sale.duplicateCount} article{sale.duplicateCount > 1 ? 's' : ''}
-                        </span>
-                      )}
-                      <span
-                        className={`badge ${
-                          sale.status === 'paid'
-                            ? 'badge-success'
-                            : sale.status === 'void'
-                            ? 'badge-error'
-                            : 'badge-warning'
-                        }`}
-                      >
-                        {sale.status === 'paid'
-                          ? 'Payé'
-                          : sale.status === 'void'
-                          ? 'Annulé'
-                          : 'En attente'}
-                      </span>
-                      {/* Badge Sync */}
-                      <span
-                        className={`badge ${
-                          sale.synced_at
-                            ? 'badge-success'
-                            : 'badge-warning'
-                        }`}
-                        title={sale.synced_at ? `Synchronisé le ${format(new Date(sale.synced_at), 'dd/MM/yyyy HH:mm', { locale: fr })}` : 'En attente de synchronisation'}
-                      >
-                        {sale.synced_at ? (
-                          <>
-                            <Cloud className="w-3 h-3 inline mr-1" />
-                            Sync
-                          </>
-                        ) : (
-                          <>
-                            <CloudOff className="w-3 h-3 inline mr-1" />
-                            Sync
-                          </>
-                        )}
-                      </span>
-                      {/* Badge Print */}
-                      {(() => {
-                        const printStatus = printStatuses[sale.invoice_number];
-                        const status = printStatus?.status || 'none';
-                        return (
-                          <span
-                            className={`badge ${
-                              status === 'printed'
-                                ? 'badge-success'
-                                : status === 'error'
-                                ? 'badge-error'
-                                : status === 'processing'
-                                ? 'badge-info'
-                                : 'badge-warning'
-                            }`}
-                            title={
-                              status === 'printed' ? 'Imprimé' :
-                              status === 'error' ? `Erreur: ${printStatus?.last_error || ''}` :
-                              status === 'processing' ? 'En cours d\'impression...' :
-                              'En attente d\'impression'
-                            }
-                          >
-                            {status === 'printed' ? (
-                              <>
-                                <CheckCircle className="w-3 h-3 inline mr-1" />
-                                Print
-                              </>
-                            ) : status === 'error' ? (
-                              <>
-                                <AlertCircle className="w-3 h-3 inline mr-1" />
-                                Print
-                              </>
-                            ) : (
-                              <>
-                                <Printer className="w-3 h-3 inline mr-1" />
-                                Print
-                              </>
-                            )}
-                          </span>
-                        );
-                      })()}
-                    </div>
-                    <div className="flex items-center gap-4 text-sm text-gray-400">
-                      <span className="flex items-center gap-1">
-                        <Calendar className="w-4 h-4" />
-                        {format(new Date(sale.sold_at), 'dd MMM yyyy HH:mm', {
-                          locale: fr,
-                        })}
-                      </span>
-                      {sale.seller_name && !isUnitValue(sale.seller_name) && (
-                        <span>Vendeur: {sale.seller_name}</span>
-                      )}
-                    </div>
-                  </div>
-                  <div className="text-right mr-4">
-                    <p className="text-xl font-bold text-primary-400">
-                      {sale.total_fc.toLocaleString()} FC
-                    </p>
-                    <p className="text-sm text-gray-400">
-                      {sale.payment_mode === 'cash' ? 'Cash' : 'Dette'}
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handlePrint(sale.invoice_number);
-                      }}
-                      className="p-2 glass rounded-lg hover:bg-white/10"
-                      title="Imprimer"
-                    >
-                      <Printer className="w-5 h-5 text-gray-400" />
-                    </button>
-                  </div>
-                </div>
-              </motion.div>
-            ))}
+            <VirtualList
+              items={uniqueSales}
+              itemHeight={120}
+              containerHeight={600}
+              renderItem={(sale, index) => (
+                <SaleRow
+                  key={`${sale.client_name}_${sale.invoice_number}_${sale.id}`}
+                  sale={sale}
+                  index={index}
+                  printStatuses={printStatuses}
+                  onSelect={handleSaleClick}
+                  onPrint={handlePrint}
+                  onDelete={handleDeleteSale}
+                  deleting={deleting}
+                />
+              )}
+              keyExtractor={(sale) => `${sale.client_name}_${sale.invoice_number}_${sale.id}`}
+              overscan={5}
+            />
           </div>
         ) : (
           <div className="text-center py-12 text-gray-400">
@@ -573,23 +714,17 @@ const SalesHistory = () => {
       {/* Modal de détails */}
       <AnimatePresence>
         {selectedSale && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
+          <div
             className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4"
             onClick={closeModal}
           >
-            <motion.div
-              initial={{ scale: 0.9, opacity: 0 }}
-              animate={{ scale: 1, opacity: 1 }}
-              exit={{ scale: 0.9, opacity: 0 }}
+            <div
               className="bg-gray-900 rounded-xl shadow-2xl max-w-4xl w-full max-h-[90vh] overflow-y-auto"
               onClick={(e) => e.stopPropagation()}
             >
               {loadingDetails ? (
                 <div className="p-8 text-center">
-                  <motion.div
+                  <m.div
                     animate={{ rotate: 360 }}
                     transition={{ duration: 1, repeat: Infinity, ease: 'linear' }}
                     className="w-12 h-12 border-4 border-primary-500 border-t-transparent rounded-full mx-auto"
@@ -709,7 +844,7 @@ const SalesHistory = () => {
                     <div className="p-4 glass rounded-lg">
                       <button
                         onClick={() => setExpandedItems(!expandedItems)}
-                        className="flex items-center justify-between w-full mb-4"
+                        className="flex items-center justify-between w-full mb-2"
                       >
                         <div className="flex items-center gap-2">
                           <Package className="w-5 h-5 text-primary-400" />
@@ -723,10 +858,36 @@ const SalesHistory = () => {
                           <ChevronDown className="w-5 h-5 text-gray-400" />
                         )}
                       </button>
+                      
+                      {/* Résumé par unité */}
+                      {(() => {
+                        const unitSummary = saleDetails.items.reduce((acc, item) => {
+                          const unitKey = formatUnitLevel(item.unit_level);
+                          if (!acc[unitKey]) {
+                            acc[unitKey] = { qty: 0, total: 0, unitLevel: item.unit_level };
+                          }
+                          acc[unitKey].qty += item.qty || 0;
+                          acc[unitKey].total += item.subtotal_fc || 0;
+                          return acc;
+                        }, {});
+                        
+                        return (
+                          <div className="flex flex-wrap gap-2 mb-3">
+                            {Object.entries(unitSummary).map(([unit, data]) => (
+                              <span 
+                                key={unit} 
+                                className={`${getUnitBadgeClass(data.unitLevel)} px-2 py-1`}
+                              >
+                                {data.qty} {unit}
+                              </span>
+                            ))}
+                          </div>
+                        );
+                      })()}
 
                       <AnimatePresence>
                         {expandedItems && (
-                          <motion.div
+                          <m.div
                             initial={{ height: 0, opacity: 0 }}
                             animate={{ height: 'auto', opacity: 1 }}
                             exit={{ height: 0, opacity: 0 }}
@@ -736,42 +897,57 @@ const SalesHistory = () => {
                               {saleDetails.items.map((item, idx) => (
                                 <div
                                   key={item.id || idx}
-                                  className="p-3 bg-gray-800/50 rounded-lg flex items-center justify-between"
+                                  className="p-3 bg-gray-800/50 rounded-lg flex items-center justify-between hover:bg-gray-800/70 transition-colors"
                                 >
                                   <div className="flex-1">
-                                    <p className="font-semibold text-gray-200">{item.product_name || item.product_code}</p>
-                                    <div className="flex items-center gap-4 text-sm text-gray-400 mt-1">
-                                      <span>Code: {item.product_code}</span>
-                                      <span>
-                                        Qté: {item.qty} {item.qty_label || ''}
+                                    <div className="flex items-center gap-2">
+                                      <p className="font-semibold text-gray-200">{item.product_name || item.product_code}</p>
+                                      <span className={getUnitBadgeClass(item.unit_level)}>
+                                        {formatUnitLevel(item.unit_level)}
                                       </span>
-                                      <span>
-                                        Unité: {formatUnitLevel(item.unit_level)}
-                                      </span>
-                                      {item.unit_mark && (
-                                        <span className="badge badge-info">{item.unit_mark}</span>
+                                      {item.unit_mark && item.unit_mark !== formatUnitLevel(item.unit_level) && (
+                                        <span className="badge badge-ghost text-xs">{item.unit_mark}</span>
                                       )}
+                                    </div>
+                                    <div className="flex items-center gap-4 text-sm text-gray-400 mt-1">
+                                      <span className="font-mono text-gray-500">#{item.product_code}</span>
+                                      <span className={`font-medium ${getUnitColor(item.unit_level)}`}>
+                                        {item.qty} {item.qty_label || formatUnitLevel(item.unit_level)}
+                                      </span>
                                     </div>
                                   </div>
                                   <div className="text-right">
                                     <p className="font-semibold text-primary-400">
                                       {item.subtotal_fc?.toLocaleString() || 0} FC
                                     </p>
-                                    <p className="text-sm text-gray-400">
-                                      {item.unit_price_fc?.toLocaleString() || 0} FC/u
+                                    <p className="text-sm text-gray-500">
+                                      @ {item.unit_price_fc?.toLocaleString() || 0} FC
                                     </p>
                                   </div>
                                 </div>
                               ))}
                             </div>
-                          </motion.div>
+                          </m.div>
                         )}
                       </AnimatePresence>
                     </div>
                   )}
 
                   {/* Actions */}
-                  <div className="flex items-center justify-end gap-3 pt-4 border-t border-gray-700">
+                  <div className="flex items-center justify-between pt-4 border-t border-gray-700">
+                    <button
+                      onClick={() => handleDeleteSale(saleDetails.invoice_number)}
+                      disabled={deleting === saleDetails.invoice_number}
+                      className={`btn flex items-center gap-2 ${
+                        deleting === saleDetails.invoice_number 
+                          ? 'btn-disabled bg-red-900/50' 
+                          : 'btn-error bg-red-600/20 hover:bg-red-600/40 text-red-400'
+                      }`}
+                      title="Supprimer et restaurer le stock"
+                    >
+                      <Trash2 className={`w-5 h-5 ${deleting === saleDetails.invoice_number ? 'animate-pulse' : ''}`} />
+                      {deleting === saleDetails.invoice_number ? 'Suppression...' : 'Supprimer'}
+                    </button>
                     <button
                       onClick={() => handlePrint(saleDetails.invoice_number)}
                       className="btn btn-primary flex items-center gap-2"
@@ -789,8 +965,8 @@ const SalesHistory = () => {
                   </button>
                 </div>
               )}
-            </motion.div>
-          </motion.div>
+            </div>
+          </div>
         )}
       </AnimatePresence>
     </div>

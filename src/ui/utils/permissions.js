@@ -6,6 +6,15 @@
  * - Vendeur : OUI = accès ventes + historique
  * - Gerent Stock : OUI = accès produits (stock)
  * - Porudits est Vender : OUI = accès produits + ventes + historique
+ * - is_active : OUI = compte actif, NON = compte bloqué
+ * 
+ * RÈGLES D'ACCÈS:
+ * - Admin : Accès à TOUT, peut créer/modifier/bloquer des comptes
+ * - Licences (LICENSE_ONLY) : Même accès qu'Admin
+ * - Vendeur seulement : Accès uniquement à la page Ventes
+ * - Gérant Stock : Accès à Ventes + Produits (peut modifier stock)
+ * - Vendeur + Gérant Stock : Accès à Ventes + Produits
+ * - Compte bloqué (is_active = false) : Message "Compte bloqué - Contactez La Grâce"
  */
 
 /**
@@ -23,6 +32,7 @@ export const PERMISSIONS = {
   SYNC: 'canAccessSync',
   LICENSE: 'canAccessLicense',
   DASHBOARD: 'canAccessDashboard',
+  NEW_ARRIVAGE: 'canAccessNewArrivage',
   
   // Actions sur les produits
   MANAGE_PRODUCTS: 'canManageProducts',
@@ -45,6 +55,33 @@ export const PERMISSIONS = {
  */
 export const ROLE_PERMISSIONS = {
   /**
+   * BLOCKED - Compte bloqué (is_active = false)
+   * Aucun accès - Afficher message "Compte bloqué"
+   */
+  BLOCKED: {
+    [PERMISSIONS.SALES_POS]: false,
+    [PERMISSIONS.SALES_HISTORY]: false,
+    [PERMISSIONS.PRODUCTS]: false,
+    [PERMISSIONS.USERS]: false,
+    [PERMISSIONS.DEBTS]: false,
+    [PERMISSIONS.ANALYTICS]: false,
+    [PERMISSIONS.SETTINGS]: false,
+    [PERMISSIONS.SYNC]: false,
+    [PERMISSIONS.LICENSE]: false,
+    [PERMISSIONS.DASHBOARD]: false,
+    [PERMISSIONS.NEW_ARRIVAGE]: false,
+    [PERMISSIONS.MANAGE_PRODUCTS]: false,
+    [PERMISSIONS.MODIFY_PRODUCT_PRICES]: false,
+    [PERMISSIONS.MODIFY_PRODUCT_STOCK]: false,
+    [PERMISSIONS.MANAGE_USERS]: false,
+    [PERMISSIONS.CREATE_USERS]: false,
+    [PERMISSIONS.BLOCK_USERS]: false,
+    [PERMISSIONS.MANAGE_SETTINGS]: false,
+    [PERMISSIONS.MANAGE_SYNC]: false,
+    [PERMISSIONS.MANAGE_LICENSE]: false,
+  },
+
+  /**
    * ADMIN (admi = OUI)
    * Accès total à toutes les pages et toutes les actions
    */
@@ -59,6 +96,7 @@ export const ROLE_PERMISSIONS = {
     [PERMISSIONS.SYNC]: true,
     [PERMISSIONS.LICENSE]: true,
     [PERMISSIONS.DASHBOARD]: true,
+    [PERMISSIONS.NEW_ARRIVAGE]: true,
     [PERMISSIONS.MANAGE_PRODUCTS]: true,
     [PERMISSIONS.MODIFY_PRODUCT_PRICES]: true,
     [PERMISSIONS.MODIFY_PRODUCT_STOCK]: true,
@@ -85,7 +123,8 @@ export const ROLE_PERMISSIONS = {
     [PERMISSIONS.SETTINGS]: false,
     [PERMISSIONS.SYNC]: false,
     [PERMISSIONS.LICENSE]: false,
-    [PERMISSIONS.DASHBOARD]: true,
+    [PERMISSIONS.DASHBOARD]: false, // Pas de dashboard, directement aux ventes
+    [PERMISSIONS.NEW_ARRIVAGE]: false,
     [PERMISSIONS.MANAGE_PRODUCTS]: false,
     [PERMISSIONS.MODIFY_PRODUCT_PRICES]: false,
     [PERMISSIONS.MODIFY_PRODUCT_STOCK]: false,
@@ -112,6 +151,7 @@ export const ROLE_PERMISSIONS = {
     [PERMISSIONS.SYNC]: false,
     [PERMISSIONS.LICENSE]: false,
     [PERMISSIONS.DASHBOARD]: true,
+    [PERMISSIONS.NEW_ARRIVAGE]: true,
     [PERMISSIONS.MANAGE_PRODUCTS]: true,
     [PERMISSIONS.MODIFY_PRODUCT_PRICES]: true,
     [PERMISSIONS.MODIFY_PRODUCT_STOCK]: true,
@@ -125,10 +165,10 @@ export const ROLE_PERMISSIONS = {
 
   /**
    * GERANT_STOCK (Gerent Stock = OUI, Vendeur = NON)
-   * Accès : Produits (stock) uniquement
+   * Accès : Produits (stock) + Ventes (lecture) uniquement
    */
   GERANT_STOCK: {
-    [PERMISSIONS.SALES_POS]: false,
+    [PERMISSIONS.SALES_POS]: true, // Peut voir les ventes
     [PERMISSIONS.SALES_HISTORY]: true, // Lecture seule pour voir les ventes
     [PERMISSIONS.PRODUCTS]: true,
     [PERMISSIONS.USERS]: false,
@@ -138,8 +178,9 @@ export const ROLE_PERMISSIONS = {
     [PERMISSIONS.SYNC]: false,
     [PERMISSIONS.LICENSE]: false,
     [PERMISSIONS.DASHBOARD]: true,
+    [PERMISSIONS.NEW_ARRIVAGE]: true,
     [PERMISSIONS.MANAGE_PRODUCTS]: true,
-    [PERMISSIONS.MODIFY_PRODUCT_PRICES]: false, // Peut-être NON selon politique
+    [PERMISSIONS.MODIFY_PRODUCT_PRICES]: false, // Ne peut pas modifier les prix
     [PERMISSIONS.MODIFY_PRODUCT_STOCK]: true,
     [PERMISSIONS.MANAGE_USERS]: false,
     [PERMISSIONS.CREATE_USERS]: false,
@@ -165,6 +206,7 @@ export const ROLE_PERMISSIONS = {
     [PERMISSIONS.SYNC]: false,
     [PERMISSIONS.LICENSE]: false,
     [PERMISSIONS.DASHBOARD]: true,
+    [PERMISSIONS.NEW_ARRIVAGE]: true,
     [PERMISSIONS.MANAGE_PRODUCTS]: true,
     [PERMISSIONS.MODIFY_PRODUCT_PRICES]: true,
     [PERMISSIONS.MODIFY_PRODUCT_STOCK]: true,
@@ -191,6 +233,7 @@ export const ROLE_PERMISSIONS = {
     [PERMISSIONS.SYNC]: false,
     [PERMISSIONS.LICENSE]: false,
     [PERMISSIONS.DASHBOARD]: true,
+    [PERMISSIONS.NEW_ARRIVAGE]: true,
     [PERMISSIONS.MANAGE_PRODUCTS]: true,
     [PERMISSIONS.MODIFY_PRODUCT_PRICES]: true,
     [PERMISSIONS.MODIFY_PRODUCT_STOCK]: true,
@@ -217,6 +260,7 @@ export const ROLE_PERMISSIONS = {
     [PERMISSIONS.SYNC]: true,
     [PERMISSIONS.LICENSE]: true,
     [PERMISSIONS.DASHBOARD]: true,
+    [PERMISSIONS.NEW_ARRIVAGE]: true,
     [PERMISSIONS.MANAGE_PRODUCTS]: true,
     [PERMISSIONS.MODIFY_PRODUCT_PRICES]: true,
     [PERMISSIONS.MODIFY_PRODUCT_STOCK]: true,
@@ -244,12 +288,35 @@ export const ROUTE_PERMISSIONS = {
   '/settings': PERMISSIONS.SETTINGS,
   '/sync': PERMISSIONS.SYNC,
   '/license': PERMISSIONS.LICENSE,
+  '/newarrivage': PERMISSIONS.NEW_ARRIVAGE,
 };
+
+/**
+ * Vérifie si un utilisateur est actif
+ * @param {Object} user - Objet utilisateur
+ * @returns {boolean} true si l'utilisateur est actif
+ */
+export function isUserActive(user) {
+  if (!user) return true; // Pas d'utilisateur = licence seulement = actif
+  const isActive = user.is_active;
+  return isActive === 1 || isActive === true || isActive === 'OUI' || isActive === 'oui' || isActive === '1';
+}
+
+/**
+ * Vérifie si un utilisateur est admin
+ * @param {Object} user - Objet utilisateur
+ * @returns {boolean} true si l'utilisateur est admin
+ */
+export function isUserAdmin(user) {
+  if (!user) return false;
+  const admin = user.is_admin;
+  return admin === 1 || admin === true || admin === 'OUI' || admin === 'oui' || admin === '1';
+}
 
 /**
  * Détermine le rôle d'un utilisateur basé sur ses flags de la table "Compter Utilisateur"
  * 
- * @param {Object} user - Objet utilisateur avec les flags : is_admin, is_vendeur, is_gerant_stock, can_manage_products
+ * @param {Object} user - Objet utilisateur avec les flags : is_admin, is_vendeur, is_gerant_stock, can_manage_products, is_active
  * @returns {string} Le rôle déterminé
  */
 export function getUserRole(user) {
@@ -257,8 +324,13 @@ export function getUserRole(user) {
     return 'LICENSE_ONLY';
   }
 
+  // 0. Vérifier si le compte est bloqué (is_active = false)
+  if (!isUserActive(user)) {
+    return 'BLOCKED';
+  }
+
   // 1. Admin = accès total
-  if (user.is_admin === 1 || user.is_admin === true || user.is_admin === 'OUI' || user.is_admin === 'oui') {
+  if (isUserAdmin(user)) {
     return 'ADMIN';
   }
 
@@ -293,6 +365,51 @@ export function getUserRole(user) {
 
   // 7. Par défaut = LICENSE_ONLY
   return 'LICENSE_ONLY';
+}
+
+/**
+ * Détermine la route de redirection selon le rôle de l'utilisateur
+ * @param {string} role - Le rôle de l'utilisateur
+ * @returns {string} La route vers laquelle rediriger
+ */
+export function getDefaultRouteForRole(role) {
+  switch (role) {
+    case 'BLOCKED':
+      return '/blocked'; // Page compte bloqué
+    case 'ADMIN':
+    case 'LICENSE_ONLY':
+      return '/dashboard'; // Admin et Licence -> Dashboard
+    case 'VENDEUR_SEULEMENT':
+      return '/sales'; // Vendeur seulement -> Ventes directement
+    case 'GERANT_STOCK':
+      return '/products'; // Gérant stock -> Produits directement
+    case 'VENDEUR_STOCK':
+    case 'VENDEUR_PRODUITS':
+      return '/sales'; // Vendeur + Stock -> Ventes (peut accéder aux 2)
+    case 'PRODUITS_SEULEMENT':
+      return '/products'; // Produits seulement -> Produits
+    default:
+      return '/sales'; // Par défaut -> Ventes
+  }
+}
+
+/**
+ * Obtient le nom du vendeur à utiliser pour les ventes
+ * @param {Object} user - Objet utilisateur
+ * @returns {string} Le nom du vendeur
+ */
+export function getSellerName(user) {
+  if (!user) {
+    return 'Admin'; // Pas d'utilisateur connecté = licence seule = Admin
+  }
+  
+  // Si c'est un admin, utiliser "Admin"
+  if (isUserAdmin(user)) {
+    return 'Admin';
+  }
+  
+  // Sinon, utiliser le username de l'utilisateur connecté
+  return user.username || user.name || 'Vendeur';
 }
 
 /**

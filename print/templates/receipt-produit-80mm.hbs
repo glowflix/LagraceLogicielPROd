@@ -4,31 +4,180 @@
 <meta charset="utf-8"/>
 <title>Ticket Produit</title>
 <style>
-  /* Taille 80mm, orientation verticale (writing-mode) */
+  /* ============================================
+     TICKET PRODUIT VERTICAL 80mm - PRO EDITION
+     Texte auto-adaptatif + jamais coupé
+     ============================================ */
+  
   @page { size: 80mm 200mm; margin: 0; }
-  html, body { margin:0; padding:0; width:80mm; background:#fff; color:#000; -webkit-print-color-adjust:exact; print-color-adjust:exact }
-  body { margin-left:auto; margin-right:auto; font-family:"Arial Black",Impact,system-ui,Arial,sans-serif; text-rendering:geometricPrecision }
-  .ticket{ width:80mm; height:200mm; overflow:hidden; display:flex; flex-direction:column; justify-content:space-between; align-items:stretch; border-left:1px solid #000; border-right:1px solid #000 }
-  .row{ display:grid; grid-template-columns:.34fr .66fr; align-items:stretch; justify-items:stretch; min-height:140mm; border-top:1px solid #000; border-bottom:1px dashed #000 }
-  .col{ display:flex; align-items:center; justify-content:center; height:100%; overflow:hidden; padding:3mm; box-sizing:border-box }
-  .col + .col{ border-left:1px solid #000 }
-  .prix,.nom{ writing-mode:vertical-rl; text-orientation:mixed; color:#000; width:100%; height:100%; display:flex; align-items:center; justify-content:center; box-sizing:border-box }
-  .prix span,.nom span{ display:block; line-height:1.08; letter-spacing:.3px; max-width:100%; max-height:100%; box-sizing:border-box; overflow:hidden }
-  .prix span{ white-space:nowrap; text-overflow:clip }
-  .nom span{ word-break:break-word; overflow-wrap:break-word; hyphens:auto; text-wrap:balance }
-  .prix span{ font-size:75px; font-weight:900 }
-  .nom  span{ font-size:85px; font-weight:800 }
-  .infos{ width:100%; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:4mm 2mm; border-top:1px solid #000; gap:2mm; min-height:60mm; box-sizing:border-box }
-  .info-row{ display:flex; align-items:center; justify-content:center; gap:2mm; width:100%; overflow:hidden; box-sizing:border-box }
-  .info-label{ font-size:18px; font-weight:700; color:#000; writing-mode:vertical-rl; text-orientation:mixed; white-space:nowrap; overflow:hidden }
-  .info-value{ font-size:22px; font-weight:900; color:#000; writing-mode:vertical-rl; text-orientation:mixed; max-width:100%; overflow:hidden; word-break:break-word; box-sizing:border-box }
+  
+  *, *::before, *::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
+  
+  html, body { 
+    margin: 0; 
+    padding: 0; 
+    width: 80mm; 
+    min-height: 200mm;
+    background: #fff; 
+    color: #000; 
+    -webkit-print-color-adjust: exact; 
+    print-color-adjust: exact;
+  }
+  
+  body { 
+    margin-left: auto; 
+    margin-right: auto; 
+    font-family: "Arial Black", Impact, system-ui, -apple-system, Arial, sans-serif; 
+    text-rendering: geometricPrecision;
+    -webkit-font-smoothing: antialiased;
+  }
+  
+  .ticket { 
+    width: 80mm; 
+    min-height: 200mm;
+    height: auto;
+    display: flex; 
+    flex-direction: column; 
+    justify-content: flex-start; 
+    align-items: stretch; 
+    border-left: 1.5px solid #000; 
+    border-right: 1.5px solid #000;
+    overflow: visible;
+  }
+  
+  /* Zone principale: Prix + Nom */
+  .row { 
+    display: grid; 
+    grid-template-columns: 0.32fr 0.68fr; 
+    align-items: stretch; 
+    justify-items: stretch; 
+    min-height: 130mm;
+    flex: 1 1 auto;
+    border-top: 1.5px solid #000; 
+    border-bottom: 1.5px dashed #000;
+  }
+  
+  .col { 
+    display: flex; 
+    align-items: center; 
+    justify-content: center; 
+    height: 100%; 
+    min-height: 130mm;
+    overflow: visible;
+    padding: 2.5mm; 
+  }
+  
+  .col + .col { 
+    border-left: 1.5px solid #000; 
+  }
+  
+  /* Texte vertical */
+  .prix, .nom { 
+    writing-mode: vertical-rl; 
+    text-orientation: mixed; 
+    color: #000; 
+    width: 100%; 
+    height: 100%; 
+    display: flex; 
+    align-items: center; 
+    justify-content: center;
+    padding: 2mm 1mm;
+  }
+  
+  .prix span, .nom span { 
+    display: block; 
+    line-height: 1.05; 
+    letter-spacing: 0.5px; 
+    text-align: center;
+    /* Empêcher la coupure du texte */
+    overflow: visible;
+    text-overflow: clip;
+    white-space: pre-wrap;
+  }
+  
+  .prix span { 
+    font-size: 68px; 
+    font-weight: 900;
+    white-space: nowrap;
+    letter-spacing: 1px;
+  }
+  
+  .nom span { 
+    font-size: 72px; 
+    font-weight: 800;
+    word-break: break-word; 
+    overflow-wrap: break-word; 
+    hyphens: auto;
+    text-wrap: balance;
+    line-height: 1.02;
+  }
+  
+  /* Zone infos (Unité, Mark, Stock) */
+  .infos { 
+    width: 100%; 
+    display: flex; 
+    flex-direction: column; 
+    align-items: center; 
+    justify-content: center; 
+    padding: 4mm 3mm 5mm; 
+    border-top: 1.5px solid #000; 
+    gap: 3mm; 
+    min-height: 55mm;
+    background: linear-gradient(180deg, rgba(0,0,0,0.02) 0%, transparent 100%);
+  }
+  
+  .info-row { 
+    display: flex; 
+    align-items: center; 
+    justify-content: center; 
+    gap: 3mm; 
+    width: 100%; 
+    overflow: visible;
+    padding: 1mm 0;
+  }
+  
+  .info-label { 
+    font-size: 16px; 
+    font-weight: 700; 
+    color: #333; 
+    writing-mode: vertical-rl; 
+    text-orientation: mixed; 
+    white-space: nowrap;
+    min-width: 20px;
+    text-align: center;
+    letter-spacing: 0.5px;
+    opacity: 0.85;
+  }
+  
+  .info-value { 
+    font-size: 20px; 
+    font-weight: 900; 
+    color: #000; 
+    writing-mode: vertical-rl; 
+    text-orientation: mixed; 
+    text-align: center;
+    word-break: break-word;
+    overflow-wrap: break-word;
+    max-width: 55mm;
+    line-height: 1.1;
+  }
+  
+  /* Séparateur visuel entre les infos */
+  .info-row + .info-row {
+    border-top: 0.5px dotted #999;
+    padding-top: 2mm;
+  }
 </style>
 </head>
 <body>
   <div class="ticket">
     <div class="row">
-      <div class="col prix"><span>{{prixFc}}</span></div>
-      <div class="col nom"><span>{{nom}}</span></div>
+      <div class="col prix"><span data-original="{{prixFc}}">{{prixFc}}</span></div>
+      <div class="col nom"><span data-original="{{nom}}">{{nom}}</span></div>
     </div>
     <div class="infos">
       <div class="info-row">
@@ -47,131 +196,186 @@
       </div>
     </div>
   </div>
+  
   <script>
-    function growToFit(el, opts) {
-      const span = el.querySelector('span') || el;
-      if (!span || !el) return;
-      
-      const hardMax = (opts && opts.max) || 120;
-      const min = (opts && opts.min) || 24;
-      let size = parseFloat(getComputedStyle(span).fontSize) || 75;
-      let guard = 0;
-      
-      // Réduire agressivement si trop grand (avec marge de sécurité)
-      while (guard++ < 300) {
-        span.style.fontSize = size + 'px';
-        // Force reflow
-        void span.offsetHeight;
-        
-        const scrollH = span.scrollHeight || 0;
-        const scrollW = span.scrollWidth || 0;
-        const clientH = el.clientHeight || 0;
-        const clientW = el.clientWidth || 0;
-        
-        // Marge de sécurité de 95% pour éviter toute coupure
-        if (size <= min || (scrollH <= clientH * 0.95 && scrollW <= clientW * 0.95)) {
-          break;
-        }
-        size = Math.max(min, size - 1);
-      }
-      
-      // Ajustement final : réduire encore un peu pour sécurité
-      span.style.fontSize = Math.max(min, size - 2) + 'px';
-    }
+    /**
+     * SYSTÈME D'AJUSTEMENT AUTOMATIQUE DU TEXTE - PRO EDITION
+     * Garantit que le texte ne sera JAMAIS coupé
+     * Algorithme de réduction progressive avec marges de sécurité
+     */
     
-    function stretchHeight(el, factorMax) {
-      const span = el.querySelector('span') || el;
-      if (!span || !el) return;
-      const hEl = el.clientHeight || el.offsetHeight;
-      const hSp = span.scrollHeight;
-      if (!hEl || !hSp || hSp <= hEl) return;
-      const factor = Math.min(hEl / hSp, factorMax || 1.4);
-      if (factor > 1.05 && factor < 1.5) {
-        span.style.lineHeight = (1.02 * factor).toFixed(3);
-        // Re-vérifier après ajustement
-        void span.offsetHeight;
-        if (span.scrollHeight > hEl) {
-          // Si toujours trop grand, réduire la taille
-          const currentSize = parseFloat(getComputedStyle(span).fontSize) || 85;
-          span.style.fontSize = Math.max(28, currentSize - 5) + 'px';
-        }
-      }
-    }
-    
-    (function adjustAllText() {
-      // Attendre que le DOM soit prêt
-      if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', adjustAllText);
-        return;
+    (function() {
+      'use strict';
+      
+      // Configuration
+      const CONFIG = {
+        PRIX: { max: 90, min: 24, initial: 68, safetyMargin: 0.88 },
+        NOM: { max: 100, min: 22, initial: 72, safetyMargin: 0.85 },
+        INFO: { max: 26, min: 12, initial: 20, safetyMargin: 0.90 },
+        LABEL: { max: 20, min: 10, initial: 16, safetyMargin: 0.95 },
+        MAX_ITERATIONS: 200,
+        STEP: 0.8 // Réduction par pas de 0.8px pour précision
+      };
+      
+      /**
+       * Vérifie si un élément déborde de son conteneur
+       */
+      function isOverflowing(element, container, safetyMargin) {
+        if (!element || !container) return false;
+        
+        const margin = safetyMargin || 0.92;
+        const scrollH = element.scrollHeight || 0;
+        const scrollW = element.scrollWidth || 0;
+        const clientH = container.clientHeight * margin;
+        const clientW = container.clientWidth * margin;
+        
+        return scrollH > clientH || scrollW > clientW;
       }
       
-      // Attendre un frame pour que les styles soient appliqués
-      requestAnimationFrame(function() {
+      /**
+       * Ajuste la taille de police pour qu'elle rentre dans le conteneur
+       */
+      function fitTextToContainer(element, container, config) {
+        if (!element || !container) return;
+        
+        let fontSize = config.initial || parseFloat(getComputedStyle(element).fontSize) || 50;
+        let iterations = 0;
+        
+        // Appliquer la taille initiale
+        element.style.fontSize = fontSize + 'px';
+        void element.offsetHeight; // Force reflow
+        
+        // Réduire jusqu'à ce que ça rentre
+        while (isOverflowing(element, container, config.safetyMargin) && iterations < CONFIG.MAX_ITERATIONS) {
+          fontSize = Math.max(config.min, fontSize - CONFIG.STEP);
+          element.style.fontSize = fontSize + 'px';
+          void element.offsetHeight; // Force reflow
+          iterations++;
+          
+          if (fontSize <= config.min) break;
+        }
+        
+        // Marge de sécurité finale - réduire encore un peu
+        const finalSize = Math.max(config.min, fontSize - 1);
+        element.style.fontSize = finalSize + 'px';
+        
+        // Ajuster le line-height pour les textes longs
+        if (iterations > 20 && config.initial > 50) {
+          element.style.lineHeight = '0.98';
+        }
+        
+        return finalSize;
+      }
+      
+      /**
+       * Ajuste tous les éléments du ticket
+       */
+      function adjustAllElements() {
+        try {
+          // 1. PRIX - Doit être bien visible et lisible
+          document.querySelectorAll('.prix').forEach(container => {
+            const span = container.querySelector('span');
+            if (span) {
+              fitTextToContainer(span, container, CONFIG.PRIX);
+            }
+          });
+          
+          // 2. NOM - Le plus important, peut être long
+          document.querySelectorAll('.nom').forEach(container => {
+            const span = container.querySelector('span');
+            if (span) {
+              // Vérifier la longueur du texte pour ajuster la configuration
+              const text = span.textContent || '';
+              const customConfig = { ...CONFIG.NOM };
+              
+              // Textes très longs : permettre plus de réduction
+              if (text.length > 25) {
+                customConfig.min = 18;
+                customConfig.safetyMargin = 0.82;
+              }
+              if (text.length > 40) {
+                customConfig.min = 16;
+                customConfig.safetyMargin = 0.78;
+              }
+              
+              fitTextToContainer(span, container, customConfig);
+              
+              // Double vérification
+              void span.offsetHeight;
+              if (isOverflowing(span, container, 0.95)) {
+                const current = parseFloat(span.style.fontSize) || 50;
+                span.style.fontSize = Math.max(customConfig.min, current - 3) + 'px';
+              }
+            }
+          });
+          
+          // 3. INFO VALUES (Unité, Mark, Stock)
+          document.querySelectorAll('.info-value').forEach(element => {
+            const container = element.closest('.info-row') || element.parentElement;
+            if (container) {
+              const text = element.textContent || '';
+              const customConfig = { ...CONFIG.INFO };
+              
+              // Valeurs longues : ajuster
+              if (text.length > 10) {
+                customConfig.min = 11;
+                customConfig.safetyMargin = 0.85;
+              }
+              
+              fitTextToContainer(element, container, customConfig);
+            }
+          });
+          
+          // 4. LABELS (UNITÉ, MARK, STOCK)
+          document.querySelectorAll('.info-label').forEach(element => {
+            const container = element.closest('.info-row') || element.parentElement;
+            if (container) {
+              fitTextToContainer(element, container, CONFIG.LABEL);
+            }
+          });
+          
+          // Signal que l'ajustement est terminé (pour Puppeteer)
+          document.body.setAttribute('data-adjusted', 'true');
+          document.body.classList.add('adjusted');
+          
+        } catch (e) {
+          console.error('[TICKET] Erreur ajustement:', e);
+          document.body.setAttribute('data-adjusted', 'true');
+        }
+      }
+      
+      /**
+       * Initialisation
+       */
+      function init() {
+        // Attendre que le DOM soit complètement prêt
+        if (document.readyState === 'loading') {
+          document.addEventListener('DOMContentLoaded', init);
+          return;
+        }
+        
+        // Double requestAnimationFrame pour garantir que les styles sont appliqués
         requestAnimationFrame(function() {
-          try {
-            // Ajuster le prix
-            document.querySelectorAll('.prix').forEach(el => {
-              growToFit(el, { max: 95, min: 30 });
-            });
+          requestAnimationFrame(function() {
+            adjustAllElements();
             
-            // Ajuster le nom avec hauteur extensible
-            document.querySelectorAll('.nom').forEach(el => {
-              growToFit(el, { max: 100, min: 28 });
-              stretchHeight(el, 1.4);
-              // Vérification supplémentaire après stretchHeight
-              growToFit(el, { max: 100, min: 28 });
-            });
-            
-            // Ajuster les infos (unité, mark, stock)
-            document.querySelectorAll('.info-value').forEach(el => {
-              const row = el.closest('.info-row');
-              if (row) {
-                const container = row.parentElement;
-                let fontSize = 24;
-                let guard = 0;
-                
-                // Réduire agressivement si trop grand
-                while (guard++ < 50) {
-                  el.style.fontSize = fontSize + 'px';
-                  void el.offsetHeight; // Force reflow
-                  
-                  const scrollH = el.scrollHeight || 0;
-                  const scrollW = el.scrollWidth || 0;
-                  const clientH = container.clientHeight * 0.25 || 0;
-                  const clientW = container.clientWidth * 0.35 || 0;
-                  
-                  if (fontSize <= 14 || (scrollH <= clientH && scrollW <= clientW)) {
-                    break;
-                  }
-                  fontSize = Math.max(14, fontSize - 1);
+            // Vérification supplémentaire après un court délai
+            setTimeout(function() {
+              // Re-vérifier les éléments critiques
+              document.querySelectorAll('.nom span, .prix span').forEach(span => {
+                const container = span.closest('.col');
+                if (container && isOverflowing(span, container, 0.98)) {
+                  const current = parseFloat(span.style.fontSize) || 30;
+                  span.style.fontSize = Math.max(14, current - 2) + 'px';
                 }
-                el.style.fontSize = Math.max(14, fontSize - 1) + 'px';
-              }
-            });
-            
-            // Ajuster aussi les labels
-            document.querySelectorAll('.info-label').forEach(el => {
-              let fontSize = 20;
-              let guard = 0;
-              while (guard++ < 30) {
-                el.style.fontSize = fontSize + 'px';
-                void el.offsetHeight;
-                if (el.scrollHeight <= (el.parentElement?.clientHeight || 100) * 0.95 || fontSize <= 14) {
-                  break;
-                }
-                fontSize = Math.max(14, fontSize - 1);
-              }
-              el.style.fontSize = Math.max(14, fontSize - 1) + 'px';
-            });
-            
-            // Signal que l'ajustement est terminé (pour Puppeteer)
-            document.body.setAttribute('data-adjusted', 'true');
-          } catch(e) {
-            console.error('Erreur ajustement:', e);
-            document.body.setAttribute('data-adjusted', 'true'); // Même en cas d'erreur
-          }
+              });
+            }, 50);
+          });
         });
-      });
+      }
+      
+      // Lancer l'initialisation
+      init();
     })();
   </script>
 </body>

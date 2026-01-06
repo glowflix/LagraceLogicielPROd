@@ -1,33 +1,38 @@
-# Script NSIS Personnalisé pour Glowflix POS
-# Installation Professionnelle avec Auto-Launch en Admin
+; electron-builder NSIS include fragment.
+; IMPORTANT: This file must only define macros/callback fragments, not a full NSIS script.
 
-!include "MUI2.nsh"
-!include "x64.nsh"
+!macro customInstall
+  ; ---- Ensure legacy data dir exists and is writable by standard users ----
+  CreateDirectory "C:\\Glowflixprojet"
+  CreateDirectory "C:\\Glowflixprojet\\printer"
+  CreateDirectory "C:\\Glowflixprojet\\printer\\jobs"
+  CreateDirectory "C:\\Glowflixprojet\\printer\\ok"
+  CreateDirectory "C:\\Glowflixprojet\\printer\\err"
+  CreateDirectory "C:\\Glowflixprojet\\printer\\tmp"
+  CreateDirectory "C:\\Glowflixprojet\\printer\\logs"
+  CreateDirectory "C:\\Glowflixprojet\\printer\\templates"
+  CreateDirectory "C:\\Glowflixprojet\\printer\\assets"
 
-; Configuration générale
-SetCompressor /SOLID lzma
-SetDatablockOptimize on
-SetDateSave off
-SetOverwrite ifnewer
+  ; Grant Modify to Builtin Users via SID (works on FR/EN Windows)
+  ; S-1-5-32-545 = Builtin Users
+  ExecWait '"$SYSDIR\\cmd.exe" /C icacls C:\\Glowflixprojet /grant *S-1-5-32-545:(OI)(CI)M /T /C'
 
-; Hook post-installation - LANCER AUTOMATIQUEMENT
-Function .onInstSuccess
-  ; Message de fin
-  MessageBox MB_ICONINFORMATION "Installation Glowflix POS réussie !$\n$\nLe logiciel va démarrer..." IDOK
-  
-  ; Lancer le logiciel en admin
-  ${If} ${RunningX64}
-    ExecShell "runas" "$INSTDIR\Glowflix POS.exe"
-  ${EndIf}
-FunctionEnd
+  DetailPrint "C:\\Glowflixprojet créé + ACL Users=Modify"
 
-; Variables pour customization
-Var InstallDir
+  ; ---- Optional: install SumatraPDF system-wide (app also ships a bundled Sumatra) ----
+  CreateDirectory "$PROGRAMFILES64\\SumatraPDF"
+  SetOutPath "$PROGRAMFILES64\\SumatraPDF"
+  CopyFiles /SILENT "$INSTDIR\\resources\\vendor\\sumatra\\SumatraPDF.exe" "$PROGRAMFILES64\\SumatraPDF\\SumatraPDF.exe"
+  IfFileExists "$PROGRAMFILES64\\SumatraPDF\\SumatraPDF.exe" 0 +4
+    WriteRegStr HKLM "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\SumatraPDF.exe" "" "$PROGRAMFILES64\\SumatraPDF\\SumatraPDF.exe"
+    WriteRegStr HKLM "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\SumatraPDF.exe" "Path" "$PROGRAMFILES64\\SumatraPDF"
+    DetailPrint "SumatraPDF installé dans $PROGRAMFILES64\\SumatraPDF"
+!macroend
 
-; Définir chemins d'installation
-!ifdef INSTALL_DIR
-  InstallDir "${INSTALL_DIR}"
-!else
-  InstallDir "$PROGRAMFILES64\Glowflix\Glowflix POS"
-!endif
+!macro customUnInstall
+  ; Remove SumatraPDF installed by this installer (does not touch a user's own installation)
+  Delete "$PROGRAMFILES64\\SumatraPDF\\SumatraPDF.exe"
+  RMDir "$PROGRAMFILES64\\SumatraPDF"
+  DeleteRegKey HKLM "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\SumatraPDF.exe"
+!macroend
 

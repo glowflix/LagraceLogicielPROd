@@ -1,6 +1,7 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { BrowserRouter } from 'react-router-dom';
+import { LazyMotion, domAnimation } from 'framer-motion';
 import App from './App';
 import './index.css';
 import { setupAxiosInterceptors } from './utils/axiosConfig';
@@ -16,7 +17,9 @@ ReactDOM.createRoot(document.getElementById('root')).render(
         v7_relativeSplatPath: true,
       }}
     >
-      <App />
+      <LazyMotion features={domAnimation} strict>
+        <App />
+      </LazyMotion>
     </BrowserRouter>
   </React.StrictMode>
 );

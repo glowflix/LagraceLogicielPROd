@@ -9,10 +9,29 @@ Langue: Français avec prononciation naturelle et humaine
 import os
 from pathlib import Path
 
-# Chemins
-BASE_DIR = Path(__file__).resolve().parent.parent
+# Chemins - supporte mode dev ET mode packagé (PyInstaller)
+import sys
+
+def get_base_dir():
+    """Obtenir le répertoire de base (supporte PyInstaller)"""
+    if getattr(sys, 'frozen', False):
+        # Mode PyInstaller (EXE)
+        return Path(sys._MEIPASS)
+    else:
+        # Mode développement
+        return Path(__file__).resolve().parent.parent
+
+BASE_DIR = get_base_dir()
 MODELS_DIR = BASE_DIR / "models"
-DB_PATH = BASE_DIR.parent / "data" / "lagrace.db"
+
+# DB Path - en mode EXE, utiliser AppData; en dev, utiliser le dossier parent
+if getattr(sys, 'frozen', False):
+    # Mode EXE: utiliser le dossier AppData de l'utilisateur
+    _app_data = os.environ.get('LAGRACE_DATA_DIR', os.path.join(os.environ.get('APPDATA', '.'), 'LA GRACE POS'))
+    DB_PATH = Path(_app_data) / "data" / "lagrace.db"
+else:
+    # Mode dev: dossier parent
+    DB_PATH = BASE_DIR.parent / "data" / "lagrace.db"
 
 # Configuration Socket.IO
 SOCKET_URL = os.getenv("SOCKET_URL", "http://localhost:3030")

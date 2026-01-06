@@ -132,5 +132,32 @@ router.post('/:id/payments', authenticate, (req, res) => {
   }
 });
 
+/**
+ * POST /api/debts/cleanup-duplicates
+ * Nettoie les doublons dans la table debts
+ * Garde la dette la plus récente pour chaque invoice_number
+ */
+router.post('/cleanup-duplicates', authenticate, (req, res) => {
+  try {
+    logger.info('🧹 [ENDPOINT] POST /api/debts/cleanup-duplicates - Début nettoyage');
+    const deletedCount = debtsRepo.cleanupDuplicates();
+    logger.info(`✅ [ENDPOINT] Nettoyage terminé: ${deletedCount} doublon(s) supprimé(s)`);
+    
+    // Audit log
+    auditRepo.log(req.user.id, 'debts_cleanup', {
+      deleted_count: deletedCount,
+    });
+    
+    res.json({ 
+      success: true, 
+      deleted_count: deletedCount,
+      message: `${deletedCount} doublon(s) supprimé(s)`
+    });
+  } catch (error) {
+    logger.error('❌ [ENDPOINT] POST /api/debts/cleanup-duplicates error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 export default router;
 
