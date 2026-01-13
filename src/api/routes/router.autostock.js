@@ -471,6 +471,337 @@ router.post("/apply", async (req, res) => {
 });
 
 /**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * AUTO-STOCK PRÉVENTIF POUR VENTES (SalesPOS)
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 
+ * Calcule et applique l'auto-stock AVANT qu'il soit trop tard, basé sur la
+ * quantité demandée par l'utilisateur dans l'écran de vente.
+ * 
+ * Exemple:
+ * - Stock MILLIER: 15, auto_stock_factor: 50
+ * - Quantité demandée: 45
+ * - Stock insuffisant (15 < 45)
+ * - Besoin: ceil((45 - 15) / 50) = 1 carton
+ * - Après conversion: MILLIER = 15 + 50 = 65, CARTON = n - 1
+ * - Vente peut continuer: 65 >= 45
+ */
+
+/**
+ * Prévisualisation Auto-Stock (read-only, pas de modification DB)
+ * 
+ * POST /api/autostock/preview
+ * Body: { productKey, unit_level, qty_requested }
+ * 
+ * Retourne:
+ * - needsConversion: boolean
+ * - cartonsNeeded: number
+ * - cartonsAvailable: number
+ * - canFulfill: boolean (si conversion possible)
+ * - stockAfterConversion: number
+ * - message: string (pour UI)
+ */
+router.post("/preview", async (req, res) => {
+  const db = req.app?.locals?.db;
+  const dbx = makeDb(db);
+
+  const { productKey, unit_level, qty_requested } = req.body || {};
+
+  if (!productKey) {
+    return res.status(400).json({ ok: false, error: "productKey requis" });
+  }
+  if (!unit_level) {
+    return res.status(400).json({ ok: false, error: "unit_level requis (PIECE ou MILLIER)" });
+  }
+  if (typeof qty_requested !== 'number' || qty_requested <= 0) {
+    return res.status(400).json({ ok: false, error: "qty_requested requis (nombre > 0)" });
+  }
+
+  try {
+    const product = await getProductByKey(dbx, productKey);
+    if (!product) {
+      return res.status(404).json({ ok: false, error: `Produit introuvable: ${productKey}` });
+    }
+
+    const units = await getUnits(dbx, product.id);
+    const carton = units.find((u) => toUpper(u.unit_level) === "CARTON");
+    const target = units.find((u) => toUpper(u.unit_level) === toUpper(unit_level));
+
+    if (!carton) {
+      return res.json({
+        ok: true,
+        needsConversion: false,
+        canFulfill: false,
+        message: "Pas d'unité CARTON trouvée pour ce produit",
+        stockCurrent: target?.stock_current || 0,
+      });
+    }
+
+    if (!target) {
+      return res.status(404).json({ ok: false, error: `Unité ${unit_level} introuvable pour ce produit` });
+    }
+
+    const cartonStock = toNum(carton.stock_current, 0);
+    const targetStock = toNum(target.stock_current, 0);
+    const factor = normFactor(target.auto_stock_factor);
+
+    // Stock suffisant sans conversion
+    if (targetStock >= qty_requested) {
+      return res.json({
+        ok: true,
+        needsConversion: false,
+        canFulfill: true,
+        cartonsNeeded: 0,
+        cartonsAvailable: cartonStock,
+        stockCurrent: targetStock,
+        stockAfterConversion: targetStock,
+        factor: factor,
+        message: `Stock suffisant (${targetStock} disponibles)`,
+      });
+    }
+
+    // Pas de facteur de conversion
+    if (factor <= 0) {
+      return res.json({
+        ok: true,
+        needsConversion: false,
+        canFulfill: targetStock >= qty_requested,
+        cartonsNeeded: 0,
+        cartonsAvailable: cartonStock,
+        stockCurrent: targetStock,
+        stockAfterConversion: targetStock,
+        factor: 0,
+        message: `Auto-stock désactivé (factor=0). Stock: ${targetStock}`,
+      });
+    }
+
+    // Calculer combien de cartons sont nécessaires
+    const shortage = qty_requested - targetStock;
+    const cartonsNeeded = Math.ceil(shortage / factor);
+
+    // Vérifier si assez de cartons
+    if (cartonsNeeded > cartonStock) {
+      const maxPossibleStock = targetStock + (cartonStock * factor);
+      
+      // ✅ Message spécifique si cartons = 0
+      let message;
+      if (cartonStock <= 0) {
+        message = `Stock épuisé: ${targetStock} ${toUpper(unit_level)} disponibles, aucun carton à convertir`;
+      } else {
+        message = `Stock insuffisant: max ${maxPossibleStock} (${cartonStock} carton${cartonStock > 1 ? 's' : ''} dispo)`;
+      }
+      
+      return res.json({
+        ok: true,
+        needsConversion: true,
+        canFulfill: false,
+        cartonsNeeded: cartonsNeeded,
+        cartonsAvailable: cartonStock,
+        stockCurrent: targetStock,
+        stockAfterConversion: maxPossibleStock,
+        factor: factor,
+        shortage: qty_requested - maxPossibleStock,
+        noCartonsLeft: cartonStock <= 0,
+        message: message,
+      });
+    }
+
+    // Conversion possible!
+    const stockAfterConversion = targetStock + (cartonsNeeded * factor);
+    const remainingStock = stockAfterConversion - qty_requested;
+
+    return res.json({
+      ok: true,
+      needsConversion: true,
+      canFulfill: true,
+      cartonsNeeded: cartonsNeeded,
+      cartonsAvailable: cartonStock,
+      cartonStockAfter: cartonStock - cartonsNeeded,
+      stockCurrent: targetStock,
+      stockAfterConversion: stockAfterConversion,
+      remainingAfterSale: remainingStock,
+      factor: factor,
+      message: `Auto-Stock: ${cartonsNeeded} carton(s) → +${cartonsNeeded * factor} ${toUpper(unit_level)}`,
+    });
+
+  } catch (e) {
+    res.status(e.status || 500).json({ ok: false, error: e.message || "Erreur preview AutoStock" });
+  }
+});
+
+/**
+ * Appliquer Auto-Stock PRÉVENTIF pour une quantité demandée
+ * 
+ * POST /api/autostock/apply-for-sale
+ * Body: { productKey, unit_level, qty_requested, device_id? }
+ * 
+ * Cette route:
+ * 1. Calcule combien de cartons sont nécessaires
+ * 2. Convertit UNIQUEMENT le nombre de cartons nécessaires
+ * 3. Retourne le nouveau stock pour que la vente puisse continuer
+ */
+router.post("/apply-for-sale", async (req, res) => {
+  const db = req.app?.locals?.db;
+  const dbx = makeDb(db);
+
+  const { productKey, unit_level, qty_requested, device_id } = req.body || {};
+
+  if (!productKey) {
+    return res.status(400).json({ ok: false, error: "productKey requis" });
+  }
+  if (!unit_level) {
+    return res.status(400).json({ ok: false, error: "unit_level requis (PIECE ou MILLIER)" });
+  }
+  if (typeof qty_requested !== 'number' || qty_requested <= 0) {
+    return res.status(400).json({ ok: false, error: "qty_requested requis (nombre > 0)" });
+  }
+
+  try {
+    const result = await dbx.tx(async () => {
+      await forcePragmas(dbx);
+
+      const product = await getProductByKey(dbx, productKey);
+      if (!product) {
+        const err = new Error(`Produit introuvable: ${productKey}`);
+        err.status = 404;
+        throw err;
+      }
+
+      const units = await getUnits(dbx, product.id);
+      const carton = units.find((u) => toUpper(u.unit_level) === "CARTON");
+      const target = units.find((u) => toUpper(u.unit_level) === toUpper(unit_level));
+
+      if (!carton) {
+        const err = new Error(`Pas d'unité CARTON pour ${product.code}`);
+        err.status = 400;
+        throw err;
+      }
+
+      if (!target) {
+        const err = new Error(`Unité ${unit_level} introuvable pour ${product.code}`);
+        err.status = 404;
+        throw err;
+      }
+
+      const cartonStock = toNum(carton.stock_current, 0);
+      const targetStock = toNum(target.stock_current, 0);
+      const factor = normFactor(target.auto_stock_factor);
+
+      // Stock déjà suffisant
+      if (targetStock >= qty_requested) {
+        return {
+          ok: true,
+          applied: false,
+          reason: "Stock déjà suffisant",
+          product: { code: product.code, name: product.name },
+          stockCurrent: targetStock,
+          stockFinal: targetStock,
+        };
+      }
+
+      // Pas de facteur
+      if (factor <= 0) {
+        const err = new Error(`Auto-stock désactivé pour ${unit_level} (factor=0)`);
+        err.status = 400;
+        throw err;
+      }
+
+      // Calculer cartons nécessaires
+      const shortage = qty_requested - targetStock;
+      const cartonsNeeded = Math.ceil(shortage / factor);
+
+      // Vérifier disponibilité cartons
+      if (cartonsNeeded > cartonStock) {
+        const err = new Error(`Cartons insuffisants: ${cartonStock} disponibles, ${cartonsNeeded} requis`);
+        err.status = 400;
+        throw err;
+      }
+
+      // ✅ APPLIQUER LA CONVERSION
+      const actions = [];
+      const moveIds = [];
+      const ref = `AUTO_STOCK_SALE:${product.code}`;
+
+      // Décrémenter CARTON
+      const cartonDelta = -cartonsNeeded;
+      const cartonUpd = await updateUnitStocks(dbx, carton.uuid, cartonDelta);
+
+      // Incrémenter TARGET
+      const targetDelta = cartonsNeeded * factor;
+      const targetUpd = await updateUnitStocks(dbx, target.uuid, targetDelta);
+
+      // Log stock_moves
+      const cartonMoveId = await insertStockMove(dbx, {
+        product_uuid: product.uuid,
+        product_code: product.code,
+        unit_level: "CARTON",
+        unit_mark: carton.unit_mark ?? "",
+        delta: cartonDelta,
+        reason: "adjustment",
+        reference_id: ref,
+        stock_before: cartonUpd.before.stock_current,
+        stock_after: cartonUpd.after.stock_current,
+        device_id: device_id ?? "SALES_POS",
+      });
+
+      const targetMoveId = await insertStockMove(dbx, {
+        product_uuid: product.uuid,
+        product_code: product.code,
+        unit_level: toUpper(target.unit_level),
+        unit_mark: target.unit_mark ?? "",
+        delta: targetDelta,
+        reason: "adjustment",
+        reference_id: ref,
+        stock_before: targetUpd.before.stock_current,
+        stock_after: targetUpd.after.stock_current,
+        device_id: device_id ?? "SALES_POS",
+      });
+
+      moveIds.push(cartonMoveId, targetMoveId);
+
+      // Sync operations
+      const sync_op_id = await insertSyncOperation(dbx, {
+        op_type: "STOCK_MOVE",
+        entity_uuid: product.uuid,
+        entity_code: product.code,
+        device_id: device_id ?? "SALES_POS",
+        payload: {
+          kind: "AUTO_STOCK_SALE",
+          product: { uuid: product.uuid, code: product.code, name: product.name },
+          move_ids: moveIds,
+          cartonsConverted: cartonsNeeded,
+          unitsAdded: targetDelta,
+          unit_level: toUpper(unit_level),
+          at: nowISO(),
+        },
+      });
+
+      return {
+        ok: true,
+        applied: true,
+        product: { code: product.code, name: product.name, uuid: product.uuid },
+        cartonsConverted: cartonsNeeded,
+        factor: factor,
+        unitsAdded: targetDelta,
+        cartonBefore: cartonUpd.before.stock_current,
+        cartonAfter: cartonUpd.after.stock_current,
+        targetBefore: targetUpd.before.stock_current,
+        targetAfter: targetUpd.after.stock_current,
+        stockFinal: targetUpd.after.stock_current,
+        remainingAfterSale: targetUpd.after.stock_current - qty_requested,
+        sync_op_id,
+        message: `✅ ${cartonsNeeded} carton(s) converti(s) → +${targetDelta} ${toUpper(unit_level)}`,
+      };
+    });
+
+    res.json(result);
+
+  } catch (e) {
+    res.status(e.status || 500).json({ ok: false, error: e.message || "Erreur AutoStock Sale" });
+  }
+});
+
+/**
  * AUTO-VÉRIFICATION (toutes les 2 secondes)
  * 
  * Scanne tous les produits et déclenche automatiquement autostock si:
@@ -487,6 +818,11 @@ function runAutoCheck(db) {
   autoCheckRunning = true;
 
   const checkStartTime = Date.now();
+  
+  // ✅ SÉCURITÉ: Limites raisonnables pour éviter les valeurs cassées
+  const MAX_STOCK = 1000000;  // Stock max acceptable
+  const MIN_STOCK = -10000;   // Stock min acceptable (permet petits négatifs temporaires)
+  const MAX_FACTOR = 10000;   // Facteur max acceptable
   
   try {
     // ✅ SYNCHRONE: utiliser db directement (better-sqlite3)
@@ -526,18 +862,30 @@ function runAutoCheck(db) {
           continue;
         }
 
-        const cartonStock = Math.floor(Number(carton.stock_current ?? 0));
-        if (cartonStock <= 0) {
+        const cartonStock = Number(carton.stock_current ?? 0);
+        
+        // ✅ SÉCURITÉ: Vérifier que le stock CARTON est valide
+        if (!Number.isFinite(cartonStock) || cartonStock < 0.5 || cartonStock > MAX_STOCK) {
           skippedCount++;
           continue;
         }
 
         // 4. Chercher UNE unité cible vide avec auto_stock_factor > 0
+        // Chercher MILLIER ou PIECE
         const targets = units.filter(
           (u) => {
             const level = (u.unit_level || '').toUpperCase().trim();
-            const stock = Math.floor(Number(u.stock_current ?? 0));
-            const factor = Math.floor(Number(u.auto_stock_factor ?? 0));
+            const stock = Number(u.stock_current ?? 0);
+            const factor = Number(u.auto_stock_factor ?? 0);
+            
+            // ✅ SÉCURITÉ: Ignorer les valeurs cassées
+            if (!Number.isFinite(stock) || stock < MIN_STOCK || stock > MAX_STOCK) {
+              return false;
+            }
+            if (!Number.isFinite(factor) || factor <= 0 || factor > MAX_FACTOR) {
+              return false;
+            }
+            
             return (level === "PIECE" || level === "MILLIER") && stock <= 0 && factor > 0;
           }
         );
@@ -549,12 +897,26 @@ function runAutoCheck(db) {
 
         // 5. Si une cible vide trouvée, déclencher autostock (synchrone)
         const target = targets[0]; // Prendre la première cible
-        const targetFactor = Math.floor(Number(target.auto_stock_factor ?? 0));
-        const targetStock = Math.floor(Number(target.stock_current ?? 0));
+        // ✅ FIX: Forcer le facteur à être POSITIF avec Math.abs()
+        const targetFactor = Math.abs(Math.floor(Number(target.auto_stock_factor ?? 0)));
+        const targetStock = Number(target.stock_current ?? 0);
+        
+        // ✅ SÉCURITÉ FINALE: Vérifier les bornes
+        if (targetFactor <= 0 || targetFactor > MAX_FACTOR) {
+          skippedCount++;
+          continue;
+        }
+        
+        // ✅ DEBUG: Afficher les valeurs avant la transaction
+        console.log(`  🔍 [AutoStock] ${product.code}: Vérification...`);
+        console.log(`      CARTON: stock=${cartonStock}, MILLIER: stock=${targetStock}, factor=${targetFactor}`);
 
         // ✅ TRANSACTION SYNCHRONE
         try {
           const tx = db.transaction(() => {
+            // ✅ Recalculer le facteur positif à l'intérieur de la transaction
+            const positiveFactorTx = Math.abs(targetFactor);
+            
             // 1) Update CARTON -1
             const cartonRes = db.prepare(`
               UPDATE product_units
@@ -570,7 +932,7 @@ function runAutoCheck(db) {
               throw new Error(`Impossible de mettre à jour CARTON (uuid: ${carton.uuid})`);
             }
 
-            // 2) Update TARGET +factor
+            // 2) Update TARGET +factor (TOUJOURS POSITIF!)
             const targetRes = db.prepare(`
               UPDATE product_units
               SET stock_initial = stock_initial + ?,
@@ -579,7 +941,7 @@ function runAutoCheck(db) {
                   synced_at = NULL,
                   updated_at = datetime('now')
               WHERE uuid = ?
-            `).run(targetFactor, targetFactor, target.uuid);
+            `).run(positiveFactorTx, positiveFactorTx, target.uuid);
 
             if (targetRes.changes === 0) {
               throw new Error(`Impossible de mettre à jour ${target.unit_level} (uuid: ${target.uuid})`);
@@ -624,23 +986,59 @@ function runAutoCheck(db) {
               product.code,
               target.unit_level,
               target.unit_mark || '',
-              targetFactor,
+              Math.abs(targetFactor), // ✅ Toujours positif!
               'adjustment',
               ref,
               targetStock,
-              targetStock + targetFactor,
+              targetStock + Math.abs(targetFactor), // ✅ Toujours positif!
               'AUTO_CHECK',
               0
             );
 
-            // 4) Créer sync_operation
-            const opId = crypto.randomUUID();
-            const payload = {
-              kind: 'AUTO_STOCK',
-              product: { uuid: product.uuid, code: product.code, name: product.name },
-              move_ids: [moveIdCarton, moveIdTarget],
-              device_id: 'AUTO_CHECK',
+            // 4) Créer sync_operations - UNE OPÉRATION PAR MOUVEMENT avec format compatible sync.worker
+            const opIdCarton = crypto.randomUUID();
+            const opIdTarget = crypto.randomUUID();
+            
+            // ✅ FIX: Calculer les nouvelles valeurs de stock avec GARANTIE positive pour target
+            const newCartonStock = Math.round((cartonStock - 1) * 100) / 100;
+            const newTargetStock = Math.round((targetStock + Math.abs(targetFactor)) * 100) / 100;
+            
+            // ✅ FIX: Payload compatible avec pushStockMoves() dans sync.worker.js
+            // Format requis: product_code, unit_level, unit_mark, stock_absolute, delta
+            const payloadCarton = {
+              move_id: moveIdCarton,
+              product_uuid: product.uuid,
+              product_code: String(product.code).trim(),
+              unit_level: 'CARTON',
+              unit_mark: carton.unit_mark || '',
+              stock_absolute: newCartonStock,
+              delta: -1,
+              reason: 'adjustment',
+              reference_id: ref,
+              stock_before: cartonStock,
+              stock_after: newCartonStock
             };
+
+            // ✅ FIX: S'assurer que delta est POSITIF pour MILLIER/PIECE
+            const positiveDelta = Math.abs(targetFactor);
+            
+            const payloadTarget = {
+              move_id: moveIdTarget,
+              product_uuid: product.uuid,
+              product_code: String(product.code).trim(),
+              unit_level: target.unit_level,
+              unit_mark: target.unit_mark || '',
+              stock_absolute: newTargetStock,
+              delta: positiveDelta, // ✅ Toujours positif!
+              reason: 'adjustment',
+              reference_id: ref,
+              stock_before: targetStock,
+              stock_after: newTargetStock
+            };
+            
+            // ✅ DEBUG: Afficher les payloads
+            console.log(`      📤 CARTON: ${cartonStock} → ${newCartonStock} (delta: -1)`);
+            console.log(`      📤 ${target.unit_level}: ${targetStock} → ${newTargetStock} (delta: +${positiveDelta})`);
 
             db.prepare(`
               INSERT INTO sync_operations (
@@ -648,22 +1046,37 @@ function runAutoCheck(db) {
                 device_id, status, tries, created_at, updated_at
               ) VALUES (?,?,?,?,?,?, 'pending', 0, datetime('now'), datetime('now'))
             `).run(
-              opId,
+              opIdCarton,
               'STOCK_MOVE',
               product.uuid,
               product.code,
-              JSON.stringify(payload),
+              JSON.stringify(payloadCarton),
               'AUTO_CHECK'
             );
 
-            return { opId, moveIdCarton, moveIdTarget };
+            db.prepare(`
+              INSERT INTO sync_operations (
+                op_id, op_type, entity_uuid, entity_code, payload_json,
+                device_id, status, tries, created_at, updated_at
+              ) VALUES (?,?,?,?,?,?, 'pending', 0, datetime('now'), datetime('now'))
+            `).run(
+              opIdTarget,
+              'STOCK_MOVE',
+              product.uuid,
+              product.code,
+              JSON.stringify(payloadTarget),
+              'AUTO_CHECK'
+            );
+
+            return { opIdCarton, opIdTarget, moveIdCarton, moveIdTarget };
           });
 
           const result = tx();
           actionCount++;
 
           // Afficher uniquement les actions effectuées
-          console.log(`  ✅ [AutoStock] ${product.code}: CARTON ${cartonStock}→${cartonStock-1}, ${target.unit_level} ${targetStock}→${targetStock+targetFactor}`);
+          const displayFactor = Math.abs(targetFactor);
+          console.log(`  ✅ [AutoStock] ${product.code}: CARTON ${cartonStock}→${cartonStock-1}, ${target.unit_level} ${targetStock}→${targetStock + displayFactor}`);
 
         } catch (txErr) {
           console.error(`  ❌ ${product.code}: Erreur transaction - ${txErr.message}`);
@@ -698,8 +1111,7 @@ export function startAutoCheck(db) {
     return;
   }
 
-  // Log compact au démarrage
-  console.log(`🚀 [AutoCheck] Démarré (intervalle: 2s)`);
+  // ✅ PRO: Démarrage silencieux
 
   let checkCount = 0;
 
@@ -721,8 +1133,6 @@ export function stopAutoCheck() {
   if (autoCheckInterval) {
     clearInterval(autoCheckInterval);
     autoCheckInterval = null;
-    const stopTime = new Date().toLocaleTimeString('fr-FR');
-    console.log(`\n⏹️  [AutoCheck] Arrêté à ${stopTime}\n`);
   }
 }
 

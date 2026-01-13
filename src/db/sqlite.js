@@ -323,6 +323,9 @@ function applyMigrations() {
     
     // Migrations pour la table products
     const productsUuidAdded = ensureColumn('products', 'uuid', 'TEXT');
+    // ✅ SOFT DELETE: Ajouter colonne deleted_at pour soft delete des produits
+    ensureColumn('products', 'deleted_at', 'DATETIME DEFAULT NULL');
+    ensureColumn('products', 'is_active', 'INTEGER DEFAULT 1');
     
     // Migrations pour la table product_units
     const unitsUuidAdded = ensureColumn('product_units', 'uuid', 'TEXT');
@@ -332,6 +335,8 @@ function applyMigrations() {
     ensureColumn('users', 'is_vendeur', 'INTEGER DEFAULT 1');
     ensureColumn('users', 'is_gerant_stock', 'INTEGER DEFAULT 0');
     ensureColumn('users', 'can_manage_products', 'INTEGER DEFAULT 0');
+    // ✅ OWNER ROLE: Ajouter colonne is_owner pour identifier le créateur/fondateur
+    ensureColumn('users', 'is_owner', 'INTEGER DEFAULT 0');
     
     // Migrations pour la table debts
     ensureColumn('debts', 'uuid', 'TEXT');
@@ -758,6 +763,34 @@ function applyMigrations() {
     logger.info('[MIGRATION] ✅ Module Dettes/Clients amélioré appliqué');
     // ==================================================================================
     // FIN: Module Dettes/Clients amélioré
+    // ==================================================================================
+    
+    // ==================================================================================
+    // ✅ MIGRATION: Amélioration table print_jobs (retry + priority)
+    // ==================================================================================
+    try {
+      if (tableExists('print_jobs')) {
+        // Ajouter colonne priority pour jobs urgents
+        ensureColumn('print_jobs', 'priority', 'INTEGER NOT NULL DEFAULT 0');
+        
+        // Ajouter colonne retry_at pour planifier les retries
+        ensureColumn('print_jobs', 'retry_at', 'TEXT');
+        
+        // Créer index pour performance
+        try {
+          database.exec('CREATE INDEX IF NOT EXISTS idx_print_jobs_priority ON print_jobs(priority DESC, created_at ASC)');
+          database.exec('CREATE INDEX IF NOT EXISTS idx_print_jobs_retry ON print_jobs(status, retry_at)');
+        } catch (e) {
+          // Ignorer si index existe déjà
+        }
+        
+        logger.info('[MIGRATION] ✅ Table print_jobs améliorée (priority + retry)');
+      }
+    } catch (error) {
+      logger.warn('[MIGRATION] Erreur amélioration print_jobs:', error.message);
+    }
+    // ==================================================================================
+    // FIN: Amélioration print_jobs
     // ==================================================================================
     
     logger.info('[MIGRATION] ✅ Toutes les migrations appliquées avec succès');

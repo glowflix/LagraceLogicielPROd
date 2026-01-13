@@ -102,6 +102,7 @@ export const SHEET_MAPPINGS = {
   },
   
   // Feuille Utilisateurs
+  // ✅ PRO: Mapping complet avec toutes les colonnes de rôles
   COMPTER_UTILISATEUR: {
     sheetName: 'Compter Utilisateur',
     columns: {
@@ -114,7 +115,13 @@ export const SHEET_MAPPINGS = {
       marque: 'marque',
       url_profile: 'Urlprofile',
       admin: 'admi',
-      uuid: '_uuid'
+      uuid: '_uuid',
+      // ✅ Nouvelles colonnes de rôles
+      vendeur: 'Vendeur',
+      gerant_stock: 'Gerent Stock',
+      produits: 'Porudits est Vender',  // = can_manage_products
+      updated_at: '_updated_at',
+      device_id: '_device_id'
     }
   },
   

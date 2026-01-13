@@ -1,4 +1,5 @@
-import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { useState, useEffect, useMemo, useRef, useCallback, startTransition } from 'react';
+import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { 
@@ -15,9 +16,17 @@ import {
   ArrowUp,
   Upload,
   Loader2,
-  Trash2
+  Trash2,
+  Wifi,
+  WifiOff,
+  RefreshCw
 } from 'lucide-react';
 import { useStore } from '../store/useStore';
+import ErrorBoundary from '../components/ErrorBoundary';
+import { ToastContainer } from '../components/Toast';
+import { useToastNotifications } from '../hooks/useToastNotifications';
+import { useSmartProducts, useWebSocketStatus, isUserCurrentlyTyping, saveUIState, restoreUIState } from '../hooks/useSmartSync';
+import { SyncIndicator } from '../components/SyncIndicator';
 import axios from 'axios';
 
 // En mode proxy Vite, utiliser des chemins relatifs pour compatibilité LAN
@@ -92,11 +101,29 @@ const AnimatedCounter = ({ value, duration = 500, formatter = (v) => v, classNam
 const ConfirmModal = ({ isOpen, onClose, onConfirm, title, message, productName, onCustomName, onCancel }) => {
   const [customName, setCustomName] = useState('');
   
+  // ✅ FIXED: Return null early but ensure no phantom DOM elements remain
   if (!isOpen) return null;
   
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-      <div className="bg-gray-800 rounded-2xl shadow-2xl max-w-md w-full mx-4 border border-white/10">
+    <div 
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      style={{ 
+        // ✅ Explicit pointer-events to prevent blocking when closed
+        pointerEvents: isOpen ? 'auto' : 'none'
+      }}
+      onClick={(e) => {
+        // Close when clicking backdrop
+        if (e.target === e.currentTarget) {
+          if (onCancel) onCancel();
+          else onClose();
+        }
+      }}
+    >
+      <div 
+        className="bg-gray-800 rounded-2xl shadow-2xl max-w-md w-full mx-4 border border-white/10"
+        onClick={(e) => e.stopPropagation()}
+        style={{ pointerEvents: 'auto' }}
+      >
         <div className="p-6">
           <div className="flex items-center gap-3 mb-4">
             <div className="w-10 h-10 rounded-full bg-primary-500/20 flex items-center justify-center">
@@ -105,7 +132,7 @@ const ConfirmModal = ({ isOpen, onClose, onConfirm, title, message, productName,
             <h3 className="text-xl font-bold text-gray-100">{title}</h3>
           </div>
           
-          <p className="text-gray-300 mb-4">{message}</p>
+          <p className="text-gray-300 mb-4 whitespace-pre-line">{message}</p>
           
           {productName && (
             <div className="bg-white/5 rounded-lg p-3 mb-4">
@@ -126,6 +153,7 @@ const ConfirmModal = ({ isOpen, onClose, onConfirm, title, message, productName,
                 placeholder="Nom du produit"
                 className="input-field w-full"
                 autoFocus
+                style={{ pointerEvents: 'auto' }}
               />
             </div>
           )}
@@ -168,8 +196,37 @@ const ConfirmModal = ({ isOpen, onClose, onConfirm, title, message, productName,
 };
 
 const ProductsPage = () => {
-  const { products, loadProducts, currentRate, loadCurrentRate, token: storeToken, isAuthenticated, socket } = useStore();
+  const { products: storeProducts, loadProducts, currentRate, loadCurrentRate, token: storeToken, isAuthenticated, socket } = useStore();
   const navigate = useNavigate();
+  const { toasts, closeToast, error: showError, success: showSuccess, info: showInfo } = useToastNotifications();
+  
+  // ✅ AUTO-ACTUALISATION INTELLIGENTE (toutes les 2 secondes)
+  const { 
+    data: smartProducts, 
+    loading: smartLoading, 
+    refresh: smartRefresh, 
+    lastUpdate,
+    isConnected: wsConnected,
+    changes: productChanges,
+  } = useSmartProducts({
+    enabled: true,
+    onDataChange: (newProducts, changes) => {
+      // Notifier des changements si > 0 items modifiés
+      if (changes.hasChanges && IS_DEV) {
+        console.log('📊 [SmartSync] Produits modifiés:', {
+          added: changes.added.length,
+          updated: changes.updated.length,
+          removed: changes.removed.length,
+        });
+      }
+    },
+  });
+  
+  // Utiliser les produits du smart sync si disponibles, sinon ceux du store
+  const products = smartProducts && smartProducts.length > 0 ? smartProducts : storeProducts;
+  
+  // État de connexion WebSocket
+  const { isConnected, reconnecting } = useWebSocketStatus();
   
   // Constante pour le token offline
   const OFFLINE_BEARER = 'offline-token';
@@ -229,11 +286,97 @@ const ProductsPage = () => {
   const [visualValues, setVisualValues] = useState({}); // Map<rowId, {field: value}>
   const visualValuesTimeoutsRef = useRef(new Map()); // Map<rowId, timeoutId>
   
+  // ✅ PRO: Tracker les 3 derniers produits modifiés pour animation visuelle (persisté dans localStorage)
+  const RECENT_MOD_KEY = 'lagrace_recently_modified_products';
+  const RECENT_MOD_DURATION = 10000; // 10 secondes
+  
+  // Charger depuis localStorage au démarrage
+  const loadRecentlyModified = useCallback(() => {
+    try {
+      const stored = localStorage.getItem(RECENT_MOD_KEY);
+      if (!stored) return [];
+      const parsed = JSON.parse(stored);
+      const now = Date.now();
+      // Filtrer les entrées expirées (plus de 10 secondes)
+      return parsed.filter(r => (now - r.timestamp) < RECENT_MOD_DURATION).slice(0, 3);
+    } catch {
+      return [];
+    }
+  }, []);
+  
+  const [recentlyModifiedRows, setRecentlyModifiedRows] = useState(() => loadRecentlyModified());
+  const recentlyModifiedTimeoutsRef = useRef(new Map()); // Map<rowId, timeoutId>
+  
+  // Sauvegarder dans localStorage quand ça change
+  useEffect(() => {
+    try {
+      localStorage.setItem(RECENT_MOD_KEY, JSON.stringify(recentlyModifiedRows));
+    } catch {
+      // Ignorer les erreurs localStorage
+    }
+  }, [recentlyModifiedRows]);
+  
+  // ✅ PRO: Au montage, programmer les timeouts pour les entrées restaurées
+  useEffect(() => {
+    const now = Date.now();
+    recentlyModifiedRows.forEach(r => {
+      const remaining = RECENT_MOD_DURATION - (now - r.timestamp);
+      if (remaining > 0 && !recentlyModifiedTimeoutsRef.current.has(r.rowId)) {
+        const timeoutId = setTimeout(() => {
+          if (isMountedRef.current) {
+            setRecentlyModifiedRows(prev => prev.filter(row => row.rowId !== r.rowId));
+          }
+          recentlyModifiedTimeoutsRef.current.delete(r.rowId);
+        }, remaining);
+        recentlyModifiedTimeoutsRef.current.set(r.rowId, timeoutId);
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Seulement au montage
+  
+  // ✅ PRO: Fonction pour marquer un produit comme récemment modifié (animation 10s)
+  const markRowAsModified = useCallback((rowId) => {
+    if (!rowId || !isMountedRef.current) return;
+    
+    // Annuler le timeout existant pour ce rowId
+    if (recentlyModifiedTimeoutsRef.current.has(rowId)) {
+      clearTimeout(recentlyModifiedTimeoutsRef.current.get(rowId));
+    }
+    
+    setRecentlyModifiedRows(prev => {
+      // Retirer si déjà présent
+      const filtered = prev.filter(r => r.rowId !== rowId);
+      // Ajouter en premier (le plus récent)
+      const updated = [{ rowId, timestamp: Date.now() }, ...filtered];
+      // Garder seulement les 3 derniers
+      return updated.slice(0, 3);
+    });
+    
+    // Retirer l'animation après 10 secondes
+    const timeoutId = setTimeout(() => {
+      if (isMountedRef.current) {
+        setRecentlyModifiedRows(prev => prev.filter(r => r.rowId !== rowId));
+      }
+      recentlyModifiedTimeoutsRef.current.delete(rowId);
+    }, RECENT_MOD_DURATION);
+    
+    recentlyModifiedTimeoutsRef.current.set(rowId, timeoutId);
+  }, []);
+  
   // Refs pour auto-save IA
   const pendingSavesRef = useRef(new Map());
   const savingLoopRef = useRef(false); // ✅ Boucle de sauvegarde au lieu d'un lock simple
   const idleSaveTimersRef = useRef(new Map()); // Map<rowId, timeoutId>
   const lastInputAtRef = useRef(new Map());    // Map<rowId, timestamp>
+  
+  // ✅ PRO: Ref pour tracker les suppressions en attente de sync
+  const pendingDeletionsRef = useRef(new Set()); // Set<productCode>
+
+  // ✅ FOCUS PROTECTION SYSTEM PRO: Empêche le vol de focus pendant la saisie
+  const isUserTypingRef = useRef(false);
+  const lastActiveInputRef = useRef(null);
+  const initialMountDoneRef = useRef(false);
+  const searchInputRef = useRef(null);
 
   // ✅ Robustesse: éviter setState après unmount + cleanup timers (évite freeze / fuites)
   const isMountedRef = useRef(false);
@@ -280,6 +423,80 @@ const ProductsPage = () => {
   useEffect(() => {
     editingValuesRef.current = editingValues;
   }, [editingValues]);
+
+  // ✅ FOCUS PROTECTION SYSTEM PRO: Détection et restauration automatique du focus
+  useEffect(() => {
+    if (typeof document === 'undefined') return;
+
+    const handleFocusIn = (e) => {
+      const target = e.target;
+      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT') {
+        isUserTypingRef.current = true;
+        lastActiveInputRef.current = target;
+      }
+    };
+
+    const handleFocusOut = (e) => {
+      // Délai pour permettre le changement de focus naturel entre champs
+      setTimeout(() => {
+        const activeEl = document.activeElement;
+        const isStillInInput = activeEl?.tagName === 'INPUT' || activeEl?.tagName === 'TEXTAREA' || activeEl?.tagName === 'SELECT';
+        
+        if (!isStillInInput) {
+          // L'utilisateur a quitté les champs de saisie normalement
+          isUserTypingRef.current = false;
+        }
+        
+        // ✅ PROTECTION ANTI-VOL: Si on était en train de taper et le focus a été volé
+        if (isUserTypingRef.current && lastActiveInputRef.current) {
+          const lastInput = lastActiveInputRef.current;
+          
+          // Vérifier si le focus a été perdu de manière inattendue (pas un clic ailleurs)
+          if (!isStillInInput && e.relatedTarget === null) {
+            // Le focus a été volé ! Restaurer immédiatement
+            if (IS_DEV) {
+              console.log('🔒 [FOCUS PROTECTION] Focus volé détecté, restauration...');
+            }
+            
+            requestAnimationFrame(() => {
+              if (lastInput && document.contains(lastInput) && document.activeElement !== lastInput) {
+                try {
+                  lastInput.focus();
+                  // Restaurer la position du curseur à la fin
+                  if (lastInput.type === 'text' || lastInput.type === 'number') {
+                    const len = String(lastInput.value || '').length;
+                    lastInput.setSelectionRange?.(len, len);
+                  }
+                  if (IS_DEV) {
+                    console.log('✅ [FOCUS PROTECTION] Focus restauré sur:', lastInput.placeholder || lastInput.name || 'input');
+                  }
+                } catch (e) {
+                  // Silencieux
+                }
+              }
+            });
+          }
+        }
+      }, 50);
+    };
+
+    document.addEventListener('focusin', handleFocusIn, true);
+    document.addEventListener('focusout', handleFocusOut, true);
+
+    return () => {
+      document.removeEventListener('focusin', handleFocusIn, true);
+      document.removeEventListener('focusout', handleFocusOut, true);
+    };
+  }, []);
+
+  // ✅ AUTO-FOCUS INITIAL UNIQUE: Seulement au premier montage
+  useEffect(() => {
+    if (!initialMountDoneRef.current && searchInputRef.current) {
+      // Focus sur recherche seulement au premier montage
+      searchInputRef.current.focus();
+      initialMountDoneRef.current = true;
+    }
+  }, []);
   
   // ✅ Ref pour tracker le dernier champ prix édité (USD ou FC)
   const lastPriceEditedRef = useRef(new Map()); // Map<rowId, 'sale_price_usd' | 'sale_price_fc'>
@@ -383,52 +600,102 @@ const ProductsPage = () => {
     }
   }, []);
 
-  // ✅ Socket.IO listener pour écouter les mises à jour de produits depuis Google Sheets
+  // ✅ PRO: Socket.IO listener avec debounce + startTransition pour ne pas bloquer les inputs
+  // Ref pour debounce Socket.IO (évite les re-renders massifs)
+  const socketDebounceRef = useRef(null);
+  const SOCKET_DEBOUNCE_MS = 500; // 500ms de debounce
+
   useEffect(() => {
-    if (!socket) return; // Socket pas encore initialisé
+    if (!socket) return;
     
-    const handleProductsUpdated = async (data) => {
+    const handleProductsUpdated = (data) => {
       if (IS_DEV) {
         console.log('📡 [ProductsPage] Event "products:updated" reçu:', data);
         console.log(`   → ${data.count} produit(s) mis à jour depuis Google Sheets`);
       }
       
-      try {
-        const savedTop = captureScrollTop();
-        // Recharger les produits pour avoir les données à jour
-        await loadProducts();
-        restoreScrollTopIfJumped(savedTop);
-        
-        // Afficher une notification à l'utilisateur (optionnel)
-        if (IS_DEV) {
-          console.log('✅ [ProductsPage] Produits rechargés depuis le serveur');
-        }
-      } catch (error) {
-        console.error('❌ [ProductsPage] Erreur lors du rechargement des produits:', error);
+      // ✅ PRO: Debounce pour éviter les re-renders massifs si plusieurs events arrivent
+      if (socketDebounceRef.current) {
+        clearTimeout(socketDebounceRef.current);
       }
+      
+      socketDebounceRef.current = setTimeout(() => {
+        // ✅ FOCUS PROTECTION PRO: Utilise le système global de détection de saisie
+        if (isUserCurrentlyTyping()) {
+          if (IS_DEV) {
+            console.log('⏳ [ProductsPage] Utilisateur en train de taper (global), reload différé de 3s');
+          }
+          // ✅ Réessayer dans 3 secondes
+          socketDebounceRef.current = setTimeout(() => {
+            // Vérifier à nouveau si l'utilisateur tape
+            if (isUserCurrentlyTyping()) {
+              // Encore en train de taper, réessayer plus tard
+              return;
+            }
+            // ✅ PRÉSERVER L'ÉTAT UI
+            const savedUIState = saveUIState();
+            const savedTop = captureScrollTop();
+            startTransition(() => {
+              loadProducts()
+                .then(() => {
+                  restoreScrollTopIfJumped(savedTop);
+                  restoreUIState(savedUIState);
+                })
+                .catch(() => {});
+            });
+          }, 3000);
+          return;
+        }
+        
+        // ✅ PRÉSERVER L'ÉTAT UI AVANT LE RECHARGEMENT
+        const savedUIState = saveUIState();
+        const savedTop = captureScrollTop();
+        
+        // ✅ PRO: startTransition pour ne pas bloquer les inputs pendant le reload
+        startTransition(() => {
+          loadProducts()
+            .then(() => {
+              restoreScrollTopIfJumped(savedTop);
+              // ✅ RESTAURER L'ÉTAT UI APRÈS LE RECHARGEMENT
+              setTimeout(() => restoreUIState(savedUIState), 50);
+              if (IS_DEV) {
+                console.log('✅ [ProductsPage] Produits rechargés (startTransition, UI préservé)');
+              }
+            })
+            .catch(error => {
+              // ✅ Silencieux en production
+              if (IS_DEV) {
+                console.error('❌ [ProductsPage] Erreur rechargement:', error);
+              }
+            });
+        });
+      }, SOCKET_DEBOUNCE_MS);
     };
     
-    // S'abonner à l'événement 'products:updated'
     socket.on('products:updated', handleProductsUpdated);
     
     if (IS_DEV) {
-      console.log('🔗 [ProductsPage] Listener Socket.IO "products:updated" enregistré');
+      console.log('🔗 [ProductsPage] Listener Socket.IO "products:updated" (debounced + startTransition)');
     }
     
-    // Cleanup: désabonner au démontage du composant
     return () => {
       socket.off('products:updated', handleProductsUpdated);
+      if (socketDebounceRef.current) {
+        clearTimeout(socketDebounceRef.current);
+      }
       if (IS_DEV) {
         console.log('🔓 [ProductsPage] Listener Socket.IO "products:updated" désabonné');
       }
     };
   }, [socket, captureScrollTop, loadProducts, restoreScrollTopIfJumped]);
 
-  // ✅ Socket.IO listener pour la synchronisation automatique intelligente
+  // ✅ PRO: Socket.IO listener pour sync avec startTransition (non-bloquant)
+  const syncDebounceRef = useRef(null);
+
   useEffect(() => {
     if (!socket) return;
 
-    const handleProductsSynced = async (data) => {
+    const handleProductsSynced = (data) => {
       if (IS_DEV) {
         console.log('🔄 [AutoSync] Event "products:synced" reçu:', {
           updated: data.updated,
@@ -438,34 +705,128 @@ const ProductsPage = () => {
         });
       }
 
-      // Si il y a eu des updates, recharger les produits
+      // ✅ Seulement recharger si il y a eu des updates
       if (data.updated > 0) {
-        try {
-          const savedTop = captureScrollTop();
-          await loadProducts();
-          restoreScrollTopIfJumped(savedTop);
-          if (IS_DEV) {
-            console.log(`✅ [AutoSync] Produits rechargés (${data.updated} mises à jour)`);
-          }
-        } catch (error) {
-          console.error('❌ [AutoSync] Erreur rechargement produits:', error);
+        // ✅ PRO: Debounce pour éviter surcharge
+        if (syncDebounceRef.current) {
+          clearTimeout(syncDebounceRef.current);
         }
+        
+        syncDebounceRef.current = setTimeout(() => {
+          // ✅ FOCUS PROTECTION PRO: Utilise le système global
+          if (isUserCurrentlyTyping()) {
+            if (IS_DEV) {
+              console.log('⏳ [AutoSync] Utilisateur en train de taper (global), sync différé de 3s');
+            }
+            syncDebounceRef.current = setTimeout(() => {
+              if (isUserCurrentlyTyping()) return; // Encore en train de taper
+              const savedUIState = saveUIState();
+              const savedTop = captureScrollTop();
+              startTransition(() => {
+                loadProducts()
+                  .then(() => {
+                    restoreScrollTopIfJumped(savedTop);
+                    restoreUIState(savedUIState);
+                  })
+                  .catch(() => {});
+              });
+            }, 3000);
+            return;
+          }
+          
+          // ✅ PRÉSERVER L'ÉTAT UI
+          const savedUIState = saveUIState();
+          const savedTop = captureScrollTop();
+          
+          // ✅ PRO: startTransition pour ne pas bloquer les inputs
+          startTransition(() => {
+            loadProducts()
+              .then(() => {
+                restoreScrollTopIfJumped(savedTop);
+                setTimeout(() => restoreUIState(savedUIState), 50);
+                if (IS_DEV) {
+                  console.log(`✅ [AutoSync] ${data.updated} produit(s) rechargé(s) (UI préservé)`);
+                }
+              })
+              .catch(error => {
+                // ✅ Silencieux en production
+                if (IS_DEV) {
+                  console.error('❌ [AutoSync] Erreur rechargement:', error);
+                }
+              });
+          });
+        }, SOCKET_DEBOUNCE_MS);
       }
     };
 
     socket.on('products:synced', handleProductsSynced);
 
     if (IS_DEV) {
-      console.log('🔗 [ProductsPage] Listener Socket.IO "products:synced" enregistré');
+      console.log('🔗 [ProductsPage] Listener Socket.IO "products:synced" (debounced + startTransition)');
     }
 
     return () => {
       socket.off('products:synced', handleProductsSynced);
+      if (syncDebounceRef.current) {
+        clearTimeout(syncDebounceRef.current);
+      }
       if (IS_DEV) {
         console.log('🔓 [ProductsPage] Listener Socket.IO "products:synced" désabonné');
       }
     };
   }, [socket, captureScrollTop, loadProducts, restoreScrollTopIfJumped]);
+
+  // ✅ PRO: Socket.IO listener pour confirmation de suppression produit
+  useEffect(() => {
+    if (!socket) return;
+
+    const handleProductDeleted = (data) => {
+      const code = data?.code || data?.product_code;
+      if (!code) return;
+      
+      if (IS_DEV) {
+        console.log('🗑️ [Socket] Event "product:deleted" reçu:', code);
+      }
+
+      // Supprimer du pending deletions (sync confirmée)
+      pendingDeletionsRef.current.delete(code);
+      
+      // S'assurer que le produit n'est plus dans le store
+      const currentStore = useStore.getState();
+      const stillExists = (currentStore.products || []).some(p => {
+        const pCode = String(p.code || p.product_code || '').trim();
+        return pCode === code;
+      });
+      
+      if (stillExists) {
+        // Le produit est encore là (peut-être rechargé par un pull) → le supprimer
+        const updatedProducts = (currentStore.products || []).filter(p => {
+          const pCode = String(p.code || p.product_code || '').trim();
+          return pCode !== code;
+        });
+        useStore.setState({ products: updatedProducts }, false);
+        
+        if (IS_DEV) {
+          console.log(`🗑️ [Socket] Produit ${code} supprimé du store (confirmation sync)`);
+        }
+      }
+      
+      showSuccess(`✅ Produit "${code}" synchronisé - supprimé de Sheets`);
+    };
+
+    socket.on('product:deleted', handleProductDeleted);
+
+    if (IS_DEV) {
+      console.log('🔗 [ProductsPage] Listener Socket.IO "product:deleted" enregistré');
+    }
+
+    return () => {
+      socket.off('product:deleted', handleProductDeleted);
+      if (IS_DEV) {
+        console.log('🔓 [ProductsPage] Listener Socket.IO "product:deleted" désabonné');
+      }
+    };
+  }, [socket, showSuccess]);
 
   // Fonction helper pour obtenir les headers d'authentification (optimisée)
   const getAuthHeaders = useCallback(() => {
@@ -893,11 +1254,18 @@ const ProductsPage = () => {
     const unitLevel = row.unit_level || edits?.unit_level || 'CARTON';
     const productName = (edits?.product_name || row.product_name || '').trim();
     
+    // ✅ PRO FIX: Si le nom est vide sur une ligne vide, c'est une "création annulée"
+    // Ne pas afficher d'erreur, juste ignorer silencieusement
     if (!productName) {
+      if (row?.is_empty) {
+        // Création annulée silencieusement - l'utilisateur a vidé le champ
+        if (IS_DEV) console.log('⏹️ [handleCreateProduct] Création annulée - champ vide');
+        throw new Error('Annulé'); // ✅ Ce message spécial est ignoré par le catch
+      }
       throw new Error('Le nom du produit est requis');
     }
 
-    // ✅ Normaliser Mark (peut être vide; validation au blur)
+    // ✅ FIX PRO: Mark peut être vide - l'utilisateur est libre
     const mark = normalizeMark(edits?.unit_mark);
     
     // Calculer USD depuis les edits (si FC modifié, convertir en USD)
@@ -925,10 +1293,31 @@ const ProductsPage = () => {
     
     // Pour MILLIER et PIECE, vérifier si existe en CARTON
     if (unitLevel === 'MILLIER' || unitLevel === 'PIECE') {
-      // Rechercher un produit avec le même nom qui a une unité CARTON
+      // ✅ FIX PRO: Si l'utilisateur a sélectionné un produit depuis les suggestions, utiliser son code
+      const linkedProductCode = edits?._link_to_product;
+      
+      if (IS_DEV) {
+        console.log('🔍 [handleCreateProduct] Recherche CARTON pour MILLIER/PIECE:', {
+          linkedProductCode,
+          productName,
+          unitLevel,
+          productsCount: products?.length
+        });
+      }
+      
+      // Rechercher un produit avec le même nom (ou code lié) qui a une unité CARTON
       const existingCarton = Array.isArray(products) ? products.find(p => {
         if (!p || !p.name || typeof p.name !== 'string') return false;
         try {
+          // Si un code lié est fourni, chercher par code
+          if (linkedProductCode) {
+            const match = p.code === linkedProductCode || p.id === linkedProductCode;
+            if (match && IS_DEV) {
+              console.log('✅ [handleCreateProduct] CARTON trouvé par code lié:', p.name, p.code);
+            }
+            return match;
+          }
+          // Sinon chercher par nom
           const nameMatch = p.name.toLowerCase().trim() === productName.toLowerCase().trim();
           const hasCarton = Array.isArray(p.units) && p.units.some(u => u && u.unit_level === 'CARTON');
           return nameMatch && hasCarton;
@@ -939,15 +1328,21 @@ const ProductsPage = () => {
       
       if (existingCarton) {
         const auth = getAuthHeaders();
-        const productKey = existingCarton.id ?? existingCarton.code;
+        // ✅ FIX CRITIQUE: Utiliser CODE (pas ID numérique) - l'API attend /api/products/:code
+        const productKey = existingCarton.code || existingCarton.id;
+        
+        if (IS_DEV) {
+          console.log('🔗 [handleCreateProduct] Utilisation productKey:', productKey, '(code:', existingCarton.code, ', id:', existingCarton.id, ')');
+        }
 
         // Reprendre le produit "frais" (évite unités périmées)
         let currentProduct = existingCarton;
         try {
           const r = await axios.get(`${API_URL}/api/products/${productKey}`, auth);
           currentProduct = r.data;
-        } catch {
+        } catch (err) {
           // si GET échoue, on fallback sur existingCarton
+          if (IS_DEV) console.warn('⚠️ GET produit échoué, fallback:', err.message);
         }
 
         const now = nowISO();
@@ -957,20 +1352,23 @@ const ProductsPage = () => {
         const purchaseValue = toNumberSafe(edits?.purchase_price_usd, 0);
 
         const autoStock = Math.round(toNumberSafe(edits?.auto_stock_factor, 1));
-        const newUnit = buildUnitPayload(
-          {
-            unit_level: unitLevel,
-            unit_mark: mark,
-            stock_current: stockValue,
-            purchase_price_usd: purchaseValue,
-            sale_price_usd: salePriceUSD, // USD source de vérité
-            auto_stock_factor: autoStock,
-            qty_step: 1,
-            extra1: null,
-            extra2: null,
-          },
-          { last_update: now, synced_at: null }
-        );
+        
+        // ✅ FIX CRITIQUE: NOUVELLE unité = PAS d'UUID (le backend le génère)
+        // Ne pas utiliser buildUnitPayload qui pourrait copier un UUID existant
+        const newUnit = {
+          unit_level: unitLevel,
+          unit_mark: mark || '', // ✅ Mark peut être vide
+          stock_current: stockValue,
+          purchase_price_usd: purchaseValue,
+          sale_price_usd: salePriceUSD, // USD source de vérité
+          auto_stock_factor: autoStock,
+          qty_step: 1,
+          extra1: null,
+          extra2: null,
+          last_update: now,
+          synced_at: null,
+          // ⚠️ PAS de uuid ici - le backend le génère pour nouvelle unité
+        };
 
         const safeUnits = (currentProduct.units || []).map((u) => buildUnitPayload(u));
         safeUnits.push(newUnit);
@@ -984,84 +1382,97 @@ const ProductsPage = () => {
         await axios.put(`${API_URL}/api/products/${productKey}`, payload, auth);
         return;
       } else {
-        // Demander confirmation via modal
-        return new Promise((resolve, reject) => {
-          setModalState({
-            isOpen: true,
-            type: 'create_confirm',
-            data: {
-              row,
-              edits,
-              unitLevel,
-              onConfirm: async () => {
-                try {
-                  // Générer un code unique
-                  const code = edits?.product_code || `PROD-${Date.now()}`;
-                  // ✅ Parser correctement les valeurs numériques
-                  const stockStr = String(edits?.stock_current || '').trim();
-                  const stockValue = stockStr !== '' ? (parseFloat(stockStr) || 0) : 0;
-                  const purchaseStr = String(edits?.purchase_price_usd || '').trim();
-                  const purchaseValue = purchaseStr !== '' ? (parseFloat(purchaseStr) || 0) : 0;
-                  
-                  const autoStock = Math.round(toNumberSafe(edits?.auto_stock_factor, 1));
-                  await axios.post(`${API_URL}/api/products`, {
-                    code,
-                    name: productName,
-                    units: [{
-                      unit_level: unitLevel,
-                      unit_mark: mark,
-                      stock_current: stockValue,
-                      sale_price_usd: salePriceUSD, // USD comme source de vérité
-                      // Ne pas envoyer sale_price_fc, le backend le calculera depuis USD
-                      purchase_price_usd: purchaseValue,
-                      auto_stock_factor: autoStock,  // ✅ ADD
-                    }]
-                  }, getAuthHeaders());
-                  setModalState({ isOpen: false, type: '', data: null });
-                  resolve();
-                } catch (error) {
-                  reject(error);
-                }
-              },
-              onCustomName: async (customName) => {
-                try {
-                  const code = edits?.product_code || `PROD-${Date.now()}`;
-                  // ✅ Parser correctement les valeurs numériques
-                  const stockStr = String(edits?.stock_current || '').trim();
-                  const stockValue = stockStr !== '' ? (parseFloat(stockStr) || 0) : 0;
-                  const purchaseStr = String(edits?.purchase_price_usd || '').trim();
-                  const purchaseValue = purchaseStr !== '' ? (parseFloat(purchaseStr) || 0) : 0;
-                  
-                  const autoStock = Math.round(toNumberSafe(edits?.auto_stock_factor, 1));
-                  await axios.post(`${API_URL}/api/products`, {
-                    code,
-                    name: customName,
-                    units: [{
-                      unit_level: unitLevel,
-                      unit_mark: mark,
-                      stock_current: stockValue,
-                      sale_price_usd: salePriceUSD, // USD comme source de vérité
-                      // Ne pas envoyer sale_price_fc, le backend le calculera depuis USD
-                      purchase_price_usd: purchaseValue,
-                      auto_stock_factor: autoStock,  // ✅ ADD
-                    }]
-                  }, getAuthHeaders());
-                  setModalState({ isOpen: false, type: '', data: null });
-                  resolve();
-                } catch (error) {
-                  reject(error);
-                }
-              },
-              onCancel: () => {
-                setModalState({ isOpen: false, type: '', data: null });
-                reject(new Error('Annulé'));
-              }
-            }
+        // ✅ FIX: Pas de modal - juste un message d'info et on annule silencieusement
+        // L'utilisateur doit d'abord sélectionner un produit CARTON existant dans les suggestions
+        showInfo(`⚠️ Créez d'abord un produit CARTON avec ce nom, puis ajoutez l'unité ${unitLevel}`);
+        
+        // Nettoyer la ligne vide (ne pas la laisser en erreur)
+        if (row?.id) {
+          pendingSavesRef.current.delete(row.id);
+          setEditingValues(prev => {
+            const copy = { ...prev };
+            delete copy[row.id];
+            return copy;
           });
-        });
+        }
+        
+        // Annuler silencieusement (pas d'erreur console)
+        return;
       }
     } else {
-      // CARTON peut être créé directement
+      // CARTON peut être créé directement MAIS vérifier si le nom existe déjà
+      
+      // ✅ PRO FIX: Vérifier si un produit avec le même nom existe déjà (case-insensitive)
+      const existingProduct = Array.isArray(products) ? products.find(p => {
+        if (!p || !p.name || typeof p.name !== 'string') return false;
+        return p.name.toLowerCase().trim() === productName.toLowerCase().trim();
+      }) : null;
+      
+      if (existingProduct) {
+        // ✅ Le produit existe déjà - ne pas recréer
+        // Vérifier s'il a déjà une unité CARTON
+        const hasCarton = Array.isArray(existingProduct.units) && 
+          existingProduct.units.some(u => u && u.unit_level === 'CARTON');
+        
+        if (hasCarton) {
+          showInfo(`⚠️ Le produit "${existingProduct.name}" existe déjà en CARTON. Sélectionnez-le dans la liste.`);
+        } else {
+          // Le produit existe mais sans CARTON - ajouter l'unité CARTON
+          showInfo(`ℹ️ Ajout de l'unité CARTON au produit existant "${existingProduct.name}"`);
+          
+          const auth = getAuthHeaders();
+          const productKey = existingProduct.code || existingProduct.id;
+          
+          // Récupérer le produit frais
+          let currentProduct = existingProduct;
+          try {
+            const r = await axios.get(`${API_URL}/api/products/${productKey}`, auth);
+            currentProduct = r.data;
+          } catch (err) {
+            if (IS_DEV) console.warn('⚠️ GET produit échoué, fallback:', err.message);
+          }
+          
+          const stockStr = String(edits?.stock_current || '').trim();
+          const stockValue = stockStr !== '' ? (parseFloat(stockStr) || 0) : 0;
+          const purchaseStr = String(edits?.purchase_price_usd || '').trim();
+          const purchaseValue = purchaseStr !== '' ? (parseFloat(purchaseStr) || 0) : 0;
+          const autoStock = Math.round(toNumberSafe(edits?.auto_stock_factor, 1));
+          
+          const newUnit = {
+            unit_level: 'CARTON',
+            unit_mark: mark || '',
+            stock_current: stockValue,
+            sale_price_usd: salePriceUSD,
+            purchase_price_usd: purchaseValue,
+            auto_stock_factor: autoStock,
+            qty_step: 1,
+            last_update: nowISO(),
+          };
+          
+          const safeUnits = (currentProduct.units || []).map((u) => buildUnitPayload(u));
+          safeUnits.push(newUnit);
+          
+          await axios.put(`${API_URL}/api/products/${productKey}`, {
+            name: currentProduct.name,
+            units: safeUnits,
+          }, auth);
+          
+          return;
+        }
+        
+        // Nettoyer la ligne vide
+        if (row?.id) {
+          pendingSavesRef.current.delete(row.id);
+          setEditingValues(prev => {
+            const copy = { ...prev };
+            delete copy[row.id];
+            return copy;
+          });
+        }
+        return;
+      }
+      
+      // ✅ Nouveau produit - créer
       const code = edits?.product_code || `PROD-${Date.now()}`;
       // ✅ Parser correctement les valeurs numériques
       const stockStr = String(edits?.stock_current || '').trim();
@@ -1070,21 +1481,22 @@ const ProductsPage = () => {
       const purchaseValue = purchaseStr !== '' ? (parseFloat(purchaseStr) || 0) : 0;
       
       const autoStock = Math.round(toNumberSafe(edits?.auto_stock_factor, 1));
+      const unitPayload = {
+        unit_level: 'CARTON',
+        unit_mark: mark || '', // ✅ Mark peut être vide
+        stock_current: stockValue,
+        sale_price_usd: salePriceUSD, // USD comme source de vérité
+        // Ne pas envoyer sale_price_fc, le backend le calculera depuis USD
+        purchase_price_usd: purchaseValue,
+        auto_stock_factor: autoStock,
+      };
       await axios.post(`${API_URL}/api/products`, {
         code,
         name: productName,
-        units: [{
-          unit_level: 'CARTON',
-          unit_mark: mark,
-          stock_current: stockValue,
-          sale_price_usd: salePriceUSD, // USD comme source de vérité
-          // Ne pas envoyer sale_price_fc, le backend le calculera depuis USD
-          purchase_price_usd: purchaseValue,
-          auto_stock_factor: autoStock,  // ✅ ADD
-        }]
+        units: [unitPayload]
       }, getAuthHeaders());
     }
-  }, [products, calculateFC, calculateUSD, getAuthHeaders]);
+  }, [products, calculateFC, calculateUSD, getAuthHeaders, showInfo]);
 
   // Mettre à jour un produit
   // IMPORTANT: USD est la source de vérité; FC est dérivé (backend + UI)
@@ -1118,7 +1530,8 @@ const ProductsPage = () => {
 
     if (edits.auto_stock_factor !== undefined) unitUpdates.auto_stock_factor = Math.round(toNumberSafe(edits.auto_stock_factor, 1));
     if (edits.unit_mark !== undefined) {
-      unitUpdates.unit_mark = normalizeMark(edits.unit_mark);  // ✅ trim; never null (always '' or string)
+      // ✅ FIX PRO: L'utilisateur peut modifier le Mark librement (y compris vide)
+      unitUpdates.unit_mark = normalizeMark(edits.unit_mark);
     }
 
     if (edits.product_name !== undefined) productNameUpdate = String(edits.product_name ?? '').trim();
@@ -1211,7 +1624,7 @@ const ProductsPage = () => {
 
   }, [getAuthHeaders, calculateUSD, buildUnitPayload, getProductCode]);
 
-  // ✅ NOUVEAU: Supprimer un produit
+  // ✅ PRO: Supprimer un produit avec tracking de suppression pending - NON-BLOQUANT
   const handleDeleteProduct = useCallback(async (row) => {
     if (!row || row.is_empty) return;
 
@@ -1219,57 +1632,107 @@ const ProductsPage = () => {
 
     const productCode = getProductCode(row);
     if (!productCode) {
-      alert('Code produit invalide');
+      showError('Code produit invalide');
+      return;
+    }
+
+    // ✅ PRO: Éviter double-suppression si déjà en cours
+    if (pendingDeletionsRef.current.has(productCode)) {
+      showInfo(`Suppression de "${row.product_name}" déjà en cours...`);
       return;
     }
 
     // Demander confirmation
     const confirmed = window.confirm(
-      `Êtes-vous sûr de vouloir supprimer le produit "${row.product_name}" (${productCode})?\n\nCette action est irréversible.`
+      `Êtes-vous sûr de vouloir supprimer le produit "${row.product_name}" (${productCode})?\n\nLa suppression sera synchronisée avec Google Sheets.`
     );
     if (!confirmed) return;
+
+    // ✅ YIELD TO MAIN THREAD: Permettre au DOM de se mettre à jour après le confirm
+    await new Promise(resolve => requestAnimationFrame(resolve));
+
+    // ✅ PRO: Marquer comme pending deletion
+    pendingDeletionsRef.current.add(productCode);
+    
+    // ✅ PRO: UI optimiste - supprimer du store IMMÉDIATEMENT
+    const currentStore = useStore.getState();
+    const updatedProducts = (currentStore.products || []).filter(p => {
+      const pCode = String(p.code || p.product_code || '').trim();
+      return pCode !== productCode;
+    });
+    useStore.setState({ products: updatedProducts }, false);
+    
+    if (IS_DEV) {
+      console.log(`🗑️ [ProductsPage] Suppression optimiste produit: ${productCode}`);
+    }
+    
+    // Afficher message de sync en cours
+    setSaveMessage({ type: 'info', text: `Suppression de "${row.product_name}" en cours...` });
 
     try {
       const auth = getAuthHeaders();
       
-      if (IS_DEV) {
-        console.log(`🗑️ [ProductsPage] Suppression produit: ${productCode}`);
-      }
-
       await axios.delete(`${API_URL}/api/products/${productCode}`, auth);
 
       if (IS_DEV) {
-        console.log('✅ [ProductsPage] Produit supprimé avec succès');
+        console.log('✅ [ProductsPage] Produit supprimé en local, sync Sheets en arrière-plan');
       }
 
-      // Afficher message de succès
-      setSaveMessage({ type: 'success', text: 'Produit supprimé avec succès' });
-      setTimeout(() => setSaveMessage({ type: '', text: '' }), 2000);
-
-      // Recharger les produits via le store
-      await loadProducts();
+      // ✅ PRO: Message de succès - la sync Sheets se fait en arrière-plan
+      setSaveMessage({ type: 'success', text: `✅ "${row.product_name}" supprimé - sync Sheets en cours...` });
+      setTimeout(() => {
+        if (isMountedRef.current) {
+          setSaveMessage({ type: '', text: '' });
+        }
+      }, 3000);
+      
       restoreScrollTopIfJumped(savedTop);
 
+      // ✅ PRO: Supprimer du pendingDeletions après délai (le sync worker va s'en occuper)
+      // On garde le pending pendant 30s pour éviter que le produit revienne lors d'un pull
+      setTimeout(() => {
+        pendingDeletionsRef.current.delete(productCode);
+        if (IS_DEV) {
+          console.log(`🗑️ [ProductsPage] Pending deletion expiré: ${productCode}`);
+        }
+      }, 30000);
+
     } catch (error) {
+      // ✅ PRO: Rollback - remettre le produit dans le store si erreur
+      pendingDeletionsRef.current.delete(productCode);
+      
       if (IS_DEV) {
         console.error('❌ [ProductsPage] Erreur suppression produit:', error);
         console.error('   Status:', error.response?.status);
         console.error('   Message:', error.response?.data?.error || error.message);
       }
 
+      // ✅ PRO: Rollback avec startTransition pour ne pas bloquer les inputs
+      setTimeout(() => {
+        startTransition(() => {
+          loadProducts().catch(reloadErr => {
+            if (IS_DEV) {
+              console.warn('⚠️ Erreur rechargement après rollback:', reloadErr.message);
+            }
+          });
+        });
+      }, 16); // 1 frame pour libérer le thread d'abord
+
       let errorMessage = 'Erreur lors de la suppression';
       if (error.response?.status === 401) {
         errorMessage = 'Erreur d\'authentification. Veuillez vous reconnecter.';
       } else if (error.response?.status === 404) {
-        errorMessage = 'Produit non trouvé';
+        // 404 = produit déjà supprimé, ce n'est pas une erreur
+        setSaveMessage({ type: 'success', text: 'Produit déjà supprimé' });
+        setTimeout(() => setSaveMessage({ type: '', text: '' }), 2000);
+        return;
       } else {
         errorMessage = error.response?.data?.error || errorMessage;
       }
 
-      setSaveMessage({ type: 'error', text: errorMessage });
-      setTimeout(() => setSaveMessage({ type: '', text: '' }), 3000);
+      showError(errorMessage);
     }
-  }, [captureScrollTop, getAuthHeaders, getProductCode, loadProducts, restoreScrollTopIfJumped]);
+  }, [captureScrollTop, getAuthHeaders, getProductCode, loadProducts, restoreScrollTopIfJumped, showError, showInfo]);
 
   // Sauvegarder les changements en attente avec boucle (défini avant scheduleSave)
   // ✅ Utilise une boucle au lieu d'un lock pour éviter de perdre les modifications pendant la sauvegarde
@@ -1345,8 +1808,24 @@ const ProductsPage = () => {
           
           // Si c'est une ligne vide, créer le produit
           if (row.is_empty) {
+            // ✅ PRO FIX: Ne pas tenter de créer si le nom est vide (garder les autres edits comme unit_level)
+            const productName = (edits?.product_name || row.product_name || '').trim();
+            if (!productName) {
+              if (IS_DEV) console.log(`⏹️ [ProductsPage] Création différée - nom vide pour ${rowId}, garder les edits`);
+              // ✅ Ne PAS supprimer les edits (unit_level, etc.) - juste retirer du pending
+              pendingSavesRef.current.delete(rowId);
+              return; // Pas de création, garder les edits pour plus tard
+            }
+            
             hadCreation = true; // ✅ FIX #3: tracker la création
             return handleCreateProduct(row, edits).catch(err => {
+              // ✅ FIX: Ignorer les annulations silencieusement (pas d'erreur console)
+              if (err?.message === 'Annulé') {
+                if (IS_DEV) console.log(`⏹️ [ProductsPage] Création annulée pour ${rowId}`);
+                // ✅ PRO: Nettoyer seulement le pending, garder les edits (unit_level sélectionné, etc.)
+                pendingSavesRef.current.delete(rowId);
+                return; // Pas de throw, juste ignorer
+              }
               if (IS_DEV) {
                 console.error(`❌ [ProductsPage] Erreur création produit ${rowId}:`, err);
                 console.error('   Code:', err.response?.status);
@@ -1417,9 +1896,7 @@ const ProductsPage = () => {
             // ✅ Normaliser Mark aussi au patch visuel (pas juste au save)
             if (edits.unit_mark !== undefined) {
               const m = normalizeMark(edits.unit_mark);
-              if (!m) {
-                throw new Error('Le Mark est obligatoire');
-              }
+              // ✅ FIX: Ne pas jeter d'erreur si Mark vide - c'est un champ optionnel
               patch.unit_mark = m;
             }
 
@@ -1442,6 +1919,9 @@ const ProductsPage = () => {
             }
 
             setVisualForRow(rowId, patch, 8000);  // ✅ 8s pour le cache visuel
+            
+            // ✅ PRO: Marquer comme récemment modifié pour animation visuelle
+            markRowAsModified(rowId);
 
             // ✅ nettoyer l'état d'édition après save (mais garder si pending)
             setEditingValues((prev) => {
@@ -1476,11 +1956,16 @@ const ProductsPage = () => {
         setSaveMessage({ type: 'success', text: 'Sauvegarde réussie' });
       }
       
-      // ✅ FIX #3: hadCreation est tracké dans la boucle while, on l'utilise ici pour reload optionnel
+      // ✅ PRO: hadCreation reload avec startTransition pour ne pas bloquer les inputs
       if (hadCreation) {
-        setTimeout(async () => {
-          await loadProducts();
-          restoreScrollTopIfJumped(savedTop);
+        setTimeout(() => {
+          startTransition(() => {
+            loadProducts()
+              .then(() => restoreScrollTopIfJumped(savedTop))
+              .catch(err => {
+                if (IS_DEV) console.warn('⚠️ Reload après création:', err.message);
+              });
+          });
         }, 150);
       }
 
@@ -1494,6 +1979,12 @@ const ProductsPage = () => {
         }
       }, 2000);
     } catch (error) {
+      // ✅ FIX: Ignorer les annulations silencieusement
+      if (error?.message === 'Annulé') {
+        if (IS_DEV) console.log('⏹️ [ProductsPage] Sauvegarde annulée');
+        return;
+      }
+      
       if (IS_DEV) {
         console.error('❌ [ProductsPage] Erreur sauvegarde:', error);
         console.error('   Code:', error.response?.status);
@@ -1512,8 +2003,17 @@ const ProductsPage = () => {
         // ✅ AMÉLIORATION: Message 404 plus clair
         errorMessage = '❌ Produit non trouvé. Vérifiez que le code du produit est correct.';
       } else if (error.response?.status === 409) {
-        // ✅ PRO FIX E: Améliorer le message d'erreur 409 (sans spam)
-        errorMessage = 'Conflit: ce Mark est déjà utilisé pour ce produit et cette unité. Choisissez un autre Mark.';
+        // ✅ PRO FIX: Message d'erreur 409 selon le type de conflit
+        const details = error.response?.data?.details || '';
+        if (details.includes('uuid')) {
+          errorMessage = '❌ Erreur technique: UUID en conflit. Réessayez.';
+        } else if (details.includes('unit_level')) {
+          errorMessage = '❌ Cette unité existe déjà pour ce produit.';
+        } else if (details.includes('unit_mark')) {
+          errorMessage = '❌ Ce Mark est déjà utilisé. Choisissez un autre Mark.';
+        } else {
+          errorMessage = error.response?.data?.error || '❌ Conflit: cette donnée existe déjà.';
+        }
       } else {
         errorMessage = error.response?.data?.error || errorMessage;
       }
@@ -1527,7 +2027,7 @@ const ProductsPage = () => {
       }
       savingLoopRef.current = false; // ✅ Utiliser savingLoopRef au lieu de savingInFlightRef
     }
-  }, [captureScrollTop, restoreScrollTopIfJumped, tableDataById, loadProducts, handleCreateProduct, handleUpdateProduct, calculateFC, calculateUSD, setVisualForRow]);
+  }, [captureScrollTop, restoreScrollTopIfJumped, tableDataById, loadProducts, handleCreateProduct, handleUpdateProduct, calculateFC, calculateUSD, setVisualForRow, markRowAsModified]);
 
   // ✅ AUTO-SAVE IA : save si 5s sans frappe ET la ligne reste active (focus dans la ligne)
   // + save immédiat uniquement quand on quitte réellement la ligne (pas quand on change de cellule dans la même ligne)
@@ -1583,10 +2083,23 @@ const ProductsPage = () => {
   // ✅ Save immédiat forcé (Enter, clic dehors, etc.)
   const flushRowNow = useCallback((rowId, reason = 'manual') => {
     cancelIdleSave(rowId);
+    
+    // ✅ PRO FIX: Si on a des edits pour cette ligne, forcer l'ajout au pending
+    // MAIS seulement si le nom est rempli (pour éviter de créer un produit sans nom)
+    const edits = editingValuesRef.current?.[rowId];
+    const row = tableDataById.get(rowId);
+    if (edits && Object.keys(edits).length > 0) {
+      // Pour les lignes vides, vérifier que le nom est rempli avant de forcer le pending
+      const productName = (edits.product_name ?? row?.product_name ?? '').trim();
+      if (!row?.is_empty || productName) {
+        pendingSavesRef.current.set(rowId, true);
+      }
+    }
+    
     if (!pendingSavesRef.current.has(rowId)) return;
     if (IS_DEV) console.log(`⚡ [AUTO-SAVE IA] ${reason} → save immédiat row=${rowId}`);
     savePendingChanges();
-  }, [cancelIdleSave, savePendingChanges]);
+  }, [cancelIdleSave, savePendingChanges, tableDataById]);
 
   // ✅ Blur intelligent :
   // - si le focus reste dans la même ligne (autre cellule) => PAS de save immédiat (groupage)
@@ -1601,13 +2114,24 @@ const ProductsPage = () => {
         return;
       }
 
+      // ✅ PRO FIX: Si on a des edits pour cette ligne, forcer l'ajout au pending
+      // MAIS seulement si le nom est rempli (pour éviter de créer un produit sans nom)
+      const edits = editingValuesRef.current?.[rowId];
+      const row = tableDataById.get(rowId);
+      if (edits && Object.keys(edits).length > 0) {
+        const productName = (edits.product_name ?? row?.product_name ?? '').trim();
+        if (!row?.is_empty || productName) {
+          pendingSavesRef.current.set(rowId, true);
+        }
+      }
+
       // Focus sorti => save immédiat
       if (pendingSavesRef.current.has(rowId)) {
         if (IS_DEV) console.log(`⚡ [AUTO-SAVE IA] sortie ligne row=${rowId} → save immédiat`);
         savePendingChanges();
       }
     });
-  }, [cancelIdleSave, isRowFocused, scheduleIdleSave, savePendingChanges]);
+  }, [cancelIdleSave, isRowFocused, scheduleIdleSave, savePendingChanges, tableDataById]);
 
   // ✅ PRO FIX B: si clic dehors de la ligne active, flush NON-BLOQUANT (après l'event)
   useEffect(() => {
@@ -1616,6 +2140,13 @@ const ProductsPage = () => {
     const onPointerDownCapture = (e) => {
       const activeRowId = editingCell?.rowId;
       if (!activeRowId) return;
+
+      // ✅ FIX: Ignorer les clics sur les suggestions (createPortal sur document.body)
+      const onSuggestions = e.target?.closest?.('[data-suggestions]');
+      if (onSuggestions) {
+        // Clic sur une suggestion = ne pas flush, laisser la suggestion gérer
+        return;
+      }
 
       const inside = e.target?.closest?.(`[data-rowid="${activeRowId}"]`);
 
@@ -1671,6 +2202,7 @@ const ProductsPage = () => {
   const markSuggestionsCache = useRef(new Map());
   
   // Champs qui déclenchent l'autosave automatique
+  // ⚠️ product_name n'est PAS inclus - sauvegarde seulement sur blur/clic externe
   const AUTO_SAVE_FIELDS = new Set([
     'sale_price_fc',
     'sale_price_usd',
@@ -1678,12 +2210,12 @@ const ProductsPage = () => {
     'stock_current',
     'auto_stock_factor',
     'unit_mark',      // ✅ Ajouter pour éviter perte du mark
-    'product_name'    // ✅ Ajouter pour nom du produit
   ]);
 
   // Obtenir les suggestions de produits par nom - avec cache
   const getProductSuggestions = useCallback((productName, unitLevel) => {
-    if (!productName || typeof productName !== 'string' || productName.trim().length < 2) return [];
+    // ✅ FIX: Réduire à 1 caractère pour recherche temps réel immédiate
+    if (!productName || typeof productName !== 'string' || productName.trim().length < 1) return [];
     if (!Array.isArray(products)) return [];
     
     const cacheKey = `${productName.toLowerCase().trim()}-${unitLevel || 'all'}`;
@@ -1693,15 +2225,24 @@ const ProductsPage = () => {
     
     try {
       const query = productName.toLowerCase().trim();
+      
+      // ✅ FIX PRO: Pour MILLIER/PIECE, chercher les produits qui ont un CARTON
       const suggestions = products.filter(p => {
         if (!p || !p.name) return false;
         try {
-          return p.name.toLowerCase().includes(query) &&
-            (!unitLevel || unitLevel === 'CARTON' || p.units?.some(u => u && u.unit_level === unitLevel));
+          const nameMatch = p.name.toLowerCase().includes(query);
+          if (!nameMatch) return false;
+          
+          // Pour MILLIER ou PIECE, on cherche les produits avec CARTON
+          if (unitLevel === 'MILLIER' || unitLevel === 'PIECE') {
+            return p.units?.some(u => u && u.unit_level === 'CARTON');
+          }
+          
+          return true;
         } catch {
           return false;
         }
-      }).slice(0, 5);
+      }).slice(0, 8); // ✅ Plus de suggestions
       
       productSuggestionsCache.current.set(cacheKey, suggestions);
       return suggestions;
@@ -2139,11 +2680,44 @@ const ProductsPage = () => {
               </span>
             )}
           </h1>
-          <p className="text-gray-400">
-            {initialLoading ? 'Chargement...' : `${productCount} produit(s)`} • Taux: {currentRate || 2800} FC/USD
+          <p className="text-gray-400 flex items-center gap-2 flex-wrap">
+            <span>
+              {initialLoading ? 'Chargement...' : `${productCount} produit(s)`} • Taux: {currentRate || 2800} FC/USD
+            </span>
             {activeFilter !== 'TOUS' && (
-              <span className="ml-2 text-primary-400">
+              <span className="text-primary-400">
                 • Filtre: {activeFilter === 'DETAIL' ? 'Détail (Milliers)' : activeFilter}
+              </span>
+            )}
+            {/* ✅ Indicateur de synchronisation temps réel */}
+            <span className="ml-2">•</span>
+            <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium ${
+              isConnected 
+                ? 'bg-green-500/20 text-green-400 border border-green-500/30' 
+                : reconnecting 
+                ? 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30 animate-pulse' 
+                : 'bg-red-500/20 text-red-400 border border-red-500/30'
+            }`}>
+              {isConnected ? (
+                <>
+                  <Wifi className="w-3 h-3" />
+                  <span>Sync auto 2s</span>
+                </>
+              ) : reconnecting ? (
+                <>
+                  <RefreshCw className="w-3 h-3 animate-spin" />
+                  <span>Reconnexion...</span>
+                </>
+              ) : (
+                <>
+                  <WifiOff className="w-3 h-3" />
+                  <span>Hors ligne</span>
+                </>
+              )}
+            </span>
+            {lastUpdate && (
+              <span className="text-xs text-gray-500">
+                (màj: {new Date(lastUpdate).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', second: '2-digit' })})
               </span>
             )}
           </p>
@@ -2228,6 +2802,17 @@ const ProductsPage = () => {
               <span className="sm:hidden">Imprimer</span>
             </span>
           </button>
+          
+          {/* Bouton Arrivages */}
+          <button
+            onClick={() => navigate('/newarrivage')}
+            className="group relative flex items-center gap-2 px-4 py-2.5 rounded-xl font-semibold bg-gradient-to-r from-green-600 to-emerald-600 text-white hover:shadow-lg hover:shadow-green-500/30 hover:scale-[1.02] active:scale-[0.98] transition-all duration-300"
+            title="Voir les nouveaux arrivages"
+          >
+            <TrendingUp className="w-5 h-5 transition-transform group-hover:scale-110" />
+            <span className="hidden sm:inline">Arrivages</span>
+          </button>
+          
           <button
             onClick={handleExportCSV}
             className="btn-secondary flex items-center gap-2 hover:scale-105 transition-transform"
@@ -2243,12 +2828,15 @@ const ProductsPage = () => {
         <div className="relative mb-4">
           <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5 text-gray-400" />
           <input
+            id="products-search-input"
+            ref={searchInputRef}
             type="text"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             placeholder="Rechercher (nom, code)..."
             className="input-field pl-10 w-full"
-            autoFocus
+            // ❌ autoFocus SUPPRIMÉ: Utiliser initialMountDoneRef pour focus unique au montage
+            // Cela évite le vol de focus lors des rechargements de produits via Socket.IO
           />
         </div>
         
@@ -2351,7 +2939,7 @@ const ProductsPage = () => {
                   </th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-white/5">
+              <tbody className="divide-y divide-white/5" style={{ overflow: 'visible' }}>
                 {/* Bouton pour descendre au dernier produit - au début des lignes vides */}
                 {(() => {
                   try {
@@ -2398,21 +2986,32 @@ const ProductsPage = () => {
                       {/* ✅ Virtualisation: rendre seulement les lignes visibles */}
                       {virtualItems.map((virtualRow) => {
                         const row = filteredData[virtualRow.index];
-                        if (!row) return null;
+                        // ✅ FIX: Protection complète contre null/undefined/missing id
+                        if (!row || row.id == null) return null;
 
                         const index = virtualRow.index;
-                        const isEditingThisRow = editingCell?.rowId === row.id && !row.is_empty;
-                        const hasPendingChanges = pendingSavesRef.current.has(row.id);
+                        const rowId = row.id;
+                        const isEditingThisRow = editingCell?.rowId === rowId && !row.is_empty;
+                        const hasPendingChanges = pendingSavesRef.current.has(rowId);
+                        
+                        // ✅ PRO: Vérifier si c'est une ligne récemment modifiée
+                        const recentModIndex = recentlyModifiedRows.findIndex(r => r.rowId === rowId);
+                        const isRecentlyModified = recentModIndex !== -1;
+                        const recentModRank = recentModIndex + 1; // 1 = le plus récent
 
                         try {
                           return (
                             <tr
-                              key={row.id || `row-${index}`}
-                              data-rowid={row.id}
+                              key={rowId || `row-${index}`}
+                              data-rowid={rowId}
                               data-index={virtualRow.index}
                               ref={rowVirtualizer.measureElement}
                               style={{
                                 height: `${virtualRow.size}px`,
+                                // ✅ FIX: Permettre aux suggestions de déborder
+                                overflow: isEditingThisRow ? 'visible' : undefined,
+                                position: isEditingThisRow ? 'relative' : undefined,
+                                zIndex: isEditingThisRow ? 50 : undefined,
                               }}
                               className={`group ${
                                 row.is_empty ? 'opacity-30' : 'hover:bg-dark-700/50'
@@ -2421,35 +3020,45 @@ const ProductsPage = () => {
                                   ? 'bg-primary-500/10 border-l-2 border-primary-500/50' 
                                   : hasPendingChanges
                                   ? 'bg-orange-500/5 border-l-2 border-orange-500/30'
+                                  : isRecentlyModified
+                                  ? recentModRank === 1 
+                                    ? 'bg-emerald-500/20 border-l-4 border-emerald-400 animate-pulse' 
+                                    : recentModRank === 2
+                                    ? 'bg-emerald-500/10 border-l-3 border-emerald-500/70'
+                                    : 'bg-emerald-500/5 border-l-2 border-emerald-500/40'
                                   : ''
-                              } transition-colors`}
+                              } transition-all duration-300`}
                       >
                     {/* Produit */}
-                    <td className="px-4 py-3">
-                      {editingCell?.rowId === row?.id && editingCell?.field === 'product_name' ? (
-                        <div className="relative">
+                    <td className="px-4 py-3" style={{ position: 'relative', overflow: 'visible' }}>
+                      {editingCell?.rowId === rowId && editingCell?.field === 'product_name' ? (
+                        <div className="relative" style={{ overflow: 'visible' }}>
                           <input
+                            ref={(el) => {
+                              // Stocker la ref de l'input pour positionner le dropdown
+                              if (el) el._inputRef = el;
+                            }}
                             type="text"
                             value={getCellValue(row, 'product_name') || ''}
                             onChange={(e) => {
-                              if (row?.id) {
-                                updateEditValue(row.id, 'product_name', e.target.value);
-                              }
+                              updateEditValue(rowId, 'product_name', e.target.value);
                             }}
-                            onBlur={() => {
+                            onBlur={(e) => {
+                              // ✅ FIX: Vérifier si le clic est sur une suggestion avant de blur
+                              const relatedTarget = e.relatedTarget;
+                              if (relatedTarget && relatedTarget.closest('[data-suggestions]')) {
+                                // Ne pas blur si on clique sur les suggestions
+                                return;
+                              }
                               setTimeout(() => {
-                                if (row?.id) {
-                                  smartBlurRow(row.id);
-                                }
+                                smartBlurRow(rowId);
                                 setEditingCell(null);
                                 setFocusedField(null);
-                              }, 50);
+                              }, 150);
                             }}
                             onKeyPress={(e) => {
                               if (e.key === 'Enter') {
-                                if (row?.id) {
-                                  flushRowNow(row.id, 'enter');
-                                }
+                                flushRowNow(rowId, 'enter');
                                 setEditingCell(null);
                                 setFocusedField(null);
                               }
@@ -2457,46 +3066,174 @@ const ProductsPage = () => {
                             className="input-field text-sm w-full px-4 py-2.5 bg-dark-800/50 border border-primary-500/60 focus:border-primary-500 rounded-lg min-w-[200px] relative z-10"
                             autoFocus
                           />
-                          {/* Suggestions de produits pour autres unités */}
+                          {/* Suggestions de produits pour MILLIER/PIECE - PORTAL pour être au-dessus de tout */}
                           {(() => {
                             try {
                               const productName = getCellValue(row, 'product_name') || '';
                               const unitLevel = getCellValue(row, 'unit_level') || row?.unit_level || '';
-                              const suggestions = unitLevel !== 'CARTON' && productName && typeof productName === 'string' && productName.length >= 2 
+                              
+                              // ✅ FIX PRO: Pour MILLIER/PIECE, chercher les produits CARTON existants
+                              const isSubUnit = unitLevel === 'MILLIER' || unitLevel === 'PIECE';
+                              // ✅ FIX: Afficher suggestions dès 1 caractère pour recherche temps réel
+                              const suggestions = isSubUnit && productName && typeof productName === 'string' && productName.length >= 1 
                                 ? getProductSuggestions(productName, unitLevel)
                                 : [];
                               const autoCode = row?.is_empty && unitLevel === 'CARTON' && productName && productName.trim()
                                 ? generateAutoCode('CARTON')
                                 : null;
                               
-                              return (
+                              // ✅ Afficher un message d'aide si c'est MILLIER/PIECE et le champ est vide
+                              const showHelpMessage = isSubUnit && (!productName || productName.length === 0);
+                              
+                              // ✅ PORTAL: Calculer la position de l'input pour afficher le dropdown
+                              const inputEl = document.activeElement;
+                              const inputRect = inputEl?.getBoundingClientRect?.() || { left: 0, bottom: 0, width: 300 };
+                              
+                              // Le contenu des suggestions à rendre via Portal
+                              const suggestionsContent = (
                                 <>
-                                  {Array.isArray(suggestions) && suggestions.length > 0 && (
-                                    <div className="absolute z-[100] mt-1 w-full bg-dark-800 border border-primary-500/30 rounded-lg shadow-xl max-h-40 overflow-y-auto">
+                                  {/* Message d'aide compact pour MILLIER/PIECE quand le champ est vide */}
+                                  {showHelpMessage && createPortal(
+                                    <div 
+                                      data-suggestions="true"
+                                      className="bg-blue-900/90 border border-blue-400/50 rounded-lg shadow-lg px-3 py-2"
+                                      style={{ 
+                                        position: 'fixed',
+                                        left: `${inputRect.left}px`,
+                                        top: `${inputRect.bottom + 4}px`,
+                                        width: `${Math.max(inputRect.width, 280)}px`,
+                                        zIndex: 99999,
+                                      }}
+                                      onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); }}
+                                    >
+                                      <div className="text-blue-200 text-xs">
+                                        🔍 Tapez le nom d'un CARTON existant
+                                      </div>
+                                    </div>,
+                                    document.body
+                                  )}
+                                  {Array.isArray(suggestions) && suggestions.length > 0 && createPortal(
+                                    <div 
+                                      data-suggestions="true"
+                                      tabIndex={-1}
+                                      className="bg-gradient-to-br from-gray-900 via-dark-900 to-dark-800 border-2 border-primary-400 rounded-xl overflow-hidden"
+                                      style={{ 
+                                        position: 'fixed',
+                                        left: `${Math.max(inputRect.left - 10, 10)}px`,
+                                        top: `${inputRect.bottom + 4}px`,
+                                        width: `${Math.max(inputRect.width + 20, 350)}px`,
+                                        maxHeight: '320px',
+                                        zIndex: 99999,
+                                        boxShadow: '0 15px 50px rgba(0,0,0,0.8), 0 0 0 2px rgba(139,92,246,0.5)'
+                                      }}
+                                      onMouseDown={(e) => {
+                                        // ✅ CRITIQUE: Empêcher le blur de l'input parent
+                                        e.preventDefault();
+                                        e.stopPropagation();
+                                      }}
+                                    >
+                                      {/* Header compact - juste le nombre de résultats */}
+                                      <div className="px-3 py-2 text-sm font-medium text-gray-300 border-b border-primary-500/40 bg-dark-800/80 flex items-center justify-between">
+                                        <span>📦 Produits CARTON</span>
+                                        <span className="bg-primary-500/30 text-primary-200 px-2 py-0.5 rounded-full text-xs">
+                                          {suggestions.length}
+                                        </span>
+                                      </div>
+                                      {/* Liste scrollable */}
+                                      <div className="max-h-[280px] overflow-y-auto">
                                       {suggestions.map((p, idx) => {
                                         if (!p || !p.name) return null;
+                                        // Trouver l'unité CARTON pour afficher son info
+                                        const cartonUnit = p.units?.find(u => u?.unit_level === 'CARTON');
                                         return (
                                           <button
                                             key={p.id || idx}
                                             type="button"
-                                            onClick={() => {
-                                              if (row?.id) {
-                                                updateEditValue(row.id, 'product_name', p.name || '');
-                                                updateEditValue(row.id, 'product_code', p.code || '');
-                                                setTimeout(() => {
-                                                  setEditingCell(null);
-                                                  setFocusedField(null);
-                                                }, 100);
-                                              }
+                                            onMouseDown={(e) => {
+                                              // ✅ Empêcher blur
+                                              e.preventDefault();
+                                              e.stopPropagation();
                                             }}
-                                            className="w-full text-left px-4 py-2 hover:bg-primary-500/20 text-gray-200 text-sm border-b border-white/5 last:border-0"
+                                            onClick={(e) => {
+                                              e.preventDefault();
+                                              e.stopPropagation();
+                                              console.log('✅ [Suggestion] Sélection produit:', p.name, p.code);
+                                              
+                                              // ✅ FIX CRITIQUE: Annuler tout save en attente AVANT de modifier les valeurs
+                                              cancelIdleSave(rowId);
+                                              
+                                              // ✅ FIX: Fermer IMMÉDIATEMENT les suggestions (avant toute autre action)
+                                              setEditingCell(null);
+                                              setFocusedField(null);
+                                              
+                                              // ✅ FIX PRO: Mettre à jour DIRECTEMENT la ref (pas via setState qui est async)
+                                              const currentEdits = editingValuesRef.current[rowId] || {};
+                                              const updatedEdits = {
+                                                ...currentEdits,
+                                                product_name: p.name || '',
+                                                product_code: p.code || '',
+                                                _link_to_product: p.code || p.id  // ✅ CRITIQUE: pour trouver le CARTON existant
+                                              };
+                                              editingValuesRef.current = {
+                                                ...editingValuesRef.current,
+                                                [rowId]: updatedEdits
+                                              };
+                                              
+                                              // ✅ Aussi sync avec le state React pour le rendu
+                                              setEditingValues(prev => ({
+                                                ...prev,
+                                                [rowId]: updatedEdits
+                                              }));
+                                              
+                                              // ✅ FIX: Marquer comme pending (Map.set, pas Set.add)
+                                              pendingSavesRef.current.set(rowId, true);
+                                              
+                                              // ✅ Affichage visuel immédiat
+                                              setVisualForRow(rowId, { product_name: p.name || '' }, 8000);
+                                              
+                                              // ✅ FIX PRO: Sauvegarder IMMÉDIATEMENT après sélection
+                                              setTimeout(() => {
+                                                console.log('💾 [Suggestion] Sauvegarde immédiate après sélection:', rowId, 'avec _link_to_product:', p.code);
+                                                flushRowNow(rowId, 'suggestion-select');
+                                              }, 150);
+                                            }}
+                                            className="w-full text-left px-3 py-2.5 hover:bg-primary-500/40 active:bg-primary-600/60 text-gray-100 border-b border-white/10 last:border-0 cursor-pointer transition-all duration-75"
                                           >
-                                            <div className="font-semibold">{p.name || ''}</div>
-                                            <div className="text-xs text-gray-400">Code: {p.code || ''}</div>
+                                            <div className="font-semibold text-white text-sm">{p.name || ''}</div>
+                                            <div className="flex justify-between items-center text-xs text-gray-300 mt-0.5">
+                                              <span className="text-gray-400">{p.code || '—'}</span>
+                                              {cartonUnit && (
+                                                <span className="text-green-400">
+                                                  Stock: {cartonUnit.stock_current || 0}
+                                                </span>
+                                              )}
+                                            </div>
                                           </button>
                                         );
                                       })}
-                                    </div>
+                                      </div>
+                                    </div>,
+                                    document.body
+                                  )}
+                                  {/* Message si pas de CARTON trouvé pour MILLIER/PIECE */}
+                                  {isSubUnit && productName && productName.length >= 1 && suggestions.length === 0 && createPortal(
+                                    <div 
+                                      data-suggestions="true"
+                                      className="bg-orange-950/90 border border-orange-500/50 rounded-lg shadow-lg px-3 py-2"
+                                      style={{ 
+                                        position: 'fixed',
+                                        left: `${inputRect.left}px`,
+                                        top: `${inputRect.bottom + 4}px`,
+                                        width: `${Math.max(inputRect.width, 280)}px`,
+                                        zIndex: 99999,
+                                      }}
+                                      onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); }}
+                                    >
+                                      <div className="text-orange-300 text-xs font-medium">
+                                        ⚠️ Aucun CARTON pour "{productName}" - Créez-le d'abord
+                                      </div>
+                                    </div>,
+                                    document.body
                                   )}
                                   {autoCode && (
                                     <div className="absolute -bottom-6 left-0 text-xs text-primary-400 font-medium">
@@ -2505,6 +3242,8 @@ const ProductsPage = () => {
                                   )}
                                 </>
                               );
+                              
+                              return suggestionsContent;
                             } catch (err) {
                               if (IS_DEV) {
                                 console.error('Erreur suggestions produits:', err);
@@ -2516,9 +3255,7 @@ const ProductsPage = () => {
                       ) : (
                         <div
                           onClick={() => {
-                            if (row?.id) {
-                              startEdit(row.id, 'product_name', getCellValue(row, 'product_name') || '');
-                            }
+                            startEdit(rowId, 'product_name', getCellValue(row, 'product_name') || '');
                           }}
                           className={`cursor-pointer ${
                             row?.is_empty 
@@ -2547,23 +3284,52 @@ const ProductsPage = () => {
 
                     {/* Unité */}
                     <td className="px-4 py-3">
-                      {editingCell?.rowId === row?.id && editingCell?.field === 'unit_level' ? (
+                      {editingCell?.rowId === rowId && editingCell?.field === 'unit_level' ? (
                         <select
                           value={getCellValue(row, 'unit_level') || ''}
                           onChange={(e) => {
-                            if (row?.id) {
-                              updateEditValue(row.id, 'unit_level', e.target.value);
+                            const newLevel = e.target.value;
+                            // ✅ PRO FIX: Ne pas traiter si valeur vide sélectionnée
+                            if (!newLevel) return;
+                            
+                            updateEditValue(rowId, 'unit_level', newLevel);
+                            
+                            // ✅ FIX PRO: Quand on passe à MILLIER/PIECE sur une nouvelle ligne
+                            // Vider le nom pour forcer la recherche d'un produit CARTON existant
+                            if ((newLevel === 'MILLIER' || newLevel === 'PIECE') && row?.is_empty) {
+                              updateEditValue(rowId, 'product_name', '');
+                              updateEditValue(rowId, 'product_code', '');
+                              // Ouvrir automatiquement le champ de nom pour recherche
+                              setTimeout(() => {
+                                // ✅ PRO FIX: Utiliser startEdit pour initialiser correctement le champ
+                                // Cela préserve unit_level car startEdit fait un merge des valeurs
+                                startEdit(rowId, 'product_name', '');
+                              }, 100);
                             }
                           }}
                           onBlur={() => {
-                            if (row?.id) {
-                              smartBlurRow(row.id);
+                            // ✅ PRO FIX: Ne pas déclencher de sauvegarde si ligne vide sans nom
+                            // IMPORTANT: Utiliser editingValuesRef (synchrone) au lieu du state (asynchrone)
+                            // car updateEditValue peut avoir vidé le nom mais le state n'est pas encore à jour
+                            const edits = editingValuesRef.current?.[rowId] || {};
+                            const productName = (edits.product_name ?? row?.product_name ?? '').trim();
+                            
+                            if (row?.is_empty && !productName) {
+                              // Juste fermer l'édition, ne pas sauvegarder - garder unit_level sélectionné
+                              setEditingCell(null);
+                              setFocusedField(null);
+                              return;
                             }
+                            smartBlurRow(rowId);
                             setEditingCell(null);
                             setFocusedField(null);
                           }}
                           className="input-field text-sm px-4 py-2.5 bg-dark-800/50 border border-primary-500/60 focus:border-primary-500 rounded-lg min-w-[140px] relative z-10"
                         >
+                          {/* ✅ PRO FIX: Option vide par défaut pour éviter l'auto-sélection de Carton */}
+                          {(!getCellValue(row, 'unit_level') && row?.is_empty) && (
+                            <option value="">— Sélectionner —</option>
+                          )}
                           <option value="CARTON">Carton</option>
                           <option value="MILLIER">Détail</option>
                           <option value="PIECE">Pièce</option>
@@ -2571,28 +3337,25 @@ const ProductsPage = () => {
                       ) : (
                         <span
                           onClick={() => {
-                            if (row?.id) {
-                              startEdit(row.id, 'unit_level', row?.unit_level || '');
-                            }
+                            startEdit(rowId, 'unit_level', getCellValue(row, 'unit_level') || '');
                           }}
                           className="cursor-pointer text-gray-200 group-hover:text-primary-300 group-hover:font-semibold hover:text-primary-400"
                         >
-                          {getUnitLabel(row?.unit_level) || '—'}
+                          {/* ✅ PRO FIX: Afficher la valeur éditée si elle existe */}
+                          {getUnitLabel(getCellValue(row, 'unit_level')) || '—'}
                         </span>
                       )}
                     </td>
 
                     {/* Mark */}
                     <td className="px-4 py-3">
-                      {editingCell?.rowId === row?.id && editingCell?.field === 'unit_mark' ? (
+                      {editingCell?.rowId === rowId && editingCell?.field === 'unit_mark' ? (
                         <div className="relative">
                           <input
                             type="text"
                             value={getCellValue(row, 'unit_mark') || ''}
                             onChange={(e) => {
-                              if (row?.id) {
-                                updateEditValue(row.id, 'unit_mark', e.target.value);
-                              }
+                              updateEditValue(rowId, 'unit_mark', e.target.value);
                             }}
                             onBlur={(e) => {
                               const vNorm = String(e.currentTarget.value ?? '').trim();
@@ -2603,44 +3366,33 @@ const ProductsPage = () => {
                                 // Nettoyer seulement l'édition du champ mark
                                 setEditingValues((prev) => {
                                   const copy = { ...prev };
-                                  if (copy[row.id]) {
-                                    const rowCopy = { ...copy[row.id] };
+                                  if (copy[rowId]) {
+                                    const rowCopy = { ...copy[rowId] };
                                     delete rowCopy.unit_mark;
                                     // Si vide, supprimer la ligne
-                                    if (Object.keys(rowCopy).length === 0) delete copy[row.id];
-                                    else copy[row.id] = rowCopy;
+                                    if (Object.keys(rowCopy).length === 0) delete copy[rowId];
+                                    else copy[rowId] = rowCopy;
                                   }
                                   return copy;
                                 });
-                                pendingSavesRef.current.delete(row.id);
-                                cancelIdleSave(row.id);
+                                pendingSavesRef.current.delete(rowId);
+                                cancelIdleSave(rowId);
 
                                 setEditingCell(null);
                                 setFocusedField(null);
                                 return;
                               }
 
-                              // ✅ VALIDATION: Mark obligatoire
-                              if (!vNorm) {
-                                cancelIdleSave(row.id);
-                                pendingSavesRef.current.delete(row.id);
-                                
-                                setSaveMessage({ 
-                                  type: 'error', 
-                                  text: 'Mark obligatoire. Exemple: PQT, RAM, DZ…' 
-                                });
-                                setTimeout(() => setSaveMessage({ type: '', text: '' }), 3000);
-                                return;
-                              }
+                              // ✅ FIX PRO: Mark peut être vide - l'utilisateur est libre
 
                               // ✅ cache visuel immédiat 8s
-                              setVisualForRow(row.id, { unit_mark: vNorm }, 8000);
+                              setVisualForRow(rowId, { unit_mark: vNorm }, 8000);
 
                               // ✅ Pousser la valeur normalisée dans editingValues
-                              updateEditValue(row.id, 'unit_mark', vNorm);
+                              updateEditValue(rowId, 'unit_mark', vNorm);
 
                               // ✅ IA: Blur intelligent - save immédiat si focus sort de la ligne
-                              smartBlurRow(row.id);
+                              smartBlurRow(rowId);
 
                               setEditingCell(null);
                               setFocusedField(null);
@@ -2649,24 +3401,16 @@ const ProductsPage = () => {
                               if (e.key === 'Enter') {
                                 const vNorm = String(e.currentTarget.value ?? '').trim();
 
-                                // ✅ VALIDATION: Mark ne peut pas être vide (DB constraint)
-                                if (!vNorm) {
-                                  setSaveMessage({ 
-                                    type: 'error', 
-                                    text: 'Le Mark (unité de vente) est obligatoire' 
-                                  });
-                                  setTimeout(() => setSaveMessage({ type: '', text: '' }), 3000);
-                                  return;
-                                }
+                                // ✅ FIX PRO: Mark peut être vide - l'utilisateur est libre
 
                                 // ✅ cache visuel immédiat 8s
-                                setVisualForRow(row.id, { unit_mark: vNorm }, 8000);
+                                setVisualForRow(rowId, { unit_mark: vNorm }, 8000);
 
                                 // ✅ Pousser la valeur normalisée
-                                updateEditValue(row.id, 'unit_mark', vNorm);
+                                updateEditValue(rowId, 'unit_mark', vNorm);
 
                                 // ✅ IA: save immédiat à Enter
-                                flushRowNow(row.id, 'enter');
+                                flushRowNow(rowId, 'enter');
 
                                 setEditingCell(null);
                                 setFocusedField(null);
@@ -2687,10 +3431,9 @@ const ProductsPage = () => {
                               return (
                                 <div
                                   className="absolute z-[100] mt-1 w-full bg-dark-800 border border-primary-500/30 rounded-lg shadow-xl max-h-32 overflow-y-auto"
-                                  onPointerDownCapture={(e) => {
-                                    // Empêche le blur de l'input (et donc le "click-through")
+                                  onMouseDown={(e) => {
+                                    // ✅ FIX: Empêche le blur de l'input sans bloquer les clics enfants
                                     e.preventDefault();
-                                    e.stopPropagation();
                                   }}
                                 >
                                   {markSuggestions
@@ -2700,17 +3443,24 @@ const ProductsPage = () => {
                                       <button
                                         key={idx}
                                         type="button"
-                                        onPointerDown={(e) => {
+                                        onMouseDown={(e) => {
                                           e.preventDefault();
                                           e.stopPropagation();
-                                          if (row?.id && mark) {
-                                            updateEditValue(row.id, 'unit_mark', mark);
-                                            flushRowNow(row.id, 'mark-suggestion');
+                                        }}
+                                        onClick={(e) => {
+                                          e.preventDefault();
+                                          e.stopPropagation();
+                                          if (mark) {
+                                            console.log('✅ [Mark Suggestion] Sélection:', mark);
+                                            updateEditValue(rowId, 'unit_mark', mark);
+                                            // ✅ Affichage visuel immédiat
+                                            setVisualForRow(rowId, { unit_mark: mark }, 8000);
+                                            flushRowNow(rowId, 'mark-suggestion');
                                             setEditingCell(null);
                                             setFocusedField(null);
                                           }
                                         }}
-                                        className="w-full text-left px-3 py-1.5 hover:bg-primary-500/20 text-gray-200 text-sm border-b border-white/5 last:border-0"
+                                        className="w-full text-left px-3 py-1.5 hover:bg-primary-500/20 text-gray-200 text-sm border-b border-white/5 last:border-0 cursor-pointer"
                                       >
                                         {mark || ''}
                                       </button>
@@ -2728,9 +3478,7 @@ const ProductsPage = () => {
                       ) : (
                         <span
                           onClick={() => {
-                            if (row?.id) {
-                              startEdit(row.id, 'unit_mark', getCellValue(row, 'unit_mark') || '');
-                            }
+                            startEdit(rowId, 'unit_mark', getCellValue(row, 'unit_mark') || '');
                           }}
                           className="cursor-pointer text-gray-200 group-hover:text-primary-300 group-hover:font-semibold group-hover:px-2 group-hover:py-1 group-hover:bg-primary-500/20 group-hover:rounded hover:text-primary-400"
                         >
@@ -2741,24 +3489,22 @@ const ProductsPage = () => {
 
                     {/* Prix vente FC */}
                     <td className="px-4 py-3 text-right">
-                      {editingCell?.rowId === row?.id && editingCell?.field === 'sale_price_fc' ? (
+                      {editingCell?.rowId === rowId && editingCell?.field === 'sale_price_fc' ? (
                         <input
                           type="number"
                           value={String(getCellValue(row, 'sale_price_fc') || '')}
                           onChange={(e) => {
-                            if (row?.id) {
-                              const newValue = e.target.value; // ✅ Toujours une string depuis e.target.value
-                              if (IS_DEV) {
-                                console.log(`⌨️ [ProductsPage] Saisie: "${newValue}" (type: ${typeof newValue}) pour ${row.id}`);
-                              }
-                              // ✅ Préserver la valeur exacte saisie comme string
-                              updateEditValue(row.id, 'sale_price_fc', newValue);
+                            const newValue = e.target.value; // ✅ Toujours une string depuis e.target.value
+                            if (IS_DEV) {
+                              console.log(`⌨️ [ProductsPage] Saisie: "${newValue}" (type: ${typeof newValue}) pour ${rowId}`);
                             }
+                            // ✅ Préserver la valeur exacte saisie comme string
+                            updateEditValue(rowId, 'sale_price_fc', newValue);
                           }}
                           onBlur={() => {
                             // IA auto-save intelligent avec blur detection
-                            if (row?.id && pendingSavesRef.current.has(row.id)) {
-                              smartBlurRow(row.id);
+                            if (pendingSavesRef.current.has(rowId)) {
+                              smartBlurRow(rowId);
                             }
                             setEditingCell(null);
                             setFocusedField(null);
@@ -2766,8 +3512,8 @@ const ProductsPage = () => {
                           onKeyPress={(e) => {
                             if (e.key === 'Enter') {
                               // Flush immédiat à Enter
-                              if (row?.id && pendingSavesRef.current.has(row.id)) {
-                                flushRowNow(row.id, 'enter');
+                              if (pendingSavesRef.current.has(rowId)) {
+                                flushRowNow(rowId, 'enter');
                               }
                               setEditingCell(null);
                               setFocusedField(null);
@@ -2779,9 +3525,7 @@ const ProductsPage = () => {
                       ) : (
                         <span
                           onClick={() => {
-                            if (row?.id) {
-                              startEdit(row.id, 'sale_price_fc', row?.sale_price_fc || 0);
-                            }
+                            startEdit(rowId, 'sale_price_fc', row?.sale_price_fc || 0);
                           }}
                           className="cursor-pointer font-mono text-gray-200 group-hover:text-blue-300 group-hover:font-bold hover:text-blue-400"
                         >
@@ -2797,25 +3541,23 @@ const ProductsPage = () => {
 
                     {/* Prix vente USD */}
                     <td className="px-4 py-3 text-right">
-                      {editingCell?.rowId === row?.id && editingCell?.field === 'sale_price_usd' ? (
+                      {editingCell?.rowId === rowId && editingCell?.field === 'sale_price_usd' ? (
                         <input
                           type="number"
                           step="0.01"
                           value={String(getCellValue(row, 'sale_price_usd') || '')}
                           onChange={(e) => {
-                            if (row?.id) {
-                              const newValue = e.target.value; // ✅ Toujours une string depuis e.target.value
-                              if (IS_DEV) {
-                                console.log(`⌨️ [ProductsPage] Saisie: "${newValue}" (type: ${typeof newValue}) pour ${row.id}`);
-                              }
-                              // ✅ Préserver la valeur exacte saisie comme string
-                              updateEditValue(row.id, 'sale_price_usd', newValue);
+                            const newValue = e.target.value; // ✅ Toujours une string depuis e.target.value
+                            if (IS_DEV) {
+                              console.log(`⌨️ [ProductsPage] Saisie: "${newValue}" (type: ${typeof newValue}) pour ${rowId}`);
                             }
+                            // ✅ Préserver la valeur exacte saisie comme string
+                            updateEditValue(rowId, 'sale_price_usd', newValue);
                           }}
                           onBlur={() => {
                             // IA auto-save intelligent avec blur detection
-                            if (row?.id && pendingSavesRef.current.has(row.id)) {
-                              smartBlurRow(row.id);
+                            if (pendingSavesRef.current.has(rowId)) {
+                              smartBlurRow(rowId);
                             }
                             setEditingCell(null);
                             setFocusedField(null);
@@ -2823,8 +3565,8 @@ const ProductsPage = () => {
                           onKeyPress={(e) => {
                             if (e.key === 'Enter') {
                               // Flush immédiat à Enter
-                              if (row?.id && pendingSavesRef.current.has(row.id)) {
-                                flushRowNow(row.id, 'enter');
+                              if (pendingSavesRef.current.has(rowId)) {
+                                flushRowNow(rowId, 'enter');
                               }
                               setEditingCell(null);
                               setFocusedField(null);
@@ -2836,9 +3578,7 @@ const ProductsPage = () => {
                       ) : (
                         <span
                           onClick={() => {
-                            if (row?.id) {
-                              startEdit(row.id, 'sale_price_usd', row?.sale_price_usd || 0);
-                            }
+                            startEdit(rowId, 'sale_price_usd', row?.sale_price_usd || 0);
                           }}
                           className="cursor-pointer font-mono font-semibold text-primary-400 group-hover:text-primary-300 group-hover:font-bold group-hover:text-lg hover:text-primary-300"
                         >
@@ -2854,25 +3594,23 @@ const ProductsPage = () => {
 
                     {/* Prix achat USD */}
                     <td className="px-4 py-3 text-right">
-                      {editingCell?.rowId === row?.id && editingCell?.field === 'purchase_price_usd' ? (
+                      {editingCell?.rowId === rowId && editingCell?.field === 'purchase_price_usd' ? (
                         <input
                           type="number"
                           step="0.01"
                           value={String(getCellValue(row, 'purchase_price_usd') || '')}
                           onChange={(e) => {
-                            if (row?.id) {
-                              const newValue = e.target.value; // ✅ Toujours une string depuis e.target.value
-                              if (IS_DEV) {
-                                console.log(`⌨️ [ProductsPage] Saisie: "${newValue}" (type: ${typeof newValue}) pour ${row.id}`);
-                              }
-                              // ✅ Préserver la valeur exacte saisie comme string
-                              updateEditValue(row.id, 'purchase_price_usd', newValue);
+                            const newValue = e.target.value; // ✅ Toujours une string depuis e.target.value
+                            if (IS_DEV) {
+                              console.log(`⌨️ [ProductsPage] Saisie: "${newValue}" (type: ${typeof newValue}) pour ${rowId}`);
                             }
+                            // ✅ Préserver la valeur exacte saisie comme string
+                            updateEditValue(rowId, 'purchase_price_usd', newValue);
                           }}
                           onBlur={() => {
                             // IA auto-save intelligent avec blur detection
-                            if (row?.id && pendingSavesRef.current.has(row.id)) {
-                              smartBlurRow(row.id);
+                            if (pendingSavesRef.current.has(rowId)) {
+                              smartBlurRow(rowId);
                             }
                             setEditingCell(null);
                             setFocusedField(null);
@@ -2880,8 +3618,8 @@ const ProductsPage = () => {
                           onKeyPress={(e) => {
                             if (e.key === 'Enter') {
                               // Flush immédiat à Enter
-                              if (row?.id && pendingSavesRef.current.has(row.id)) {
-                                flushRowNow(row.id, 'enter');
+                              if (pendingSavesRef.current.has(rowId)) {
+                                flushRowNow(rowId, 'enter');
                               }
                               setEditingCell(null);
                               setFocusedField(null);
@@ -2893,9 +3631,7 @@ const ProductsPage = () => {
                       ) : (
                         <span
                           onClick={() => {
-                            if (row?.id) {
-                              startEdit(row.id, 'purchase_price_usd', row?.purchase_price_usd || 0);
-                            }
+                            startEdit(rowId, 'purchase_price_usd', row?.purchase_price_usd || 0);
                           }}
                           className="cursor-pointer font-mono text-gray-300 group-hover:text-gray-200 group-hover:font-bold hover:text-gray-200"
                         >
@@ -2905,25 +3641,25 @@ const ProductsPage = () => {
                     </td>
 
                     {/* Stock */}
-                    <td className="px-4 py-3 text-right">
-                      {editingCell?.rowId === row?.id && editingCell?.field === 'stock_current' ? (
+                    <td className="px-4 py-3 text-right" style={{ maxWidth: '120px' }}>
+                      {editingCell?.rowId === rowId && editingCell?.field === 'stock_current' ? (
                         <input
                           type="number"
                           value={String(getCellValue(row, 'stock_current') || '')}
                           onChange={(e) => {
-                            if (row?.id) {
-                              const newValue = e.target.value; // ✅ Toujours une string depuis e.target.value
-                              if (IS_DEV) {
-                                console.log(`⌨️ [ProductsPage] Saisie: "${newValue}" (type: ${typeof newValue}) pour ${row.id}`);
-                              }
-                              // ✅ Préserver la valeur exacte saisie comme string
-                              updateEditValue(row.id, 'stock_current', newValue);
+                            const newValue = e.target.value; // ✅ Toujours une string depuis e.target.value
+                            // ✅ Limiter à 10 chiffres max pour éviter débordement
+                            if (newValue.replace('-', '').length > 10) return;
+                            if (IS_DEV) {
+                              console.log(`⌨️ [ProductsPage] Saisie: "${newValue}" (type: ${typeof newValue}) pour ${rowId}`);
                             }
+                            // ✅ Préserver la valeur exacte saisie comme string
+                            updateEditValue(rowId, 'stock_current', newValue);
                           }}
                           onBlur={() => {
                             // IA auto-save intelligent avec blur detection
-                            if (row?.id && pendingSavesRef.current.has(row.id)) {
-                              smartBlurRow(row.id);
+                            if (pendingSavesRef.current.has(rowId)) {
+                              smartBlurRow(rowId);
                             }
                             setEditingCell(null);
                             setFocusedField(null);
@@ -2931,54 +3667,61 @@ const ProductsPage = () => {
                           onKeyPress={(e) => {
                             if (e.key === 'Enter') {
                               // Flush immédiat à Enter
-                              if (row?.id && pendingSavesRef.current.has(row.id)) {
-                                flushRowNow(row.id, 'enter');
+                              if (pendingSavesRef.current.has(rowId)) {
+                                flushRowNow(rowId, 'enter');
                               }
                               setEditingCell(null);
                               setFocusedField(null);
                             }
                           }}
-                          className="input-field text-sm px-4 py-2.5 text-right bg-dark-800/50 border border-primary-500/60 focus:border-primary-500 rounded-lg min-w-[120px] relative z-10"
+                          className="input-field text-sm px-4 py-2.5 text-right bg-dark-800/50 border border-primary-500/60 focus:border-primary-500 rounded-lg w-[100px] relative z-10"
                           autoFocus
+                          max={9999999999}
+                          min={-9999999999}
                         />
                       ) : (
                         <span
                           onClick={() => {
-                            if (row?.id) {
-                              startEdit(row.id, 'stock_current', row?.stock_current || 0);
-                            }
+                            startEdit(rowId, 'stock_current', row?.stock_current || 0);
                           }}
-                          className="cursor-pointer font-mono text-gray-200 group-hover:text-green-300 group-hover:font-bold hover:text-green-400"
+                          className="cursor-pointer font-mono text-gray-200 group-hover:text-green-300 group-hover:font-bold hover:text-green-400 truncate block"
+                          title={String(row?.stock_current || 0)}
                         >
-                          {(row?.stock_current || 0).toLocaleString('fr-FR')}
+                          {/* ✅ Format intelligent: nombres très grands = notation abrégée */}
+                          {(() => {
+                            const val = row?.stock_current || 0;
+                            const absVal = Math.abs(val);
+                            if (absVal >= 1000000000) return `${(val/1000000000).toFixed(1)}G`;
+                            if (absVal >= 1000000) return `${(val/1000000).toFixed(1)}M`;
+                            if (absVal >= 100000) return `${(val/1000).toFixed(0)}K`;
+                            return val.toLocaleString('fr-FR');
+                          })()}
                         </span>
                       )}
                     </td>
 
                     {/* Auto Stock (Automatisation Stock - seuil d'alerte) */}
                     <td className="px-4 py-3 text-right">
-                      {editingCell?.rowId === row?.id && editingCell?.field === 'auto_stock_factor' ? (
+                      {editingCell?.rowId === rowId && editingCell?.field === 'auto_stock_factor' ? (
                         <input
                           type="number"
                           step="1"
                           min="0"
                           value={String(getCellValue(row, 'auto_stock_factor') || '')}
                           onChange={(e) => {
-                            if (row?.id) {
-                              updateEditValue(row.id, 'auto_stock_factor', e.target.value);
-                            }
+                            updateEditValue(rowId, 'auto_stock_factor', e.target.value);
                           }}
                           onBlur={() => {
-                            if (row?.id && pendingSavesRef.current.has(row.id)) {
-                              smartBlurRow(row.id);
+                            if (pendingSavesRef.current.has(rowId)) {
+                              smartBlurRow(rowId);
                             }
                             setEditingCell(null);
                             setFocusedField(null);
                           }}
                           onKeyPress={(e) => {
                             if (e.key === 'Enter') {
-                              if (row?.id && pendingSavesRef.current.has(row.id)) {
-                                flushRowNow(row.id, 'enter');
+                              if (pendingSavesRef.current.has(rowId)) {
+                                flushRowNow(rowId, 'enter');
                               }
                               setEditingCell(null);
                               setFocusedField(null);
@@ -2990,9 +3733,7 @@ const ProductsPage = () => {
                       ) : (
                         <span
                           onClick={() => {
-                            if (row?.id) {
-                              startEdit(row.id, 'auto_stock_factor', row?.auto_stock_factor || 1);
-                            }
+                            startEdit(rowId, 'auto_stock_factor', row?.auto_stock_factor || 1);
                           }}
                           className="cursor-pointer font-mono text-gray-400 group-hover:text-orange-300 group-hover:font-bold hover:text-orange-400"
                           title="Seuil d'alerte stock (cliquer pour modifier)"
@@ -3054,15 +3795,15 @@ const ProductsPage = () => {
         </div>
       )}
 
-      {/* Modal de confirmation */}
+      {/* Modal de confirmation - création CARTON + unité */}
       <ConfirmModal
         isOpen={modalState.isOpen && modalState.type === 'create_confirm'}
         onClose={() => setModalState({ isOpen: false, type: '', data: null })}
         onConfirm={modalState.data?.onConfirm}
         onCustomName={modalState.data?.onCustomName}
         onCancel={modalState.data?.onCancel}
-        title="Créer un nouveau produit?"
-        message={`Le produit "${modalState.data?.edits?.product_name || ''}" n'existe pas en CARTON. Voulez-vous créer un nouveau produit ${modalState.data?.unitLevel === 'MILLIER' ? 'Détail' : modalState.data?.unitLevel === 'PIECE' ? 'Pièce' : ''} avec ce nom?`}
+        title="Créer le produit en CARTON d'abord"
+        message={`Le produit "${modalState.data?.edits?.product_name || ''}" n'existe pas encore.\n\n✅ Cliquer "Oui" va créer:\n• Le produit en CARTON (obligatoire)\n• L'unité ${modalState.data?.unitLevel === 'MILLIER' ? 'Détail' : modalState.data?.unitLevel === 'PIECE' ? 'Pièce' : modalState.data?.unitLevel || ''} que vous demandez`}
         productName={modalState.data?.edits?.product_name}
       />
 
@@ -3076,8 +3817,17 @@ const ProductsPage = () => {
           <ArrowUp className="w-6 h-6" />
         </button>
       )}
+
+      {/* Toast Container */}
+      <ToastContainer toasts={toasts} onCloseToast={closeToast} />
     </div>
   );
 };
 
-export default ProductsPage;
+export default function ProductsPageWithErrorBoundary() {
+  return (
+    <ErrorBoundary>
+      <ProductsPage />
+    </ErrorBoundary>
+  );
+}

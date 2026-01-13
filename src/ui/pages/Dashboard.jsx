@@ -1,4 +1,4 @@
-import { memo, useMemo } from 'react';
+import { memo, useMemo, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import {
   DollarSign,

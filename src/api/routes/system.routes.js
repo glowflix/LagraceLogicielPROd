@@ -16,24 +16,40 @@ router.get('/network-info', (req, res) => {
     const networkInterfaces = os.networkInterfaces();
     const ips = [];
 
+    // Helper: vérifier si c'est une vraie adresse IPv4
+    const isIPv4 = (iface) => {
+      // Node.js peut retourner 'IPv4' (string) ou 4 (number) selon la version
+      return iface.family === 'IPv4' || iface.family === 4;
+    };
+
+    // Helper: vérifier si c'est une vraie adresse IP (pas un hostname)
+    const isValidIPv4Address = (addr) => {
+      return /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(addr);
+    };
+
     // Parcourir toutes les interfaces réseau
     Object.keys(networkInterfaces).forEach((interfaceName) => {
       networkInterfaces[interfaceName].forEach((iface) => {
-        // Filtrer pour ne garder que les IPv4 non-internes
-        if (iface.family === 'IPv4' && !iface.internal) {
+        // Filtrer pour ne garder que les IPv4 non-internes avec une vraie adresse IP
+        if (isIPv4(iface) && !iface.internal && isValidIPv4Address(iface.address)) {
           ips.push(iface.address);
         }
       });
     });
 
-    // Trier les IPs (priorité aux 192.168.x.x)
+    // Trier les IPs (priorité aux réseaux privés communs)
     ips.sort((a, b) => {
-      const aIs192 = a.startsWith('192.168.');
-      const bIs192 = b.startsWith('192.168.');
-      if (aIs192 && !bIs192) return -1;
-      if (!aIs192 && bIs192) return 1;
-      return 0;
+      // Priorité: 192.168.x.x > 10.x.x.x > 172.16-31.x.x > autres
+      const getPriority = (ip) => {
+        if (ip.startsWith('192.168.')) return 1;
+        if (ip.startsWith('10.')) return 2;
+        if (ip.startsWith('172.')) return 3;
+        return 4;
+      };
+      return getPriority(a) - getPriority(b);
     });
+
+    console.log('[System] Adresses IP détectées:', ips);
 
     res.json({
       success: true,

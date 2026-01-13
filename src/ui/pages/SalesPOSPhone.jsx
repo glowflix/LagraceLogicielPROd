@@ -456,7 +456,7 @@ const SalesPOSPhone = () => {
               exit={{ y: '100%' }}
               transition={{ type: 'spring', damping: 25 }}
               onClick={(e) => e.stopPropagation()}
-              className="absolute bottom-0 left-0 right-0 bg-dark-800 rounded-t-2xl max-h-[85vh] flex flex-col"
+              className="fixed bottom-0 left-0 right-0 bg-dark-800 rounded-t-2xl max-h-[85vh] flex flex-col"
             >
               {/* Header du panier */}
               <div className="flex items-center justify-between px-4 py-3 border-b border-white/10">

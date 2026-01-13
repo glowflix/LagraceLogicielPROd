@@ -36,7 +36,7 @@ from services.database import DatabaseService
 def log_debug(msg: str, service: str = "AI"):
     """Log de debug avec timestamp"""
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    print(f"{Fore.WHITE}[{ts}] [{service}] {msg}{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}[{ts}] [{service}] {msg}{Style.RESET_ALL}")
 
 
 def log_info(msg: str, service: str = "AI"):
@@ -176,8 +176,8 @@ class LaGraceAssistant:
         print(f"\n{Fore.CYAN}{'='*60}{Style.RESET_ALL}")
         print(f"{Fore.GREEN}🌟 AI LaGrace - DÉMARRAGE{Style.RESET_ALL}")
         print(f"{Fore.CYAN}{'='*60}{Style.RESET_ALL}")
-        print(f"{Fore.WHITE}   Heure: {self._startup_time.strftime('%H:%M:%S')}{Style.RESET_ALL}")
-        print(f"{Fore.WHITE}   Socket URL: {settings.socket_url}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}   Heure: {self._startup_time.strftime('%H:%M:%S')}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}   Socket URL: {settings.socket_url}{Style.RESET_ALL}")
         print(f"{Fore.CYAN}{'='*60}{Style.RESET_ALL}\n")
         
         # Démarrer les services
@@ -260,7 +260,7 @@ class LaGraceAssistant:
         
         # Résumé du statut
         print(f"\n{Fore.CYAN}{'='*40}{Style.RESET_ALL}")
-        print(f"{Fore.WHITE}   STATUT DES SERVICES:{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}   STATUT DES SERVICES:{Style.RESET_ALL}")
         for svc, status in services_status.items():
             icon = "✅" if status else "❌"
             color = Fore.GREEN if status else (Fore.YELLOW if status == 'initialisation...' else Fore.RED)
@@ -350,107 +350,37 @@ class LaGraceAssistant:
             self.tts.speak(message)
         
         # Événement: nouvelle vente créée/finalisée
+        # ✅ OPTIMISATION: Ne pas parler ici - on parle UNIQUEMENT à l'impression
         def on_sale_created(data):
-            log_info(f"📥 Vente créée: {data}", "SOCKET")
+            log_info(f"📥 Vente créée (silencieux - attente impression): {data}", "SOCKET")
             self._sales_count_today += 1
-            
-            invoice = data.get('invoice_number', data.get('factureNum', data.get('id', '')))
-            client = data.get('client', data.get('customer', data.get('client_name', '')))
-            total_usd = data.get('total_usd', data.get('totalUSD', data.get('total', 0)))
-            total_cdf = data.get('total_cdf', data.get('totalFC', data.get('totalCDF', 0)))
-            seller = data.get('seller_name', data.get('user', data.get('vendeur', '')))
-            
-            log_debug(f"Détails vente - Invoice: {invoice}, Client: {client}, USD: {total_usd}, CDF: {total_cdf}, Vendeur: {seller}", "SOCKET")
-            
-            # Construire les parties du message naturellement
-            client_part = ""
-            if client and str(client).strip() and str(client).strip() != '-':
-                client_part = f"pour {client}"
-            
-            total_part = ""
-            try:
-                if total_usd and float(total_usd) > 0:
-                    total_part = f"de {int(float(total_usd))} dollars"
-                elif total_cdf and float(total_cdf) > 0:
-                    total_part = f"de {int(float(total_cdf))} francs congolais"
-            except (ValueError, TypeError):
-                pass
-            
-            # ✅ AMÉLIORATION: Formater le numéro de facture pour prononciation naturelle
-            invoice_text = format_invoice_number(invoice) if invoice else ""
-            
-            # Message naturel avec variations (SANS le numéro)
-            if seller and str(seller).strip():
-                messages = [
-                    f"La vente de {seller} est finalisée. {client_part} {total_part}.",
-                    f"C'est fait ! {seller} a finalisé une vente {client_part}. {total_part}.",
-                    f"Nouvelle vente de {seller} ! {total_part}. {client_part}.",
-                ]
-            else:
-                messages = [
-                    f"La vente est finalisée. {client_part} {total_part}.",
-                    f"Transaction validée ! {client_part} {total_part}.",
-                    f"Nouvelle vente enregistrée. {total_part}.",
-                ]
-            
-            message = random.choice(messages)
-            # Nettoyer les espaces multiples
-            message = ' '.join(message.split())
-            
-            # ✅ AMÉLIORATION PRO: Parler en deux étapes
-            # 1. Texte normal à vitesse normale
-            # 2. Numéro de facture accéléré
-            log_speak(message)
-            self.tts.speak(message)
-            
-            # Pause courte avant le numéro
-            if invoice_text:
-                time.sleep(0.3)
-                invoice_announcement = f"Facture {invoice_text}."
-                log_speak(invoice_announcement)
-                self.tts.speak(invoice_announcement)
+            # ❌ SUPPRIMÉ: On ne parle plus à la finalisation
+            # On attend l'événement print:started pour parler
         
         # Événement: impression démarrée
+        # ✅ OPTIMISATION PRO: Message court avec juste le nom du client
         def on_print_started(data):
             log_info(f"📥 Impression démarrée: {data}", "SOCKET")
-            facture = data.get('factureNum', data.get('facture', data.get('invoice_number', '')))
-            seller = data.get('seller_name', data.get('user', ''))
             
-            # ✅ AMÉLIORATION: Formater le numéro de facture
-            facture_text = format_invoice_number(facture) if facture else ""
+            # Récupérer le nom du client (priorité sur tout le reste)
+            client = data.get('client_name', data.get('client', data.get('customer', '')))
             
-            # ✅ AMÉLIORATION PRO: Parler en deux étapes
-            # 1. Annonce normale
-            # 2. Numéro accéléré
-            if seller and facture_text:
-                message = f"Impression lancée de {seller}."
-            elif facture_text:
-                message = f"Impression lancée."
+            # Nettoyer le nom du client
+            if client and str(client).strip() and str(client).strip() != '-':
+                client_name = str(client).strip()
+                message = f"Impression {client_name} est prête."
             else:
-                message = "Impression en cours..."
+                message = "Impression prête."
             
             log_speak(message)
             self.tts.speak(message)
-            
-            # Pause courte avant le numéro
-            if facture_text:
-                time.sleep(0.3)
-                facture_announcement = f"Facture {facture_text}."
-                log_speak(facture_announcement)
-                self.tts.speak(facture_announcement)
+            # ❌ SUPPRIMÉ: Plus de numéro de facture récité
         
         # Événement: impression terminée
+        # ✅ OPTIMISATION: Silencieux - on a déjà parlé à print:started
         def on_print_done(data):
-            log_info(f"📥 Impression terminée: {data}", "SOCKET")
-            facture = data.get('factureNum', data.get('facture', data.get('invoice_number', '')))
-            
-            if facture:
-                message = f"Impression de la facture {facture} terminée."
-            else:
-                message = "Impression terminée avec succès."
-            
-            log_speak(message)
-            self.tts.speak(message)
+            log_info(f"📥 Impression terminée (silencieux): {data}", "SOCKET")
+            # ❌ SUPPRIMÉ: On ne parle plus ici pour éviter la répétition
         
         # Événement: erreur d'impression
         def on_print_error(data):
@@ -498,6 +428,21 @@ class LaGraceAssistant:
                 log_speak(message)
                 self.tts.speak(message)
         
+        # ✅ Événement: vente supprimée
+        def on_sale_deleted(data):
+            log_info(f"📥 Vente supprimée: {data}", "SOCKET")
+            client = data.get('client_name', data.get('client', ''))
+            
+            # Nettoyer le nom du client
+            if client and str(client).strip() and str(client).strip() != '-':
+                client_name = str(client).strip()
+                message = f"Vente de {client_name} supprimée."
+            else:
+                message = "Vente supprimée."
+            
+            log_speak(message)
+            self.tts.speak(message)
+        
         # Événement: dette payée
         def on_debt_paid(data):
             log_info(f"📥 Dette payée: {data}", "SOCKET")
@@ -533,8 +478,9 @@ class LaGraceAssistant:
         self.socket.on('sync:completed', on_sync_completed)
         self.socket.on('debt:created', on_debt_created)
         self.socket.on('debt:paid', on_debt_paid)
-        
-        log_success("✅ Événements Socket.IO configurés (9 événements - doublons supprimés)", "SOCKET")
+        self.socket.on('sale:deleted', on_sale_deleted)  # ✅ Annonce suppression de vente
+
+        log_success("✅ Événements Socket.IO configurés (10 événements)", "SOCKET")
     
     def _on_wake_word(self):
         """Appelé quand le wake word est détecté"""

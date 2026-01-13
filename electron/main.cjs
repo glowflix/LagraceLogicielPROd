@@ -855,19 +855,19 @@ function createWindow() {
 
     console.log('[WINDOW] BrowserWindow créée avec succès, ID:', mainWindow.id);
     
-    // Afficher la fenêtre après un court délai (évite les crashes au démarrage)
+    // ✅ OPTIMISATION: Afficher la fenêtre ULTRA-RAPIDE (dès que possible)
     mainWindow.once('ready-to-show', () => {
       console.log('[WINDOW] Fenêtre ready-to-show');
       mainWindow.show();
     });
     
-    // Fallback: afficher après 1 seconde si ready-to-show ne se déclenche pas
+    // ✅ FALLBACK ULTRA-RAPIDE: Afficher après 300ms max (pas 1s)
     setTimeout(() => {
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        console.log('[WINDOW] Affichage forcé de la fenêtre (fallback)');
+      if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible()) {
+        console.log('[WINDOW] Affichage forcé de la fenêtre (fallback ultra-rapide - 300ms)');
         mainWindow.show();
       }
-    }, 1000);
+    }, 300);
     
     // Focus sur la fenêtre
     if (process.platform === 'darwin') {

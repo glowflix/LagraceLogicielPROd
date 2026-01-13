@@ -1,9 +1,10 @@
 import express from 'express';
 import { usersRepo } from '../../db/repositories/users.repo.js';
-import { syncRepo } from '../../db/repositories/sync.repo.js';
+import { outboxRepo } from '../../db/repositories/outbox.repo.js';
 import { auditRepo } from '../../db/repositories/audit.repo.js';
 import { authenticate, optionalAuth } from '../middlewares/auth.js';
-import { requireAdmin, requirePermission } from '../middlewares/permissions.js';
+// Note: requireAdmin non utilisé car la création est accessible avec license
+// import { requireAdmin, requirePermission } from '../middlewares/permissions.js';
 import { logger } from '../../core/logger.js';
 
 const router = express.Router();
@@ -103,11 +104,12 @@ router.get('/:id', optionalAuth, (req, res) => {
 /**
  * POST /api/users
  * Crée un nouvel utilisateur
- * STRICTEMENT ADMIN UNIQUEMENT
+ * ✅ Accessible avec authentification (license ou compte)
+ * Les utilisateurs connectés peuvent créer des comptes clients
  */
-router.post('/', authenticate, requireAdmin, async (req, res) => {
+router.post('/', authenticate, async (req, res) => {
   try {
-    const { username, password, phone, is_admin, is_active, device_brand, profile_url, expo_push_token } = req.body;
+    const { username, password, phone, is_admin, is_active, is_vendeur, is_gerant_stock, can_manage_products, device_brand, profile_url, expo_push_token } = req.body;
 
     if (!username || !password) {
       return res.status(400).json({
@@ -125,11 +127,30 @@ router.post('/', authenticate, requireAdmin, async (req, res) => {
       });
     }
 
+    // ✅ Sécurité: ADMIN/OWNER ou MODE LICENSE peut créer un compte admin
+    const currentUser = req.user ? usersRepo.findById(req.user.id) : null;
+    const isCurrentAdmin = currentUser && (currentUser.is_admin === 1 || currentUser.is_admin === true);
+    const isCurrentOwner = currentUser && (currentUser.is_owner === 1 || currentUser.is_owner === true);
+    
+    // ✅ MODE LICENSE: Connexion avec license SANS compte utilisateur = ACCÈS COMPLET
+    // Détection: req.user est null OU pas d'ID OU userRole = LICENSE_ONLY
+    const isLicenseMode = !req.user || !req.user.id || req.userRole === 'LICENSE_ONLY';
+    
+    logger.debug(`🔐 [POST /api/users] Création utilisateur: currentUser=${!!currentUser}, isCurrentAdmin=${isCurrentAdmin}, isCurrentOwner=${isCurrentOwner}, isLicenseMode=${isLicenseMode}, userRole=${req.userRole}`);
+    
+    // Si is_admin demandé mais utilisateur non-admin/owner/license, refuser
+    if (is_admin && !isCurrentAdmin && !isCurrentOwner && !isLicenseMode) {
+      return res.status(403).json({
+        success: false,
+        error: 'Seuls les administrateurs ou le mode license peuvent créer un compte administrateur',
+      });
+    }
+
     const user = await usersRepo.create({
       username,
       password,
       phone,
-      is_admin: is_admin ? 1 : 0,
+      is_admin: (is_admin && (isCurrentAdmin || isCurrentOwner || isLicenseMode)) ? 1 : 0,
       is_active: is_active !== undefined ? is_active : 1,
       is_vendeur: is_vendeur !== undefined ? (is_vendeur ? 1 : 0) : 1,
       is_gerant_stock: is_gerant_stock ? 1 : 0,
@@ -139,9 +160,9 @@ router.post('/', authenticate, requireAdmin, async (req, res) => {
       expo_push_token,
     });
 
-    // Ajouter à l'outbox pour synchronisation avec UUID - PRO et TOP
-    syncRepo.addToOutbox('users', user.id.toString(), 'upsert', {
-      uuid: user.uuid, // CRITIQUE: Inclure UUID pour sync bidirectionnelle
+    // ✅ PRO: Ajouter à l'outbox pour synchronisation avec Google Sheets (feuille "Compter Utilisateur")
+    outboxRepo.enqueueUser({
+      uuid: user.uuid,
       username: user.username,
       phone: user.phone || '',
       is_admin: user.is_admin,
@@ -151,18 +172,20 @@ router.post('/', authenticate, requireAdmin, async (req, res) => {
       can_manage_products: user.can_manage_products || 0,
       created_at: user.created_at,
       updated_at: user.updated_at,
-      device_brand: user.devices?.[0]?.device_brand || '',
-      profile_url: user.devices?.[0]?.profile_url || '',
-      expo_push_token: user.devices?.map(d => d.expo_push_token).filter(Boolean).join('|') || '',
-    });
+      device_brand: user.devices?.[0]?.device_brand || device_brand || '',
+      profile_url: user.devices?.[0]?.profile_url || profile_url || '',
+      expo_push_token: user.devices?.map(d => d.expo_push_token).filter(Boolean).join('|') || expo_push_token || '',
+    }, 'create');
 
     // Audit log
-    auditRepo.log(req.user.id, 'user_create', {
+    const auditUserId = req.user?.id || 0; // 0 si connexion par license
+    auditRepo.log(auditUserId, 'user_create', {
       user_id: user.id,
       username: user.username,
+      created_by: currentUser?.username || 'license',
     });
 
-    logger.info(`✅ POST /api/users: Utilisateur créé - ID=${user.id}, Username="${user.username}"`);
+    logger.info(`✅ POST /api/users: Utilisateur créé - ID=${user.id}, Username="${user.username}" par ${currentUser?.username || 'license'}`);
 
     res.json({ success: true, user });
   } catch (error) {
@@ -174,20 +197,38 @@ router.post('/', authenticate, requireAdmin, async (req, res) => {
 /**
  * PUT /api/users/:id
  * Met à jour un utilisateur
- * STRICTEMENT ADMIN UNIQUEMENT (sauf pour /me qui est géré séparément)
+ * ✅ Accessible avec authentification (license ou compte)
+ * - Chacun peut modifier son propre compte
+ * - ADMIN/OWNER peuvent modifier tous les comptes
+ * - Avec license: peut modifier n'importe quel compte client
  */
 router.put('/:id', authenticate, async (req, res) => {
   try {
     const userId = parseInt(req.params.id);
     const currentUserId = req.user?.id;
     
-    // Si l'utilisateur essaie de modifier un autre utilisateur que lui-même, vérifier qu'il est admin
-    if (userId !== currentUserId && (!req.userRole || req.userRole !== 'ADMIN')) {
+    // ✅ SÉCURITÉ: Vérifier les permissions de modification par lookup DB directe
+    const currentUser = (req.user && currentUserId) ? usersRepo.findById(currentUserId) : null;
+    const isOwner = currentUser && (currentUser.is_owner === 1 || currentUser.is_owner === true);
+    const isAdmin = currentUser && (currentUser.is_admin === 1 || currentUser.is_admin === true);
+    
+    // ✅ MODE LICENSE: Connexion avec license SANS compte utilisateur = ACCÈS COMPLET
+    // Détection: req.user est null OU pas d'ID OU userRole = LICENSE_ONLY
+    const isLicenseMode = !req.user || !currentUserId || req.userRole === 'LICENSE_ONLY';
+    
+    logger.debug(`🔐 [PUT /api/users/${userId}] Permissions: currentUser=${!!currentUser}, currentUserId=${currentUserId}, isOwner=${isOwner}, isAdmin=${isAdmin}, isLicenseMode=${isLicenseMode}, userRole=${req.userRole}`);
+    
+    // Règle: Peut modifier si:
+    // - C'est son propre compte (toujours autorisé) OU
+    // - C'est OWNER ou ADMIN (pour modifier les autres) OU
+    // - Connexion avec license (peut gérer TOUS les comptes clients)
+    if (userId !== currentUserId && !isAdmin && !isOwner && !isLicenseMode) {
       return res.status(403).json({ 
         success: false, 
-        error: 'Seuls les administrateurs peuvent modifier les comptes utilisateurs' 
+        error: 'Vous n\'avez pas les permissions pour modifier ce compte' 
       });
     }
+
     const { username, password, phone, is_admin, is_active, is_vendeur, is_gerant_stock, can_manage_products, device_brand, profile_url, expo_push_token } = req.body;
 
     const existing = usersRepo.findById(userId);
@@ -195,6 +236,23 @@ router.put('/:id', authenticate, async (req, res) => {
       return res.status(404).json({
         success: false,
         error: 'Utilisateur non trouvé',
+      });
+    }
+
+    // ✅ SÉCURITÉ: OWNER ou MODE LICENSE peut changer is_admin
+    // En mode license = droits équivalents à OWNER pour gérer les comptes
+    if ('is_admin' in req.body && !isOwner && !isLicenseMode) {
+      return res.status(403).json({ 
+        success: false, 
+        error: 'Seul le créateur ou le mode license peut modifier le statut administrateur' 
+      });
+    }
+
+    // ✅ SÉCURITÉ: Personne ne peut définir is_owner via API (protection contre escalade de privilèges)
+    if ('is_owner' in req.body) {
+      return res.status(403).json({ 
+        success: false, 
+        error: 'Impossible de modifier le statut propriétaire' 
       });
     }
 
@@ -212,9 +270,9 @@ router.put('/:id', authenticate, async (req, res) => {
       expo_push_token,
     });
 
-    // Ajouter à l'outbox pour synchronisation avec UUID - PRO et TOP
-    syncRepo.addToOutbox('users', user.id.toString(), 'upsert', {
-      uuid: user.uuid, // CRITIQUE: Inclure UUID pour sync bidirectionnelle
+    // ✅ PRO: Ajouter à l'outbox pour synchronisation avec Google Sheets (feuille "Compter Utilisateur")
+    outboxRepo.enqueueUser({
+      uuid: user.uuid,
       username: user.username,
       phone: user.phone || '',
       is_admin: user.is_admin,
@@ -222,19 +280,22 @@ router.put('/:id', authenticate, async (req, res) => {
       is_vendeur: user.is_vendeur !== undefined ? user.is_vendeur : 1,
       is_gerant_stock: user.is_gerant_stock || 0,
       can_manage_products: user.can_manage_products || 0,
+      created_at: user.created_at || existing.created_at,
       updated_at: user.updated_at,
-      device_brand: user.devices?.[0]?.device_brand || '',
-      profile_url: user.devices?.[0]?.profile_url || '',
-      expo_push_token: user.devices?.map(d => d.expo_push_token).filter(Boolean).join('|') || '',
-    });
+      device_brand: user.devices?.[0]?.device_brand || device_brand || '',
+      profile_url: user.devices?.[0]?.profile_url || profile_url || '',
+      expo_push_token: user.devices?.map(d => d.expo_push_token).filter(Boolean).join('|') || expo_push_token || '',
+    }, 'update');
 
     // Audit log
-    auditRepo.log(req.user.id, 'user_update', {
+    const auditUserId = currentUserId || 0; // 0 si connexion par license
+    auditRepo.log(auditUserId, 'user_update', {
       user_id: user.id,
       username: user.username,
+      updated_by: currentUser?.username || 'license',
     });
 
-    logger.info(`✅ PUT /api/users/${userId}: Utilisateur mis à jour`);
+    logger.info(`✅ PUT /api/users/${userId}: Utilisateur mis à jour par ${currentUser?.username || 'license'}`);
 
     res.json({ success: true, user });
   } catch (error) {

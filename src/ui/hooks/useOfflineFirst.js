@@ -110,11 +110,14 @@ export function useOfflineFirst(key, fetchFn, options = {}) {
   const mountedRef = useRef(true);
   const fetchingRef = useRef(false);
   
-  // Fonction de fetch depuis Electron/API locale
+  // ✅ PRO ULTRA-RAPIDE: Fetch en background, jamais de blocage
   const fetchData = useCallback(async (force = false) => {
     if (!enabled) return;
     
-    // Vérifier le cache si pas forcé
+    // Éviter les fetches simultanés
+    if (fetchingRef.current) return;
+    
+    // ✅ RÈGLE PRO: Si on a un cache valide et pas forcé, retourner immédiatement
     if (!force && isCacheValid(key, ttl)) {
       const cached = getCache(key);
       if (cached) {
@@ -125,59 +128,75 @@ export function useOfflineFirst(key, fetchFn, options = {}) {
       }
     }
     
-    // Marquer comme en cours
     fetchingRef.current = true;
-    setLoading(true);
+    
+    // ✅ PRO: Afficher loading SEULEMENT si on n'a AUCUNE donnée (première fois)
+    const cachedData = getCache(key);
+    const hasCache = cachedData && (!Array.isArray(cachedData) || cachedData.length > 0);
+    
+    if (!hasCache && !data) {
+      setLoading(true);
+    }
+    // Si on a un cache, l'afficher immédiatement
+    if (hasCache && !data) {
+      setData(cachedData);
+    }
+    
     setError(null);
     
+    // ✅ PRO: Timeout court de 3s max - pas de blocage
+    const timeoutId = setTimeout(() => {
+      if (mountedRef.current && fetchingRef.current) {
+        setLoading(false);
+        fetchingRef.current = false;
+      }
+    }, 3000);
+    
     try {
-      // Charger depuis Electron/API locale (toujours disponible)
       let result;
       
       if (electronAPI && typeof fetchFn === 'function') {
-        // Utiliser Electron API si disponible
         result = await fetchFn(electronAPI);
       } else if (typeof fetchFn === 'function') {
-        // Fallback: fonction directe
         result = await fetchFn();
       } else {
         throw new Error('fetchFn doit être une fonction');
       }
       
-      // Appliquer la transformation
       result = transform(result);
       
-      // Sauvegarder dans le cache
-      setCache(key, result);
+      // ✅ PRO: Toujours mettre en cache le résultat (même vide = pas de données)
+      // Sauf si on avait des données avant et le résultat est vide (erreur probable)
+      const isEmptyResult = Array.isArray(result) && result.length === 0;
+      const hadData = hasCache;
+      
+      if (!isEmptyResult || !hadData) {
+        setCache(key, result);
+      }
       
       if (mountedRef.current) {
-        setData(result);
+        // ✅ PRO: Ne pas écraser les données existantes avec un tableau vide
+        if (!isEmptyResult || !hadData) {
+          setData(result);
+        }
         setError(null);
         setIsStale(false);
       }
       
       return result;
     } catch (err) {
-      console.warn(`[useOfflineFirst] Erreur ${key}:`, err.message);
-      
-      if (mountedRef.current) {
-        setError(err);
-        // Garder les données en cache même en cas d'erreur
-        const cached = getCache(key);
-        if (cached) {
-          setData(cached);
-          setIsStale(true);
-        }
+      // ✅ PRO: Silencieux - garder le cache, pas d'erreur bloquante
+      if (mountedRef.current && hasCache) {
+        setIsStale(true);
       }
-      
-      throw err;
     } finally {
+      clearTimeout(timeoutId);
       if (mountedRef.current) {
         setLoading(false);
       }
       fetchingRef.current = false;
     }
-  }, [key, ttl, enabled, transform, electronAPI, fetchFn]);
+  }, [key, ttl, enabled, transform, electronAPI, fetchFn, data]);
   
   // Fonction de refresh (force le fetch)
   const refresh = useCallback(() => {
@@ -265,7 +284,13 @@ export function useOfflineProducts(options = {}) {
 
 /**
  * Hook spécialisé pour les ventes (offline-first)
- * Utilise SQL local en priorité, jamais d'attente réseau
+ * ✅ PRO ULTRA-RAPIDE: Affiche cache immédiatement, refresh en background
+ * 
+ * Principe:
+ * 1. Afficher les données en cache IMMÉDIATEMENT (pas de spinner)
+ * 2. Fetch API avec timeout COURT (2s) en background
+ * 3. PAS de retry - un seul appel
+ * 4. Si échec, garder le cache
  */
 export function useOfflineSales(filters = {}, options = {}) {
   const filtersKey = JSON.stringify(filters);
@@ -275,57 +300,70 @@ export function useOfflineSales(filters = {}, options = {}) {
     // PRIORITÉ 1: Charger depuis SQL local via Electron API (ultra-rapide)
     if (electronAPI?.db?.query) {
       try {
-        let query = 'SELECT * FROM sales WHERE 1=1';
+        let query = `SELECT s.* FROM sales s`;
         const params = [];
         
+        if (filters.hideDeleted === true) {
+          query += ` LEFT JOIN deleted_sales ds ON s.invoice_number = ds.invoice_number`;
+        }
+        
+        query += ` WHERE 1=1`;
+        
+        if (filters.hideDeleted === true) {
+          query += ` AND ds.id IS NULL`;
+        }
+        
         if (filters.from) {
-          query += ' AND sold_at >= ?';
+          query += ' AND s.sold_at >= ?';
           params.push(filters.from);
         }
         if (filters.to) {
-          query += ' AND sold_at <= ?';
+          query += ' AND s.sold_at <= ?';
           params.push(filters.to);
         }
         if (filters.status) {
-          query += ' AND status = ?';
+          query += ' AND s.status = ?';
           params.push(filters.status);
         }
         if (filters.exclude_status) {
-          query += ' AND status != ?';
+          query += ' AND s.status != ?';
           params.push(filters.exclude_status);
         }
         
-        query += ' ORDER BY sold_at DESC LIMIT 1000';
+        query += ' ORDER BY s.sold_at DESC LIMIT 1000';
         
         const sales = await electronAPI.db.query(query, params);
         if (sales && sales.length > 0) {
           return sales;
         }
       } catch (e) {
-        console.warn('[useOfflineSales] Erreur SQL local:', e);
+        console.warn('[useOfflineSales] SQL local error:', e.message);
       }
     }
     
-    // PRIORITÉ 2: API HTTP locale (toujours disponible même offline)
+    // PRIORITÉ 2: API HTTP locale - TIMEOUT COURT, PAS DE RETRY
     const API_URL = import.meta.env.DEV ? '' : (import.meta.env.VITE_API_URL || '');
+    
     try {
-      const params = new URLSearchParams();
-      if (filters.from) params.append('from', filters.from);
-      if (filters.to) params.append('to', filters.to);
-      if (filters.status) params.append('status', filters.status);
-      if (filters.exclude_status) params.append('exclude_status', filters.exclude_status);
+      const urlParams = new URLSearchParams();
+      if (filters.from) urlParams.append('from', filters.from);
+      if (filters.to) urlParams.append('to', filters.to);
+      if (filters.status) urlParams.append('status', filters.status);
+      if (filters.exclude_status) urlParams.append('exclude_status', filters.exclude_status);
       
-      const response = await fetch(`${API_URL}/api/sales?${params}`, {
-        signal: AbortSignal.timeout(2000), // Timeout court
+      // ✅ TIMEOUT COURT: 2 secondes max - pas d'attente
+      const response = await fetch(`${API_URL}/api/sales?${urlParams}`, {
+        signal: AbortSignal.timeout(2000),
       });
+      
       if (response.ok) {
         return await response.json();
       }
     } catch (e) {
-      console.warn('[useOfflineSales] Erreur API locale:', e);
+      // Silencieux - on garde le cache
     }
     
-    // Fallback: retourner tableau vide plutôt que d'attendre
+    // Retourner tableau vide si pas de cache
     return [];
   }, {
     ttl: CACHE_TTL.sales,
@@ -390,6 +428,42 @@ export function invalidateOfflineCache(key) {
     cacheTimestamps.clear();
     // Ne pas vider localStorage pour garder les données offline
   }
+}
+
+/**
+ * ✅ Invalider TOUS les caches de ventes (pour forcer rechargement dans SalesHistory)
+ * Utile après création d'une vente pour que la nouvelle vente apparaisse immédiatement
+ */
+export function invalidateAllSalesCache() {
+  // Invalider tous les caches commençant par "sales_"
+  const keysToDelete = [];
+  
+  // Vérifier tous les éléments du cache mémoire
+  for (const key of memoryCache.keys()) {
+    if (key.startsWith('sales_')) {
+      keysToDelete.push(key);
+    }
+  }
+  
+  // Vérifier localStorage aussi
+  for (let i = 0; i < localStorage.length; i++) {
+    const storageKey = localStorage.key(i);
+    if (storageKey && storageKey.startsWith('offline_cache_sales_')) {
+      const cacheKey = storageKey.replace('offline_cache_', '');
+      keysToDelete.push(cacheKey);
+    }
+  }
+  
+  // Supprimer tous les caches de ventes trouvés
+  keysToDelete.forEach(key => {
+    memoryCache.delete(key);
+    cacheTimestamps.delete(key);
+    try {
+      localStorage.removeItem(`offline_cache_${key}`);
+    } catch (e) {}
+  });
+  
+  console.log(`✅ [useOfflineFirst] ${keysToDelete.length} cache(s) de ventes invalidé(s)`);
 }
 
 export default useOfflineFirst;

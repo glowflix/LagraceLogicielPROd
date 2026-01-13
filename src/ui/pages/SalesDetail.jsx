@@ -22,9 +22,10 @@ const SalesDetail = () => {
     loadStatuses();
   }, [invoice]);
 
+  // ✅ PRO ULTRA-RAPIDE: Timeout court de 2s
   const loadSale = async () => {
     try {
-      const response = await axios.get(`${API_URL}/api/sales/${invoice}`);
+      const response = await axios.get(`${API_URL}/api/sales/${invoice}`, { timeout: 2000 });
       setSale(response.data);
     } catch (error) {
       console.error('Erreur chargement vente:', error);
@@ -33,24 +34,22 @@ const SalesDetail = () => {
     }
   };
 
+  // ✅ PRO: Chargement statuts en background, timeout court
   const loadStatuses = async () => {
     try {
-      // Charger le statut de sync depuis sync_outbox
-      const syncResponse = await axios.get(`${API_URL}/api/sync/status`);
+      const syncResponse = await axios.get(`${API_URL}/api/sync/status`, { timeout: 2000 });
       const syncData = syncResponse.data?.pending || [];
       const saleSync = syncData.find(s => s.entity_id === invoice);
       setSyncStatus(saleSync ? { status: saleSync.status || 'pending' } : { status: sale?.synced_at ? 'synced' : 'none' });
 
-      // Charger le statut d'impression depuis print_jobs
       try {
-        const printResponse = await axios.get(`${API_URL}/api/print/status/${invoice}`);
+        const printResponse = await axios.get(`${API_URL}/api/print/status/${invoice}`, { timeout: 2000 });
         setPrintStatus(printResponse.data || { status: 'none' });
       } catch {
-        // Si l'endpoint n'existe pas encore, utiliser le statut par défaut
         setPrintStatus({ status: 'none' });
       }
     } catch (error) {
-      console.error('Erreur chargement statuts:', error);
+      // Silencieux - pas de blocage
     }
   };
 

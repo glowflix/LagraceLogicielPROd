@@ -90,7 +90,8 @@ const UsersPage = () => {
   });
   const [creating, setCreating] = useState(false);
   const [updating, setUpdating] = useState(false);
-  const { user: currentUser } = useStore();
+  // ✅ Récupérer user ET token depuis le store
+  const { user: currentUser, token } = useStore();
   const saveTimeoutRef = useRef(null);
   const pendingSavesRef = useRef(new Map());
 
@@ -99,9 +100,19 @@ const UsersPage = () => {
     return isUserAdmin(currentUser);
   }, [currentUser]);
 
+  // ✅ MODE LICENSE: Détection si connecté avec license (pas de compte utilisateur)
+  // En mode license = accès COMPLET à tout
+  const isLicenseMode = useMemo(() => {
+    // Si pas de currentUser ou pas d'ID = mode license
+    return !currentUser || !currentUser.id;
+  }, [currentUser]);
+
   // Vérifier les permissions de l'utilisateur
   const userRole = useMemo(() => getUserRole(currentUser), [currentUser]);
-  const canManageUsers = useMemo(() => hasPermission(userRole, PERMISSIONS.MANAGE_USERS), [userRole]);
+  const canManageUsers = useMemo(() => isLicenseMode || hasPermission(userRole, PERMISSIONS.MANAGE_USERS), [userRole, isLicenseMode]);
+  const canManageUsersSelf = useMemo(() => isLicenseMode || hasPermission(userRole, PERMISSIONS.MANAGE_USERS_SELF), [userRole, isLicenseMode]);
+  const canManageUsersAll = useMemo(() => isLicenseMode || hasPermission(userRole, PERMISSIONS.MANAGE_USERS_ALL), [userRole, isLicenseMode]);
+  const canToggleAdmin = useMemo(() => isLicenseMode || hasPermission(userRole, PERMISSIONS.TOGGLE_ADMIN), [userRole, isLicenseMode]);
 
   // Charger les utilisateurs
   useEffect(() => {
@@ -113,20 +124,18 @@ const UsersPage = () => {
     return () => clearInterval(interval);
   }, []);
 
-  // Debug: Surveiller l'état du modal
-  useEffect(() => {
-    console.log('🔍 [DEBUG] État du modal changé:');
-    console.log('  - showProfileModal:', showProfileModal);
-    console.log('  - profileUser:', profileUser?.username, profileUser?.id);
-  }, [showProfileModal, profileUser]);
+  // Debug: Surveiller l'état du modal (désactivé en production)
+  // useEffect(() => {
+  //   console.log('🔍 [DEBUG] État du modal changé:', showProfileModal, profileUser?.username);
+  // }, [showProfileModal, profileUser]);
 
+  // ✅ PRO: Timeout court de 2s
   const loadUsers = useCallback(async () => {
     try {
-      const response = await axios.get(`${API_URL}/api/users`);
+      const response = await axios.get(`${API_URL}/api/users`, { timeout: 2000 });
       setUsers(response.data || []);
     } catch (error) {
-      console.error('❌ [UsersPage] Erreur chargement utilisateurs:', error);
-      setUsers([]);
+      // Silencieux - garder les données actuelles
     } finally {
       setLoading(false);
     }
@@ -176,7 +185,7 @@ const UsersPage = () => {
 
       try {
         setSaving(prev => new Set(prev).add(userId));
-        const token = localStorage.getItem('token');
+        // ✅ Utiliser le token depuis le store (pas localStorage)
         const config = token ? { headers: { Authorization: `Bearer ${token}` } } : {};
 
         // Préparer les données de mise à jour
@@ -211,16 +220,32 @@ const UsersPage = () => {
   const handleToggle = useCallback(async (userId, field) => {
     const user = users.find(u => u.id === userId);
     if (!user) return;
+
+    // ✅ Protection: is_admin ne peut être modifié que par OWNER
+    if (field === 'is_admin' && !canToggleAdmin) {
+      alert('⚠️ Seul le créateur peut changer le statut administrateur');
+      return;
+    }
+
+    // ✅ Protection: Peut modifier is_active seulement sur son propre compte OU si admin/owner
+    if (field === 'is_active' && userId !== currentUser?.id && !canManageUsersAll) {
+      alert('⚠️ Vous ne pouvez changer le statut que de votre propre compte');
+      return;
+    }
     
     const newValue = !(user[field] === 1 || user[field] === true);
     await saveFieldChange(userId, field, newValue);
-  }, [users, saveFieldChange]);
+  }, [users, saveFieldChange, canToggleAdmin, canManageUsersAll, currentUser?.id]);
 
-  // Édition inline - Seuls les admins peuvent modifier les comptes
+  // Édition inline
   const handleInlineEdit = (user, field) => {
-    // Vérifier si l'utilisateur actuel peut éditer
-    if (!canManageUsers) {
-      alert('⚠️ Vous n\'avez pas la permission de modifier les utilisateurs');
+    // Vérifier si l'utilisateur actuel peut éditer ce compte
+    if (!canEditUser(user)) {
+      const isOwnAccount = currentUser?.id === user.id;
+      const message = isOwnAccount 
+        ? '⚠️ Vous n\'avez pas la permission de modifier votre propre compte'
+        : '⚠️ Vous n\'avez pas la permission de modifier les autres comptes. Vous pouvez seulement modifier votre propre compte.';
+      alert(message);
       return;
     }
     setEditingField({ userId: user.id, field });
@@ -232,10 +257,22 @@ const UsersPage = () => {
   };
   
   // Vérifier si l'utilisateur peut modifier un autre utilisateur
+  // ✅ Règles PRO:
+  // 1. MODE LICENSE = ACCÈS COMPLET (peut tout modifier)
+  // 2. Chacun peut modifier son propre compte (si MANAGE_USERS_SELF = true)
+  // 3. ADMIN/OWNER peuvent modifier les autres comptes (si MANAGE_USERS_ALL = true)
   const canEditUser = useCallback((user) => {
-    // Seuls les admins peuvent modifier
-    return canManageUsers;
-  }, [canManageUsers]);
+    // ✅ Mode license = ACCÈS COMPLET à tous les comptes
+    if (isLicenseMode) {
+      return true;
+    }
+    // Cas 1: Modifier son propre compte = AUTORISÉ si permission MANAGE_USERS_SELF
+    if (currentUser?.id === user.id) {
+      return canManageUsersSelf;
+    }
+    // Cas 2: Modifier un AUTRE compte = AUTORISÉ seulement si MANAGE_USERS_ALL
+    return canManageUsersAll;
+  }, [currentUser?.id, canManageUsersSelf, canManageUsersAll, isLicenseMode]);
 
   const handleInlineSave = useCallback((userId, field) => {
     if (field === 'password' && !editingValue.trim()) {
@@ -254,6 +291,9 @@ const UsersPage = () => {
   };
 
 
+  // État pour afficher les infos de connexion après création
+  const [createdUserInfo, setCreatedUserInfo] = useState(null);
+
   // Créer un nouvel utilisateur
   const handleCreateUser = async (e) => {
     e.preventDefault();
@@ -264,30 +304,43 @@ const UsersPage = () => {
 
     try {
       setCreating(true);
-      const token = localStorage.getItem('token');
+      // ✅ Utiliser le token depuis le store (pas localStorage)
       const config = {
         headers: { Authorization: `Bearer ${token}` },
       };
 
-      await axios.post(`${API_URL}/api/users`, newUserForm, config);
+      const response = await axios.post(`${API_URL}/api/users`, newUserForm, config);
+      const createdUser = response.data?.user;
+
+      // Stocker les infos pour affichage
+      setCreatedUserInfo({
+        username: newUserForm.username,
+        password: newUserForm.password,
+        phone: newUserForm.phone || 'Non renseigné',
+        uuid: createdUser?.uuid || 'Auto-généré',
+        is_vendeur: newUserForm.is_vendeur,
+        is_gerant_stock: newUserForm.is_gerant_stock,
+        can_manage_products: newUserForm.can_manage_products,
+      });
 
       // Réinitialiser le formulaire
       setNewUserForm({
-      username: '',
-      password: '',
-      phone: '',
-      is_admin: false,
-      is_active: true,
-      device_brand: '',
-      profile_url: '',
-    });
+        username: '',
+        password: '',
+        phone: '',
+        is_admin: false,
+        is_active: true,
+        is_vendeur: true,
+        is_gerant_stock: false,
+        can_manage_products: false,
+        device_brand: '',
+        profile_url: '',
+        expo_push_token: '',
+      });
       setShowCreateForm(false);
       
       // Recharger les utilisateurs
       await loadUsers();
-      
-      // Message de succès
-      alert('✅ Utilisateur créé avec succès !');
     } catch (error) {
       console.error('Erreur création utilisateur:', error);
       const errorMessage = error.response?.data?.error || error.message || 'Erreur lors de la création de l\'utilisateur';
@@ -295,6 +348,11 @@ const UsersPage = () => {
     } finally {
       setCreating(false);
     }
+  };
+
+  // Fermer le modal d'infos de connexion
+  const closeCreatedUserInfo = () => {
+    setCreatedUserInfo(null);
   };
 
   // Convertir URL Google Drive - Utilise lh3.googleusercontent.com pour éviter CORS
@@ -369,13 +427,10 @@ const UsersPage = () => {
 
   // Fonctions pour le modal de profil avec zoom/pan et édition
   const openProfileModal = useCallback((user) => {
-    console.log('🔵 [DEBUG] openProfileModal appelé pour:', user?.username, user?.id);
-    
     const latestDevice = user.devices && user.devices.length > 0 
       ? user.devices[user.devices.length - 1] 
       : null;
     
-    console.log('✅ [DEBUG] Ouverture du modal pour:', user.username);
     setProfileUser(user);
     const allTokens = user.devices?.map(d => d.expo_push_token).filter(Boolean).join('|') || '';
     setEditForm({
@@ -394,7 +449,6 @@ const UsersPage = () => {
     setShowProfileModal(true);
     setImageZoom(1);
     setImagePan({ x: 0, y: 0 });
-    console.log('✅ [DEBUG] showProfileModal défini à true');
   }, []);
 
   const closeProfileModal = useCallback(() => {
@@ -411,7 +465,7 @@ const UsersPage = () => {
 
     try {
       setUpdating(true);
-      const token = localStorage.getItem('token');
+      // ✅ Utiliser le token depuis le store (pas localStorage)
       const config = {
         headers: { Authorization: `Bearer ${token}` },
       };
@@ -582,45 +636,27 @@ const UsersPage = () => {
     }
   };
 
-  // ⚠️ Si l'utilisateur n'est pas admin, afficher un message d'accès refusé
-  if (!canManageUsers) {
-    return (
-      <div className="min-h-[60vh] flex items-center justify-center">
-        <m.div
-          initial={{ opacity: 0, scale: 0.9 }}
-          animate={{ opacity: 1, scale: 1 }}
-          className="text-center max-w-md mx-auto p-8 glass rounded-2xl"
-        >
-          <div className="w-20 h-20 mx-auto mb-6 rounded-full bg-red-500/20 flex items-center justify-center">
-            <Lock className="w-10 h-10 text-red-400" />
-          </div>
-          <h2 className="text-2xl font-bold text-red-400 mb-3">
-            Accès Restreint
-          </h2>
-          <p className="text-gray-400 mb-4">
-            Seuls les <span className="text-primary-400 font-semibold">Administrateurs</span> peuvent gérer les comptes utilisateurs.
-          </p>
-          <p className="text-sm text-gray-500">
-            Contactez un administrateur si vous avez besoin d'accéder à cette fonctionnalité.
-          </p>
-        </m.div>
-      </div>
-    );
-  }
+  // ✅ Afficher la page à tous, mais contrôler l'accès aux actions
+  // (Au lieu de bloquer l'accès complètement)
 
   return (
     <div className="space-y-6">
       {/* En-tête */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-3xl font-bold text-gray-100 mb-2">Compte Utilisateur</h1>
-          <p className="text-gray-400">Gestion des utilisateurs et permissions</p>
-          {isCurrentUserAdmin && (
+          <h1 className="text-3xl font-bold text-gray-100 mb-2">Gestion des Comptes</h1>
+          <p className="text-gray-400">Créer et gérer les utilisateurs</p>
+          {isLicenseMode ? (
+            <p className="text-xs text-emerald-400 mt-1 flex items-center gap-1.5 bg-emerald-500/10 px-2 py-1 rounded-lg w-fit">
+              <Key className="w-3 h-3" />
+              Mode License - Accès Complet
+            </p>
+          ) : isCurrentUserAdmin ? (
             <p className="text-xs text-primary-400 mt-1 flex items-center gap-1">
               <Shield className="w-3 h-3" />
               Mode Administrateur
             </p>
-          )}
+          ) : null}
         </div>
         <div className="flex gap-3">
           {/* Bouton visible pour tous les utilisateurs */}
@@ -664,209 +700,294 @@ const UsersPage = () => {
         </div>
       </div>
 
-      {/* Formulaire de création inline - Visible pour tous */}
+      {/* Formulaire de création PRO - Design amélioré */}
       {showCreateForm && (
         <m.div
-          initial={{ opacity: 0, height: 0 }}
-          animate={{ opacity: 1, height: 'auto' }}
-          exit={{ opacity: 0, height: 0 }}
-          transition={fastTransition}
-          className="glass p-6 rounded-lg border border-primary-500/30 shadow-lg"
+          initial={{ opacity: 0, y: -10 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, y: -10 }}
+          transition={{ duration: 0.2, ease: 'easeOut' }}
+          className="rounded-2xl overflow-hidden shadow-2xl border border-primary-500/20"
+          style={{
+            background: 'linear-gradient(135deg, rgba(15,23,42,0.95) 0%, rgba(30,41,59,0.9) 50%, rgba(15,23,42,0.95) 100%)',
+          }}
         >
-          <h2 className="text-2xl font-bold text-gray-100 mb-6 flex items-center gap-2">
-            <UserPlus className="w-6 h-6" />
-            Créer un Nouveau Client
-          </h2>
-          <form onSubmit={handleCreateUser} className="space-y-5">
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-300 mb-2">
-                  Nom d'utilisateur *
-                </label>
-                <input
-                  type="text"
-                  value={newUserForm.username}
-                  onChange={(e) => setNewUserForm({ ...newUserForm, username: e.target.value })}
-                  className="w-full px-4 py-2 bg-white/5 border border-white/10 rounded-lg text-gray-100 focus:outline-none focus:border-primary-500 transition-all"
-                  placeholder="Entrez le nom d'utilisateur"
-                  required
-                />
-              </div>
-              
-              <div>
-                <label className="block text-sm font-medium text-gray-300 mb-2">
-                  Mot de passe *
-                </label>
-                <input
-                  type="password"
-                  value={newUserForm.password}
-                  onChange={(e) => setNewUserForm({ ...newUserForm, password: e.target.value })}
-                  className="w-full px-4 py-2 bg-white/5 border border-white/10 rounded-lg text-gray-100 focus:outline-none focus:border-primary-500 transition-all"
-                  placeholder="Choisissez un mot de passe sécurisé"
-                  required
-                />
-              </div>
-              
-              <div>
-                <label className="block text-sm font-medium text-gray-300 mb-2">
-                  Téléphone
-                </label>
-                <input
-                  type="text"
-                  value={newUserForm.phone}
-                  onChange={(e) => setNewUserForm({ ...newUserForm, phone: e.target.value })}
-                  className="w-full px-4 py-2 bg-white/5 border border-white/10 rounded-lg text-gray-100 focus:outline-none focus:border-primary-500 transition-all"
-                  placeholder="243xxxxxxxxx"
-                />
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-300 mb-2">
-                  Marque du device
-                </label>
-                <input
-                  type="text"
-                  value={newUserForm.device_brand}
-                  onChange={(e) => setNewUserForm({ ...newUserForm, device_brand: e.target.value })}
-                  className="w-full px-4 py-2 bg-white/5 border border-white/10 rounded-lg text-gray-100 focus:outline-none focus:border-primary-500 transition-all"
-                  placeholder="Ex: TECNO, Samsung, iPhone, etc."
-                />
-              </div>
-
-              <div className="md:col-span-2">
-                <label className="block text-sm font-medium text-gray-300 mb-2">
-                  URL Photo de profil
-                </label>
-                <input
-                  type="url"
-                  value={newUserForm.profile_url}
-                  onChange={(e) => setNewUserForm({ ...newUserForm, profile_url: e.target.value })}
-                  className="w-full px-4 py-2 bg-white/5 border border-white/10 rounded-lg text-gray-100 focus:outline-none focus:border-primary-500 transition-all"
-                  placeholder="https://..."
-                />
-                {newUserForm.profile_url && (
-                  <div className="mt-3">
-                    <img
-                      src={convertGoogleDriveUrl(newUserForm.profile_url) || newUserForm.profile_url}
-                      alt="Aperçu"
-                      className="w-20 h-20 rounded-full object-cover border border-primary-500/30"
-                      crossOrigin="anonymous"
-                      referrerPolicy="no-referrer"
-                      onError={(e) => {
-                        const url = newUserForm.profile_url;
-                        if (url) {
-                          const fileIdMatch = url.match(/\/d\/([a-zA-Z0-9_-]+)/) || 
-                                             url.match(/[?&]id=([a-zA-Z0-9_-]+)/) ||
-                                             url.match(/\/file\/d\/([a-zA-Z0-9_-]+)/);
-                          if (fileIdMatch) {
-                            const fileId = fileIdMatch[1];
-                            e.target.src = `https://lh3.googleusercontent.com/d/${fileId}`;
-                            return;
-                          }
-                        }
-                        e.target.style.display = 'none';
-                      }}
-                    />
-                  </div>
-                )}
-              </div>
-            </div>
-
-            <div className="grid grid-cols-2 md:grid-cols-5 gap-3 pt-4 border-t border-white/10">
-              <label className="flex items-center gap-2 cursor-pointer group p-2 rounded-lg hover:bg-white/5 transition-all">
-                <input
-                  type="checkbox"
-                  checked={newUserForm.is_admin}
-                  onChange={(e) => setNewUserForm({ ...newUserForm, is_admin: e.target.checked })}
-                  className="w-4 h-4 rounded bg-white/5 border-white/10 text-primary-500 focus:ring-primary-500 transition-all"
-                />
-                <div className="flex items-center gap-1.5">
-                  <Shield className="w-4 h-4 text-yellow-400" />
-                  <span className="text-xs text-gray-300 group-hover:text-gray-100 transition-colors font-medium">Admin</span>
+          {/* Header du formulaire */}
+          <div className="relative px-6 py-5 border-b border-white/10">
+            <div className="absolute inset-0 bg-gradient-to-r from-primary-600/20 via-transparent to-primary-600/20"></div>
+            <div className="relative flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-12 h-12 bg-gradient-to-br from-primary-500 to-primary-700 rounded-xl flex items-center justify-center shadow-lg shadow-primary-500/30">
+                  <UserPlus className="w-6 h-6 text-white" />
                 </div>
-              </label>
-              <label className="flex items-center gap-2 cursor-pointer group p-2 rounded-lg hover:bg-white/5 transition-all">
-                <input
-                  type="checkbox"
-                  checked={newUserForm.is_active}
-                  onChange={(e) => setNewUserForm({ ...newUserForm, is_active: e.target.checked })}
-                  className="w-4 h-4 rounded bg-white/5 border-white/10 text-primary-500 focus:ring-primary-500 transition-all"
-                />
-                <div className="flex items-center gap-1.5">
-                  {newUserForm.is_active ? (
-                    <CheckCircle2 className="w-4 h-4 text-green-400" />
-                  ) : (
-                    <XCircle className="w-4 h-4 text-red-400" />
-                  )}
-                  <span className="text-xs text-gray-300 group-hover:text-gray-100 transition-colors font-medium">Actif</span>
+                <div>
+                  <h2 className="text-xl font-bold text-white">Créer un Nouveau Compte</h2>
+                  <p className="text-sm text-gray-400">Ajoutez un client ou collaborateur</p>
                 </div>
-              </label>
-              <label className="flex items-center gap-2 cursor-pointer group p-2 rounded-lg hover:bg-white/5 transition-all">
-                <input
-                  type="checkbox"
-                  checked={newUserForm.is_vendeur}
-                  onChange={(e) => setNewUserForm({ ...newUserForm, is_vendeur: e.target.checked })}
-                  className="w-4 h-4 rounded bg-white/5 border-white/10 text-primary-500 focus:ring-primary-500 transition-all"
-                />
-                <div className="flex items-center gap-1.5">
-                  <ShoppingCart className="w-4 h-4 text-blue-400" />
-                  <span className="text-xs text-gray-300 group-hover:text-gray-100 transition-colors font-medium">Vendeur</span>
-                </div>
-              </label>
-              <label className="flex items-center gap-2 cursor-pointer group p-2 rounded-lg hover:bg-white/5 transition-all">
-                <input
-                  type="checkbox"
-                  checked={newUserForm.is_gerant_stock}
-                  onChange={(e) => setNewUserForm({ ...newUserForm, is_gerant_stock: e.target.checked })}
-                  className="w-4 h-4 rounded bg-white/5 border-white/10 text-primary-500 focus:ring-primary-500 transition-all"
-                />
-                <div className="flex items-center gap-1.5">
-                  <Database className="w-4 h-4 text-purple-400" />
-                  <span className="text-xs text-gray-300 group-hover:text-gray-100 transition-colors font-medium">Stock</span>
-                </div>
-              </label>
-              <label className="flex items-center gap-2 cursor-pointer group p-2 rounded-lg hover:bg-white/5 transition-all">
-                <input
-                  type="checkbox"
-                  checked={newUserForm.can_manage_products}
-                  onChange={(e) => setNewUserForm({ ...newUserForm, can_manage_products: e.target.checked })}
-                  className="w-4 h-4 rounded bg-white/5 border-white/10 text-primary-500 focus:ring-primary-500 transition-all"
-                />
-                <div className="flex items-center gap-1.5">
-                  <Package className="w-4 h-4 text-orange-400" />
-                  <span className="text-xs text-gray-300 group-hover:text-gray-100 transition-colors font-medium">Produits</span>
-                </div>
-              </label>
-            </div>
-
-            <div className="flex gap-3 pt-4">
+              </div>
               <button
                 type="button"
                 onClick={() => setShowCreateForm(false)}
-                className="flex-1 btn-secondary"
+                className="w-10 h-10 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl flex items-center justify-center transition-all hover:scale-105"
               >
+                <X className="w-5 h-5 text-gray-400" />
+              </button>
+            </div>
+          </div>
+
+          <form onSubmit={handleCreateUser} className="p-6 space-y-6">
+            {/* Section: Informations principales */}
+            <div className="space-y-4">
+              <div className="flex items-center gap-2 text-sm font-semibold text-primary-400">
+                <User className="w-4 h-4" />
+                <span>Informations d'identification</span>
+              </div>
+              
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                {/* Nom d'utilisateur */}
+                <div className="space-y-2">
+                  <label className="flex items-center gap-2 text-sm font-medium text-gray-300">
+                    <User className="w-4 h-4 text-blue-400" />
+                    Nom d'utilisateur <span className="text-red-400">*</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={newUserForm.username}
+                    onChange={(e) => setNewUserForm({ ...newUserForm, username: e.target.value })}
+                    className="w-full px-4 py-3 bg-black/30 border border-white/10 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:border-primary-500 focus:ring-2 focus:ring-primary-500/20 transition-all"
+                    placeholder="ex: Jean Dupont"
+                    required
+                  />
+                </div>
+
+                {/* Mot de passe */}
+                <div className="space-y-2">
+                  <label className="flex items-center gap-2 text-sm font-medium text-gray-300">
+                    <Key className="w-4 h-4 text-amber-400" />
+                    Mot de passe <span className="text-red-400">*</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={newUserForm.password}
+                    onChange={(e) => setNewUserForm({ ...newUserForm, password: e.target.value })}
+                    className="w-full px-4 py-3 bg-black/30 border border-white/10 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:border-primary-500 focus:ring-2 focus:ring-primary-500/20 transition-all font-mono"
+                    placeholder="ex: 12345678"
+                    required
+                  />
+                  <p className="text-xs text-gray-500">Visible pour pouvoir le communiquer au client</p>
+                </div>
+
+                {/* Numéro de téléphone */}
+                <div className="space-y-2">
+                  <label className="flex items-center gap-2 text-sm font-medium text-gray-300">
+                    <Phone className="w-4 h-4 text-green-400" />
+                    Numéro de téléphone
+                  </label>
+                  <input
+                    type="text"
+                    value={newUserForm.phone}
+                    onChange={(e) => setNewUserForm({ ...newUserForm, phone: e.target.value })}
+                    className="w-full px-4 py-3 bg-black/30 border border-white/10 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:border-primary-500 focus:ring-2 focus:ring-primary-500/20 transition-all"
+                    placeholder="243xxxxxxxxx"
+                  />
+                  <p className="text-xs text-gray-500">Peut servir à se connecter</p>
+                </div>
+              </div>
+            </div>
+
+            {/* Section: Rôles et Permissions */}
+            <div className="space-y-4">
+              <div className="flex items-center gap-2 text-sm font-semibold text-primary-400">
+                <Shield className="w-4 h-4" />
+                <span>Rôles et Permissions</span>
+              </div>
+
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                {/* Actif */}
+                <button
+                  type="button"
+                  onClick={() => setNewUserForm({ ...newUserForm, is_active: !newUserForm.is_active })}
+                  className={`relative p-4 rounded-xl border-2 transition-all duration-200 ${
+                    newUserForm.is_active 
+                      ? 'border-green-500/50 bg-green-500/10' 
+                      : 'border-white/10 bg-black/20 hover:border-white/20'
+                  }`}
+                >
+                  <div className="flex flex-col items-center gap-2">
+                    {newUserForm.is_active ? (
+                      <CheckCircle2 className="w-6 h-6 text-green-400" />
+                    ) : (
+                      <XCircle className="w-6 h-6 text-gray-500" />
+                    )}
+                    <span className={`text-xs font-medium ${newUserForm.is_active ? 'text-green-300' : 'text-gray-400'}`}>
+                      Actif
+                    </span>
+                  </div>
+                  {newUserForm.is_active && (
+                    <div className="absolute top-2 right-2 w-2 h-2 bg-green-400 rounded-full"></div>
+                  )}
+                </button>
+
+                {/* Vendeur */}
+                <button
+                  type="button"
+                  onClick={() => setNewUserForm({ ...newUserForm, is_vendeur: !newUserForm.is_vendeur })}
+                  className={`relative p-4 rounded-xl border-2 transition-all duration-200 ${
+                    newUserForm.is_vendeur 
+                      ? 'border-blue-500/50 bg-blue-500/10' 
+                      : 'border-white/10 bg-black/20 hover:border-white/20'
+                  }`}
+                >
+                  <div className="flex flex-col items-center gap-2">
+                    <ShoppingCart className={`w-6 h-6 ${newUserForm.is_vendeur ? 'text-blue-400' : 'text-gray-500'}`} />
+                    <span className={`text-xs font-medium ${newUserForm.is_vendeur ? 'text-blue-300' : 'text-gray-400'}`}>
+                      Vendeur
+                    </span>
+                  </div>
+                  {newUserForm.is_vendeur && (
+                    <div className="absolute top-2 right-2 w-2 h-2 bg-blue-400 rounded-full"></div>
+                  )}
+                </button>
+
+                {/* Gérant Stock */}
+                <button
+                  type="button"
+                  onClick={() => setNewUserForm({ ...newUserForm, is_gerant_stock: !newUserForm.is_gerant_stock })}
+                  className={`relative p-4 rounded-xl border-2 transition-all duration-200 ${
+                    newUserForm.is_gerant_stock 
+                      ? 'border-purple-500/50 bg-purple-500/10' 
+                      : 'border-white/10 bg-black/20 hover:border-white/20'
+                  }`}
+                >
+                  <div className="flex flex-col items-center gap-2">
+                    <Database className={`w-6 h-6 ${newUserForm.is_gerant_stock ? 'text-purple-400' : 'text-gray-500'}`} />
+                    <span className={`text-xs font-medium ${newUserForm.is_gerant_stock ? 'text-purple-300' : 'text-gray-400'}`}>
+                      Gérant Stock
+                    </span>
+                  </div>
+                  {newUserForm.is_gerant_stock && (
+                    <div className="absolute top-2 right-2 w-2 h-2 bg-purple-400 rounded-full"></div>
+                  )}
+                </button>
+
+                {/* Produits */}
+                <button
+                  type="button"
+                  onClick={() => setNewUserForm({ ...newUserForm, can_manage_products: !newUserForm.can_manage_products })}
+                  className={`relative p-4 rounded-xl border-2 transition-all duration-200 ${
+                    newUserForm.can_manage_products 
+                      ? 'border-orange-500/50 bg-orange-500/10' 
+                      : 'border-white/10 bg-black/20 hover:border-white/20'
+                  }`}
+                >
+                  <div className="flex flex-col items-center gap-2">
+                    <Package className={`w-6 h-6 ${newUserForm.can_manage_products ? 'text-orange-400' : 'text-gray-500'}`} />
+                    <span className={`text-xs font-medium ${newUserForm.can_manage_products ? 'text-orange-300' : 'text-gray-400'}`}>
+                      Produits
+                    </span>
+                  </div>
+                  {newUserForm.can_manage_products && (
+                    <div className="absolute top-2 right-2 w-2 h-2 bg-orange-400 rounded-full"></div>
+                  )}
+                </button>
+
+                {/* Admin (réservé) */}
+                <button
+                  type="button"
+                  onClick={() => setNewUserForm({ ...newUserForm, is_admin: !newUserForm.is_admin })}
+                  className={`relative p-4 rounded-xl border-2 transition-all duration-200 ${
+                    newUserForm.is_admin 
+                      ? 'border-yellow-500/50 bg-yellow-500/10' 
+                      : 'border-white/10 bg-black/20 hover:border-white/20'
+                  }`}
+                  title={isCurrentUserAdmin ? "Définir comme administrateur" : "Seul un admin peut créer un autre admin"}
+                >
+                  <div className="flex flex-col items-center gap-2">
+                    <Shield className={`w-6 h-6 ${newUserForm.is_admin ? 'text-yellow-400' : 'text-gray-500'}`} />
+                    <span className={`text-xs font-medium ${newUserForm.is_admin ? 'text-yellow-300' : 'text-gray-400'}`}>
+                      Admin
+                    </span>
+                  </div>
+                  {newUserForm.is_admin && (
+                    <div className="absolute top-2 right-2 w-2 h-2 bg-yellow-400 rounded-full"></div>
+                  )}
+                </button>
+              </div>
+            </div>
+
+            {/* Section: Device (optionnel, collapsed) */}
+            <details className="group">
+              <summary className="flex items-center gap-2 text-sm font-semibold text-gray-400 cursor-pointer hover:text-gray-300 transition-colors">
+                <Smartphone className="w-4 h-4" />
+                <span>Informations Device (optionnel)</span>
+                <span className="text-xs text-gray-500 ml-2">▼</span>
+              </summary>
+              <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <label className="flex items-center gap-2 text-sm font-medium text-gray-300">
+                    <Smartphone className="w-4 h-4 text-gray-400" />
+                    Marque du device
+                  </label>
+                  <input
+                    type="text"
+                    value={newUserForm.device_brand}
+                    onChange={(e) => setNewUserForm({ ...newUserForm, device_brand: e.target.value })}
+                    className="w-full px-4 py-3 bg-black/30 border border-white/10 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:border-primary-500 focus:ring-2 focus:ring-primary-500/20 transition-all"
+                    placeholder="TECNO, Samsung, iPhone..."
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="flex items-center gap-2 text-sm font-medium text-gray-300">
+                    <User className="w-4 h-4 text-gray-400" />
+                    URL Photo de profil
+                  </label>
+                  <input
+                    type="url"
+                    value={newUserForm.profile_url}
+                    onChange={(e) => setNewUserForm({ ...newUserForm, profile_url: e.target.value })}
+                    className="w-full px-4 py-3 bg-black/30 border border-white/10 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:border-primary-500 focus:ring-2 focus:ring-primary-500/20 transition-all"
+                    placeholder="https://drive.google.com/..."
+                  />
+                </div>
+              </div>
+            </details>
+
+            {/* Boutons d'action */}
+            <div className="flex gap-4 pt-4 border-t border-white/10">
+              <button
+                type="button"
+                onClick={() => setShowCreateForm(false)}
+                className="flex-1 py-3 px-6 bg-white/5 hover:bg-white/10 border border-white/10 text-gray-300 font-medium rounded-xl transition-all flex items-center justify-center gap-2"
+              >
+                <X className="w-4 h-4" />
                 Annuler
               </button>
               <button
                 type="submit"
-                disabled={creating}
-                className="flex-1 btn-primary flex items-center justify-center gap-2"
+                disabled={creating || !newUserForm.username || !newUserForm.password}
+                className="flex-[2] py-3 px-6 bg-gradient-to-r from-primary-600 to-primary-500 hover:from-primary-500 hover:to-primary-400 disabled:from-gray-700 disabled:to-gray-600 disabled:cursor-not-allowed text-white font-bold rounded-xl transition-all shadow-lg shadow-primary-500/30 hover:shadow-primary-500/50 disabled:shadow-none flex items-center justify-center gap-2"
               >
                 {creating ? (
                   <>
-                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <Loader2 className="w-5 h-5 animate-spin" />
                     Création en cours...
                   </>
                 ) : (
                   <>
-                    <Save className="w-4 h-4" />
+                    <UserPlus className="w-5 h-5" />
                     Créer le Compte
                   </>
                 )}
               </button>
             </div>
+
+            {/* Info UUID */}
+            <div className="flex items-center justify-center gap-2 text-xs text-gray-500">
+              <Hash className="w-3 h-3" />
+              <span>L'UUID sera généré automatiquement</span>
+            </div>
           </form>
-          </m.div>
+        </m.div>
       )}
 
       {/* Statistiques - animations rapides */}
@@ -929,13 +1050,10 @@ const UsersPage = () => {
                         : 'border-white/5'
                     } ${isSaving ? 'ring-2 ring-primary-500/50' : ''}`}
                     onClick={(e) => {
-                      console.log('🟢 [DEBUG] Clic sur la carte utilisateur:', user.username, user.id);
-                      console.log('🟢 [DEBUG] Target:', e.target, 'TagName:', e.target.tagName);
-                      
                       // Empêcher la propagation si on clique sur un élément interactif
                       const target = e.target;
                       
-                      // Vérifier si on clique sur un élément interactif
+                      // Vérifier si on clique sur un élément interactif (bouton, input, badge)
                       const isInteractive = 
                         target.closest('button') || 
                         target.closest('input') || 
@@ -945,27 +1063,18 @@ const UsersPage = () => {
                         target.tagName === 'A' ||
                         target.closest('.badge');
                       
-                      console.log('🟢 [DEBUG] isInteractive:', isInteractive);
-                      
                       // Ne pas ouvrir le modal si on clique sur un élément interactif
                       if (isInteractive) {
-                        console.log('⚠️ [DEBUG] Clic sur élément interactif, annulation');
                         return;
                       }
                       
-                      console.log('🟢 [DEBUG] Vérification conditions:');
-                      console.log('  - isEditingUsername:', isEditingUsername);
-                      console.log('  - isEditingPhone:', isEditingPhone);
-                      console.log('  - isEditingPassword:', isEditingPassword);
-                      
-                      // Ouvrir le modal pour modifier l'utilisateur - TOUJOURS autorisé
-                      if (!isEditingUsername && !isEditingPhone && !isEditingPassword) {
-                        console.log('✅ [DEBUG] Conditions OK, appel de openProfileModal');
-                        openProfileModal(user);
-                      } else {
-                        console.log('❌ [DEBUG] Édition en cours, impossible d\'ouvrir le modal');
-                        alert(`⚠️ Édition en cours: username=${isEditingUsername}, phone=${isEditingPhone}, password=${isEditingPassword}`);
+                      // ✅ MODE LICENSE: Annuler toute édition en cours et ouvrir le modal
+                      if (isEditingUsername || isEditingPhone || isEditingPassword) {
+                        handleInlineCancel(); // Annuler l'édition en cours
                       }
+                      
+                      // Ouvrir le modal pour modifier l'utilisateur
+                      openProfileModal(user);
                     }}
                   >
                     <div 
@@ -981,14 +1090,14 @@ const UsersPage = () => {
                       <div className="relative flex-shrink-0">
                         <button
                           onClick={(e) => {
-                            console.log('🖼️ [DEBUG] Clic sur l\'avatar de:', user.username);
                             e.stopPropagation();
-                            console.log('🖼️ [DEBUG] canEditUser:', canEditUser(user));
-                            if (canEditUser(user)) {
-                              console.log('✅ [DEBUG] Appel de openProfileModal depuis l\'avatar');
+                            // ✅ Mode license = toujours autorisé
+                            if (isLicenseMode || canEditUser(user)) {
+                              // Annuler toute édition en cours
+                              if (isEditingUsername || isEditingPhone || isEditingPassword) {
+                                handleInlineCancel();
+                              }
                               openProfileModal(user);
-                            } else {
-                              console.log('❌ [DEBUG] Pas de permission pour modifier cet utilisateur');
                             }
                           }}
                           className="cursor-zoom-in hover:scale-105 transition-transform"
@@ -1218,29 +1327,43 @@ const UsersPage = () => {
                       )}
                       </div>
 
-                      {/* Badges - Modifiables par tous les utilisateurs connectés */}
+                      {/* Badges - Modifiables par OWNER seulement pour is_admin */}
                       <div className="flex items-center gap-2 flex-shrink-0">
+                        {/* Bouton is_admin - Seul OWNER peut modifier */}
                         <button
+                          disabled={!canToggleAdmin}
                           onClick={(e) => {
                             e.stopPropagation();
                             handleToggle(user.id, 'is_admin');
                           }}
                           className={`badge flex items-center gap-1 text-xs transition-all ${
+                            !canToggleAdmin ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'
+                          } ${
                             isAdmin ? 'badge-warning' : 'badge-secondary'
                           }`}
+                          title={canToggleAdmin ? "Cliquer pour modifier le statut administrateur" : "Seul le créateur peut modifier le statut administrateur"}
                         >
                           <Shield className="w-3 h-3" />
                           {isAdmin ? 'Admin' : 'Vendeur'}
                         </button>
                         
+                        {/* Bouton is_active - Propriétaire peut modifier tout, autres seulement leur compte */}
                         <button
+                          disabled={user.id !== currentUser?.id && !canManageUsersAll}
                           onClick={(e) => {
                             e.stopPropagation();
                             handleToggle(user.id, 'is_active');
                           }}
                           className={`badge flex items-center gap-1 text-xs transition-all ${
+                            (user.id !== currentUser?.id && !canManageUsersAll) ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'
+                          } ${
                             isActive ? 'badge-success' : 'badge-error'
                           }`}
+                          title={
+                            user.id === currentUser?.id ? "Cliquer pour modifier votre statut" :
+                            canManageUsersAll ? "Cliquer pour modifier le statut" :
+                            "Vous pouvez seulement modifier votre propre compte"
+                          }
                         >
                           {isActive ? (
                             <>
@@ -1311,11 +1434,122 @@ const UsersPage = () => {
         )}
       </div>
 
-      {/* Indicateur de débogage visuel */}
-      {showProfileModal && (
-        <div className="fixed top-4 right-4 bg-green-500 text-white px-4 py-2 rounded-lg shadow-lg z-[10000]">
-          🟢 Modal ouvert pour: {profileUser?.username}
-        </div>
+      {/* Modal d'informations de connexion après création - PRO Design */}
+      {typeof document !== 'undefined' && createPortal(
+        <AnimatePresence mode="wait">
+          {createdUserInfo && (
+            <m.div
+              key="created-user-modal"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 bg-black/80 backdrop-blur-md flex items-center justify-center p-4 z-[10000]"
+              onClick={closeCreatedUserInfo}
+            >
+              <m.div
+                initial={{ scale: 0.9, y: 20 }}
+                animate={{ scale: 1, y: 0 }}
+                exit={{ scale: 0.9, y: 20 }}
+                transition={{ type: 'spring', damping: 25, stiffness: 300 }}
+                className="w-full max-w-md"
+                onClick={(e) => e.stopPropagation()}
+              >
+                {/* Carte de succès avec design premium */}
+                <div className="bg-gradient-to-br from-emerald-900/90 via-emerald-800/80 to-teal-900/90 rounded-2xl shadow-2xl border border-emerald-500/30 overflow-hidden">
+                  {/* Header avec icône de succès */}
+                  <div className="relative p-6 text-center border-b border-emerald-500/20">
+                    <div className="absolute inset-0 bg-gradient-to-b from-emerald-400/10 to-transparent"></div>
+                    <div className="relative">
+                      <div className="w-16 h-16 mx-auto mb-3 bg-gradient-to-br from-emerald-400 to-teal-500 rounded-full flex items-center justify-center shadow-lg shadow-emerald-500/30">
+                        <CheckCircle2 className="w-9 h-9 text-white" />
+                      </div>
+                      <h2 className="text-2xl font-bold text-white mb-1">Compte Créé avec Succès !</h2>
+                      <p className="text-emerald-200/80 text-sm">Voici les informations de connexion</p>
+                    </div>
+                  </div>
+
+                  {/* Informations de connexion */}
+                  <div className="p-6 space-y-4">
+                    {/* Nom d'utilisateur */}
+                    <div className="bg-black/20 rounded-xl p-4 border border-white/10">
+                      <div className="flex items-center gap-3 mb-2">
+                        <div className="w-8 h-8 bg-blue-500/20 rounded-lg flex items-center justify-center">
+                          <User className="w-4 h-4 text-blue-400" />
+                        </div>
+                        <span className="text-xs text-gray-400 uppercase tracking-wide font-medium">Nom d'utilisateur</span>
+                      </div>
+                      <p className="text-xl font-bold text-white pl-11 select-all">{createdUserInfo.username}</p>
+                    </div>
+
+                    {/* Mot de passe */}
+                    <div className="bg-black/20 rounded-xl p-4 border border-white/10">
+                      <div className="flex items-center gap-3 mb-2">
+                        <div className="w-8 h-8 bg-amber-500/20 rounded-lg flex items-center justify-center">
+                          <Key className="w-4 h-4 text-amber-400" />
+                        </div>
+                        <span className="text-xs text-gray-400 uppercase tracking-wide font-medium">Mot de passe</span>
+                      </div>
+                      <p className="text-xl font-bold text-white pl-11 font-mono select-all">{createdUserInfo.password}</p>
+                    </div>
+
+                    {/* Numéro de téléphone */}
+                    <div className="bg-black/20 rounded-xl p-4 border border-white/10">
+                      <div className="flex items-center gap-3 mb-2">
+                        <div className="w-8 h-8 bg-green-500/20 rounded-lg flex items-center justify-center">
+                          <Phone className="w-4 h-4 text-green-400" />
+                        </div>
+                        <span className="text-xs text-gray-400 uppercase tracking-wide font-medium">Numéro de téléphone</span>
+                      </div>
+                      <p className="text-xl font-bold text-white pl-11 select-all">{createdUserInfo.phone}</p>
+                    </div>
+
+                    {/* Rôles assignés */}
+                    <div className="flex flex-wrap gap-2 pt-2">
+                      {createdUserInfo.is_vendeur && (
+                        <span className="px-3 py-1.5 bg-blue-500/20 text-blue-300 rounded-lg text-xs font-medium flex items-center gap-1.5">
+                          <ShoppingCart className="w-3 h-3" /> Vendeur
+                        </span>
+                      )}
+                      {createdUserInfo.is_gerant_stock && (
+                        <span className="px-3 py-1.5 bg-purple-500/20 text-purple-300 rounded-lg text-xs font-medium flex items-center gap-1.5">
+                          <Database className="w-3 h-3" /> Gérant Stock
+                        </span>
+                      )}
+                      {createdUserInfo.can_manage_products && (
+                        <span className="px-3 py-1.5 bg-orange-500/20 text-orange-300 rounded-lg text-xs font-medium flex items-center gap-1.5">
+                          <Package className="w-3 h-3" /> Produits
+                        </span>
+                      )}
+                    </div>
+
+                    {/* UUID (discret) */}
+                    <div className="pt-2 border-t border-white/10">
+                      <div className="flex items-center gap-2 text-xs text-gray-500">
+                        <Hash className="w-3 h-3" />
+                        <span className="font-mono truncate">{createdUserInfo.uuid}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Footer avec bouton */}
+                  <div className="p-4 bg-black/20 border-t border-emerald-500/20">
+                    <button
+                      onClick={closeCreatedUserInfo}
+                      className="w-full py-3 bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-white font-bold rounded-xl transition-all duration-200 shadow-lg shadow-emerald-500/30 hover:shadow-emerald-500/50 flex items-center justify-center gap-2"
+                    >
+                      <Check className="w-5 h-5" />
+                      C'est noté, fermer
+                    </button>
+                    <p className="text-center text-xs text-gray-500 mt-3">
+                      💡 L'utilisateur peut se connecter avec son nom ou numéro
+                    </p>
+                  </div>
+                </div>
+              </m.div>
+            </m.div>
+          )}
+        </AnimatePresence>,
+        document.body
       )}
 
       {/* Modal de profil avec zoom/pan et édition complète - Portal pour Electron */}
@@ -1337,10 +1571,7 @@ const UsersPage = () => {
               right: 0,
               bottom: 0
             }}
-            onClick={() => {
-              console.log('🔴 [DEBUG] Clic sur le fond du modal (fermeture)');
-              closeProfileModal();
-            }}
+            onClick={closeProfileModal}
           >
             <m.div
               variants={modalVariants}

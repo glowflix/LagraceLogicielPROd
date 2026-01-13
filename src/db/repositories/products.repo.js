@@ -13,7 +13,8 @@ export class ProductsRepository {
   hasProducts() {
     const db = getDb();
     try {
-      const count = db.prepare('SELECT COUNT(*) as count FROM products WHERE is_active = 1').get();
+      // ✅ SOFT DELETE: Compter seulement les produits actifs (pas supprimés)
+      const count = db.prepare('SELECT COUNT(*) as count FROM products WHERE is_active = 1 AND deleted_at IS NULL').get();
       return count.count > 0;
     } catch (error) {
       logger.error('Erreur hasProducts:', error);
@@ -31,13 +32,13 @@ export class ProductsRepository {
       // Récupérer le taux actuel pour calculer FC depuis USD
       const currentRate = ratesRepo.getCurrent();
       
-      // ✅ CORRECTION: Récupérer les produits SANS GROUP_CONCAT (trop fragile avec JSON)
-      // Utiliser une approche simple: récupérer tous les produits, puis pour chacun ses unités
+      // ✅ SOFT DELETE: Ignorer les produits marqués comme supprimés (deleted_at IS NOT NULL)
+      // ✅ Ignorer aussi les produits is_active=0 (pour compatibilité)
       const products = db
         .prepare(`
           SELECT p.* 
           FROM products p
-          WHERE p.is_active = 1
+          WHERE p.is_active = 1 AND p.deleted_at IS NULL
           ORDER BY p.id
         `)
         .all()
@@ -86,8 +87,9 @@ export class ProductsRepository {
       // Récupérer le taux actuel pour calculer FC depuis USD
       const currentRate = ratesRepo.getCurrent();
       
+      // ✅ SOFT DELETE: Ignorer les produits supprimés (deleted_at IS NOT NULL)
       const product = db
-        .prepare('SELECT * FROM products WHERE code = ? AND is_active = 1')
+        .prepare('SELECT * FROM products WHERE code = ? AND is_active = 1 AND deleted_at IS NULL')
         .get(code);
 
       if (!product) return null;
@@ -128,13 +130,15 @@ export class ProductsRepository {
         }
         
         // Upsert produit
+        // ✅ SOFT DELETE: Si produit est marqué supprimé (deleted_at IS NOT NULL), le réactiver (deleted_at = NULL)
         const productStmt = db.prepare(`
-          INSERT INTO products (uuid, code, name, is_active, updated_at)
-          VALUES (?, ?, ?, ?, datetime('now'))
+          INSERT INTO products (uuid, code, name, is_active, deleted_at, updated_at)
+          VALUES (?, ?, ?, ?, NULL, datetime('now'))
           ON CONFLICT(code) DO UPDATE SET
             uuid = COALESCE(excluded.uuid, products.uuid),
             name = excluded.name,
             is_active = excluded.is_active,
+            deleted_at = NULL,
             updated_at = datetime('now')
         `);
 

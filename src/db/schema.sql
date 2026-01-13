@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS product_units (
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   synced_at TEXT,
-  UNIQUE(product_id, unit_level),
+  UNIQUE(product_id, unit_level, unit_mark),
   FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
 );
 
@@ -165,6 +165,23 @@ CREATE TABLE IF NOT EXISTS sale_voids (
 );
 
 -- =========================
+-- DELETED SALES (Ventes supprimées - soft delete)
+-- =========================
+-- Track supprimées pour éviter qu'elles réapparaissent lors de sync Sheets
+CREATE TABLE IF NOT EXISTS deleted_sales (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  invoice_number TEXT NOT NULL UNIQUE,
+  sale_id INTEGER,
+  deleted_at TEXT NOT NULL DEFAULT (datetime('now')),
+  reason TEXT,  -- motif de suppression (manuel, sync_conflict, etc.)
+  deleted_by INTEGER,
+  FOREIGN KEY(sale_id) REFERENCES sales(id) ON DELETE SET NULL,
+  FOREIGN KEY(deleted_by) REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_deleted_sales_invoice ON deleted_sales(invoice_number);
+
+-- =========================
 -- DEBTS (Dettes) + payments
 -- =========================
 CREATE TABLE IF NOT EXISTS debts (
@@ -185,7 +202,7 @@ CREATE TABLE IF NOT EXISTS debts (
   created_at TEXT NOT NULL DEFAULT (datetime('now')),  -- date
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   synced_at TEXT,
-  FOREIGN KEY(sale_id) REFERENCES sales(id)
+  FOREIGN KEY(sale_id) REFERENCES sales(id) ON DELETE CASCADE
 );
 
 -- Éviter les doublons: invoice_number doit être unique (sauf NULL)
@@ -647,15 +664,19 @@ CREATE TABLE IF NOT EXISTS print_jobs (
   invoice_number TEXT NOT NULL,
   template TEXT NOT NULL DEFAULT 'receipt-80',
   payload_json TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending', -- pending|processing|printed|error
+  status TEXT NOT NULL DEFAULT 'pending', -- pending|processing|printed|error|retry
   attempts INTEGER NOT NULL DEFAULT 0,
   last_error TEXT,
+  priority INTEGER NOT NULL DEFAULT 0,    -- 0=normal, 1=haute, 2=urgente
+  retry_at TEXT,                          -- Date/heure du prochain retry
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   printed_at TEXT,
-  FOREIGN KEY(invoice_number) REFERENCES sales(invoice_number)
+  FOREIGN KEY(invoice_number) REFERENCES sales(invoice_number) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_print_jobs_status ON print_jobs(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_print_jobs_invoice ON print_jobs(invoice_number);
+CREATE INDEX IF NOT EXISTS idx_print_jobs_priority ON print_jobs(priority DESC, created_at ASC);
+CREATE INDEX IF NOT EXISTS idx_print_jobs_retry ON print_jobs(status, retry_at);
 

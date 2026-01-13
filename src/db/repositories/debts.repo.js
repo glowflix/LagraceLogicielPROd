@@ -314,10 +314,23 @@ export class DebtsRepository {
   /**
    * Crée une opération sync_operations pour la dette
    * Cette opération sera pushée vers Google Sheets via sync.worker
+   * ✅ ANTI-DOUBLON: Vérifie qu'aucune opération pending n'existe déjà pour cette dette
    */
   createSyncOperation(debt, opType = 'upsert') {
     const db = getDb();
     try {
+      // ✅ ANTI-DOUBLON: Vérifier si une opération pending existe déjà pour cette dette
+      const existingPending = db.prepare(`
+        SELECT id FROM sync_operations 
+        WHERE entity_uuid = ? AND op_type = 'DEBT' AND status = 'pending'
+        LIMIT 1
+      `).get(debt.uuid);
+      
+      if (existingPending) {
+        logger.debug(`   ⏭️ [SYNC] Opération DEBT déjà pending pour uuid=${debt.uuid?.substring(0, 8)}...`);
+        return; // Ne pas créer de doublon
+      }
+      
       const op_id = generateUUID();
       
       const payload = {
@@ -336,7 +349,7 @@ export class DebtsRepository {
       };
       
       db.prepare(`
-        INSERT OR IGNORE INTO sync_operations (
+        INSERT INTO sync_operations (
           op_id, op_type, entity_uuid, entity_code, payload_json, status
         )
         VALUES (?, ?, ?, ?, ?, ?)
@@ -358,11 +371,30 @@ export class DebtsRepository {
 
   /**
    * Ajoute un paiement à une dette
+   * ✅ FIX: Vérifier si la dette existe avant de la modifier
    */
   addPayment(debtId, paymentData) {
     const db = getDb();
     const transaction = db.transaction(() => {
       try {
+        // ✅ FIX: Vérifier d'abord si la dette existe
+        const debt = this.findById(debtId);
+        
+        if (!debt) {
+          // ✅ Essayer de trouver par invoice_number si fourni
+          if (paymentData.invoice_number) {
+            const debtByInvoice = this.findByInvoice(paymentData.invoice_number);
+            if (debtByInvoice) {
+              logger.info(`💳 [addPayment] Dette trouvée par invoice_number: ${paymentData.invoice_number}`);
+              return this.addPayment(debtByInvoice.id, paymentData);
+            }
+          }
+          
+          throw new Error(`Dette non trouvée avec ID: ${debtId}. La dette n'existe peut-être pas encore localement (synchronisation en cours).`);
+        }
+        
+        logger.info(`💳 [addPayment] Dette trouvée: ID=${debt.id}, invoice=${debt.invoice_number}, paid_fc=${debt.paid_fc}, total_fc=${debt.total_fc}`);
+        
         // Ajouter le paiement
         const paymentStmt = db.prepare(`
           INSERT INTO debt_payments (debt_id, amount_fc, payment_mode, paid_by)
@@ -377,10 +409,9 @@ export class DebtsRepository {
         );
 
         // Mettre à jour la dette
-        const debt = this.findById(debtId);
         const newPaidFC = (debt.paid_fc || 0) + paymentData.amount_fc;
-        const newRemainingFC = debt.total_fc - newPaidFC;
-        const newStatus = newRemainingFC <= 0 ? 'closed' : newRemainingFC < debt.total_fc ? 'partial' : 'open';
+        const newRemainingFC = Math.max(0, debt.total_fc - newPaidFC);
+        const newStatus = newRemainingFC <= 0 ? 'closed' : newPaidFC > 0 ? 'partial' : 'open';
 
         db.prepare(`
           UPDATE debts
@@ -388,9 +419,11 @@ export class DebtsRepository {
           WHERE id = ?
         `).run(newPaidFC, newRemainingFC, newStatus, debtId);
 
+        logger.info(`   ✅ [addPayment] Paiement enregistré: +${paymentData.amount_fc} FC, nouveau solde: paid=${newPaidFC}, reste=${newRemainingFC}, status=${newStatus}`);
+
         return this.findById(debtId);
       } catch (error) {
-        logger.error('Erreur addPayment:', error);
+        logger.error('❌ [addPayment] Erreur:', error);
         throw error;
       }
     });

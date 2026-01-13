@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import { getDb } from '../../db/sqlite.js';
 import { logger } from '../../core/logger.js';
 import { debtsRepo } from '../../db/repositories/debts.repo.js';
+import { outboxRepo } from '../../db/repositories/outbox.repo.js';
 import { sheetsClient } from './sheets.client.js';
 
 function toNumber(v) {
@@ -288,15 +289,113 @@ export async function pullDebtsFromSheets() {
 
     logger.info(`✅ [PULL-DEBTS] ${upserted}/${invoices.length} dettes upsertées dans SQLite`);
 
+    // 6. ✅ PRO: Supprimer les dettes locales qui n'existent plus dans Sheets
+    // Conditions:
+    // - La dette existe en local mais n'est pas dans Sheets (avec données valides)
+    // - La dette n'a pas d'opération pending dans l'outbox
+    const deleted = cleanupDeletedDebts(invoices);
+    
+    if (deleted > 0) {
+      logger.info(`🗑️ [PULL-DEBTS] ${deleted} dette(s) supprimée(s) (absentes de Sheets)`);
+    }
+
     return {
       read_rows: rows.length,
       mapped_lines: mappedLines.length,
       unique_lines: uniqueLines.length,
       invoices: invoices.length,
       upserted,
+      deleted,
     };
   } catch (error) {
     logger.error('❌ [PULL-DEBTS] Erreur:', error);
     throw error;
+  }
+}
+
+/**
+ * ✅ PRO: Supprime les dettes locales qui n'existent plus dans Sheets
+ * Ne supprime PAS les dettes qui ont des opérations pending dans l'outbox
+ * 
+ * @param {Array} sheetsDebts - Dettes présentes dans Sheets (avec invoice_number)
+ * @returns {number} - Nombre de dettes supprimées
+ */
+function cleanupDeletedDebts(sheetsDebts) {
+  const db = getDb();
+  let deleted = 0;
+  
+  try {
+    // 1. Créer un Set des invoice_numbers présents dans Sheets
+    const sheetsInvoiceNumbers = new Set(
+      sheetsDebts
+        .map(d => d.invoice_number)
+        .filter(inv => inv && inv.trim().length > 0)
+    );
+    
+    logger.debug(`🔍 [CLEANUP-DEBTS] ${sheetsInvoiceNumbers.size} factures dans Sheets`);
+    
+    // 2. Récupérer toutes les dettes locales
+    const localDebts = db.prepare(`
+      SELECT id, uuid, invoice_number, client_name, status 
+      FROM debts 
+      WHERE status != 'paid'
+    `).all();
+    
+    logger.debug(`🔍 [CLEANUP-DEBTS] ${localDebts.length} dettes locales (non payées)`);
+    
+    // 3. Récupérer les dettes avec opérations pending dans l'outbox
+    const pendingDebtOps = db.prepare(`
+      SELECT DISTINCT entity_uuid, entity_code 
+      FROM sync_outbox 
+      WHERE entity_type IN ('DEBT', 'DEBT_PAYMENT', 'DEBT_PARTIAL') 
+        AND status = 'pending'
+    `).all();
+    
+    const pendingUuids = new Set(pendingDebtOps.map(op => op.entity_uuid).filter(Boolean));
+    const pendingInvoices = new Set(pendingDebtOps.map(op => op.entity_code).filter(Boolean));
+    
+    logger.debug(`🔍 [CLEANUP-DEBTS] ${pendingUuids.size} UUIDs pending, ${pendingInvoices.size} factures pending`);
+    
+    // 4. Identifier les dettes à supprimer
+    const toDelete = localDebts.filter(debt => {
+      // Vérifier si la dette existe dans Sheets
+      const existsInSheets = sheetsInvoiceNumbers.has(debt.invoice_number);
+      
+      // Vérifier si la dette a une opération pending
+      const hasPendingOp = pendingUuids.has(debt.uuid) || pendingInvoices.has(debt.invoice_number);
+      
+      // Supprimer si: n'existe pas dans Sheets ET pas d'opération pending
+      return !existsInSheets && !hasPendingOp;
+    });
+    
+    logger.info(`🗑️ [CLEANUP-DEBTS] ${toDelete.length} dette(s) à supprimer`);
+    
+    // 5. Supprimer les dettes
+    if (toDelete.length > 0) {
+      const deleteStmt = db.prepare(`DELETE FROM debts WHERE id = ?`);
+      const deletePaymentsStmt = db.prepare(`DELETE FROM debt_payments WHERE debt_id = ?`);
+      
+      const transaction = db.transaction(() => {
+        for (const debt of toDelete) {
+          try {
+            // Supprimer les paiements associés d'abord
+            deletePaymentsStmt.run(debt.id);
+            // Supprimer la dette
+            deleteStmt.run(debt.id);
+            deleted++;
+            logger.debug(`   🗑️ Supprimée: ${debt.invoice_number} (${debt.client_name})`);
+          } catch (error) {
+            logger.warn(`   ⚠️ Erreur suppression dette ${debt.invoice_number}: ${error.message}`);
+          }
+        }
+      });
+      
+      transaction();
+    }
+    
+    return deleted;
+  } catch (error) {
+    logger.error(`❌ [CLEANUP-DEBTS] Erreur: ${error.message}`);
+    return 0;
   }
 }

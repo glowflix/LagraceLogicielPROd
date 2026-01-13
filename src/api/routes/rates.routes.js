@@ -1,8 +1,9 @@
 import express from 'express';
 import { ratesRepo } from '../../db/repositories/rates.repo.js';
-import { syncRepo } from '../../db/repositories/sync.repo.js';
+import { outboxRepo } from '../../db/repositories/outbox.repo.js';
 import { optionalAuth } from '../middlewares/auth.js';
 import { getSocketIO } from '../socket.js';
+import { logger } from '../../core/logger.js';
 
 const router = express.Router();
 
@@ -22,6 +23,7 @@ router.get('/current', optionalAuth, (req, res) => {
 /**
  * PUT /api/rates/current
  * Met à jour le taux de change (peut être utilisé sans authentification si licence activée)
+ * ✅ Synchronise automatiquement avec Google Sheets (feuille "Taux")
  */
 router.put('/current', optionalAuth, (req, res) => {
   try {
@@ -38,11 +40,9 @@ router.put('/current', optionalAuth, (req, res) => {
     const userId = req.user?.id || null;
     const newRate = ratesRepo.updateCurrent(parseFloat(rate), userId);
 
-    // Ajouter à l'outbox pour synchronisation avec Sheets
-    syncRepo.addToOutbox('rates', 'current', 'upsert', {
-      rate_fc_per_usd: newRate,
-      effective_at: new Date().toISOString(),
-    });
+    // ✅ Ajouter à l'outbox PRO pour synchronisation avec Sheets
+    const opId = outboxRepo.enqueueRate(newRate, new Date().toISOString());
+    logger.info(`💱 [RATES] Taux mis à jour: ${newRate} FC/USD, sync op_id=${opId}`);
 
     // Émettre l'événement WebSocket pour synchronisation temps réel
     const io = getSocketIO();
@@ -52,6 +52,7 @@ router.put('/current', optionalAuth, (req, res) => {
 
     res.json({ success: true, rate: newRate });
   } catch (error) {
+    logger.error('❌ [RATES] Erreur mise à jour taux:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });

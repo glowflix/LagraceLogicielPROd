@@ -41,6 +41,9 @@ export const PERMISSIONS = {
   
   // Actions sur les utilisateurs
   MANAGE_USERS: 'canManageUsers',
+  MANAGE_USERS_SELF: 'canManageUsersSelf', // ✅ Modifier son propre compte
+  MANAGE_USERS_ALL: 'canManageUsersAll',   // ✅ Modifier tous les comptes (ADMIN/OWNER)
+  TOGGLE_ADMIN: 'canToggleAdmin',          // ✅ Promouvoir admin (OWNER seulement)
   CREATE_USERS: 'canCreateUsers',
   BLOCK_USERS: 'canBlockUsers',
   
@@ -74,6 +77,9 @@ export const ROLE_PERMISSIONS = {
     [PERMISSIONS.MODIFY_PRODUCT_PRICES]: false,
     [PERMISSIONS.MODIFY_PRODUCT_STOCK]: false,
     [PERMISSIONS.MANAGE_USERS]: false,
+    [PERMISSIONS.MANAGE_USERS_SELF]: false,
+    [PERMISSIONS.MANAGE_USERS_ALL]: false,
+    [PERMISSIONS.TOGGLE_ADMIN]: false,
     [PERMISSIONS.CREATE_USERS]: false,
     [PERMISSIONS.BLOCK_USERS]: false,
     [PERMISSIONS.MANAGE_SETTINGS]: false,
@@ -101,6 +107,39 @@ export const ROLE_PERMISSIONS = {
     [PERMISSIONS.MODIFY_PRODUCT_PRICES]: true,
     [PERMISSIONS.MODIFY_PRODUCT_STOCK]: true,
     [PERMISSIONS.MANAGE_USERS]: true,
+    [PERMISSIONS.MANAGE_USERS_SELF]: true,
+    [PERMISSIONS.MANAGE_USERS_ALL]: true,
+    [PERMISSIONS.TOGGLE_ADMIN]: false, // ✅ Admins ne peuvent pas se donner OWNER
+    [PERMISSIONS.CREATE_USERS]: true,
+    [PERMISSIONS.BLOCK_USERS]: true,
+    [PERMISSIONS.MANAGE_SETTINGS]: true,
+    [PERMISSIONS.MANAGE_SYNC]: true,
+    [PERMISSIONS.MANAGE_LICENSE]: true,
+  },
+
+  /**
+   * OWNER (is_owner = true) - ✅ SUPER ADMIN
+   * Créateur/Fondateur - Accès total + promotion admin
+   */
+  OWNER: {
+    [PERMISSIONS.SALES_POS]: true,
+    [PERMISSIONS.SALES_HISTORY]: true,
+    [PERMISSIONS.PRODUCTS]: true,
+    [PERMISSIONS.USERS]: true,
+    [PERMISSIONS.DEBTS]: true,
+    [PERMISSIONS.ANALYTICS]: true,
+    [PERMISSIONS.SETTINGS]: true,
+    [PERMISSIONS.SYNC]: true,
+    [PERMISSIONS.LICENSE]: true,
+    [PERMISSIONS.DASHBOARD]: true,
+    [PERMISSIONS.NEW_ARRIVAGE]: true,
+    [PERMISSIONS.MANAGE_PRODUCTS]: true,
+    [PERMISSIONS.MODIFY_PRODUCT_PRICES]: true,
+    [PERMISSIONS.MODIFY_PRODUCT_STOCK]: true,
+    [PERMISSIONS.MANAGE_USERS]: true,
+    [PERMISSIONS.MANAGE_USERS_SELF]: true,
+    [PERMISSIONS.MANAGE_USERS_ALL]: true,   // ✅ Peut tout modifier
+    [PERMISSIONS.TOGGLE_ADMIN]: true,       // ✅ Peut promouvoir admin
     [PERMISSIONS.CREATE_USERS]: true,
     [PERMISSIONS.BLOCK_USERS]: true,
     [PERMISSIONS.MANAGE_SETTINGS]: true,
@@ -129,6 +168,9 @@ export const ROLE_PERMISSIONS = {
     [PERMISSIONS.MODIFY_PRODUCT_PRICES]: false,
     [PERMISSIONS.MODIFY_PRODUCT_STOCK]: false,
     [PERMISSIONS.MANAGE_USERS]: false,
+    [PERMISSIONS.MANAGE_USERS_SELF]: true,   // Peut modifier son propre compte
+    [PERMISSIONS.MANAGE_USERS_ALL]: false,   // Ne peut pas modifier les autres
+    [PERMISSIONS.TOGGLE_ADMIN]: false,       // Ne peut pas promouvoir admin
     [PERMISSIONS.CREATE_USERS]: false,
     [PERMISSIONS.BLOCK_USERS]: false,
     [PERMISSIONS.MANAGE_SETTINGS]: false,
@@ -156,6 +198,9 @@ export const ROLE_PERMISSIONS = {
     [PERMISSIONS.MODIFY_PRODUCT_PRICES]: true,
     [PERMISSIONS.MODIFY_PRODUCT_STOCK]: true,
     [PERMISSIONS.MANAGE_USERS]: false,
+    [PERMISSIONS.MANAGE_USERS_SELF]: true,   // Peut modifier son propre compte
+    [PERMISSIONS.MANAGE_USERS_ALL]: false,   // Ne peut pas modifier les autres
+    [PERMISSIONS.TOGGLE_ADMIN]: false,       // Ne peut pas promouvoir admin
     [PERMISSIONS.CREATE_USERS]: false,
     [PERMISSIONS.BLOCK_USERS]: false,
     [PERMISSIONS.MANAGE_SETTINGS]: false,
@@ -183,6 +228,9 @@ export const ROLE_PERMISSIONS = {
     [PERMISSIONS.MODIFY_PRODUCT_PRICES]: false, // Ne peut pas modifier les prix
     [PERMISSIONS.MODIFY_PRODUCT_STOCK]: true,
     [PERMISSIONS.MANAGE_USERS]: false,
+    [PERMISSIONS.MANAGE_USERS_SELF]: true,   // Peut modifier son propre compte
+    [PERMISSIONS.MANAGE_USERS_ALL]: false,   // Ne peut pas modifier les autres
+    [PERMISSIONS.TOGGLE_ADMIN]: false,       // Ne peut pas promouvoir admin
     [PERMISSIONS.CREATE_USERS]: false,
     [PERMISSIONS.BLOCK_USERS]: false,
     [PERMISSIONS.MANAGE_SETTINGS]: false,
@@ -211,6 +259,9 @@ export const ROLE_PERMISSIONS = {
     [PERMISSIONS.MODIFY_PRODUCT_PRICES]: true,
     [PERMISSIONS.MODIFY_PRODUCT_STOCK]: true,
     [PERMISSIONS.MANAGE_USERS]: false,
+    [PERMISSIONS.MANAGE_USERS_SELF]: true,   // Peut modifier son propre compte
+    [PERMISSIONS.MANAGE_USERS_ALL]: false,   // Ne peut pas modifier les autres
+    [PERMISSIONS.TOGGLE_ADMIN]: false,       // Ne peut pas promouvoir admin
     [PERMISSIONS.CREATE_USERS]: false,
     [PERMISSIONS.BLOCK_USERS]: false,
     [PERMISSIONS.MANAGE_SETTINGS]: false,
@@ -238,6 +289,9 @@ export const ROLE_PERMISSIONS = {
     [PERMISSIONS.MODIFY_PRODUCT_PRICES]: true,
     [PERMISSIONS.MODIFY_PRODUCT_STOCK]: true,
     [PERMISSIONS.MANAGE_USERS]: false,
+    [PERMISSIONS.MANAGE_USERS_SELF]: true,   // Peut modifier son propre compte
+    [PERMISSIONS.MANAGE_USERS_ALL]: false,   // Ne peut pas modifier les autres
+    [PERMISSIONS.TOGGLE_ADMIN]: false,       // Ne peut pas promouvoir admin
     [PERMISSIONS.CREATE_USERS]: false,
     [PERMISSIONS.BLOCK_USERS]: false,
     [PERMISSIONS.MANAGE_SETTINGS]: false,
@@ -265,6 +319,9 @@ export const ROLE_PERMISSIONS = {
     [PERMISSIONS.MODIFY_PRODUCT_PRICES]: true,
     [PERMISSIONS.MODIFY_PRODUCT_STOCK]: true,
     [PERMISSIONS.MANAGE_USERS]: true, // Licence PRO = accès total
+    [PERMISSIONS.MANAGE_USERS_SELF]: true,   // Peut modifier son propre compte
+    [PERMISSIONS.MANAGE_USERS_ALL]: true,    // Peut modifier tous les comptes
+    [PERMISSIONS.TOGGLE_ADMIN]: false,       // Mais ne peut pas promouvoir admin
     [PERMISSIONS.CREATE_USERS]: true,
     [PERMISSIONS.BLOCK_USERS]: true,
     [PERMISSIONS.MANAGE_SETTINGS]: true,
@@ -316,7 +373,7 @@ export function isUserAdmin(user) {
 /**
  * Détermine le rôle d'un utilisateur basé sur ses flags de la table "Compter Utilisateur"
  * 
- * @param {Object} user - Objet utilisateur avec les flags : is_admin, is_vendeur, is_gerant_stock, can_manage_products, is_active
+ * @param {Object} user - Objet utilisateur avec les flags : is_admin, is_vendeur, is_gerant_stock, can_manage_products, is_active, is_owner
  * @returns {string} Le rôle déterminé
  */
 export function getUserRole(user) {
@@ -327,6 +384,12 @@ export function getUserRole(user) {
   // 0. Vérifier si le compte est bloqué (is_active = false)
   if (!isUserActive(user)) {
     return 'BLOCKED';
+  }
+
+  // 0.5. Owner = accès total + gestion des permissions
+  const isOwner = user.is_owner === 1 || user.is_owner === true || user.is_owner === 'oui' || user.is_owner === 'OUI';
+  if (isOwner) {
+    return 'OWNER';
   }
 
   // 1. Admin = accès total

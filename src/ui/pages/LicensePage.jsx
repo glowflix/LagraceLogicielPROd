@@ -18,12 +18,12 @@ const LicensePage = () => {
   const [checkingFile, setCheckingFile] = useState(true);
   const [fileFound, setFileFound] = useState(false);
 
-  // Lire automatiquement le fichier linkcodeelagrace.Jeariss au chargement
+  // ✅ PRO: Lire avec timeout court
   useEffect(() => {
     const checkLicenseFile = async () => {
       try {
         setCheckingFile(true);
-        const response = await axios.get(`${API_URL}/api/license/check-file`);
+        const response = await axios.get(`${API_URL}/api/license/check-file`, { timeout: 2000 });
         
         if (response.data.success && response.data.valid) {
           // Licence valide trouvée dans le fichier

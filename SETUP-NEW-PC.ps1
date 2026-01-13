@@ -138,17 +138,34 @@ try {
     $pythonVersion = (python --version 2>$null)
 } catch {}
 
+
 if ($pythonVersion -and $pythonVersion -match "3\.(10|11|12|13)") {
     Write-OK "Python deja installe: $pythonVersion"
 } else {
     Write-Step "Installation de Python 3.11 via winget..."
     winget install Python.Python.3.11 --accept-package-agreements --accept-source-agreements --silent
-    
+
     if ($LASTEXITCODE -eq 0) {
         Write-OK "Python 3.11 installe!"
     } else {
-        Write-Err "Erreur installation Python via winget"
-        Write-Info "Installer manuellement depuis: https://www.python.org/downloads/"
+        Write-Err "Erreur installation Python via winget. Tentative d'installation Python 3.12.10 depuis python.org..."
+        $pyInstallerUrl = "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe"
+        $pyInstallerPath = "$env:TEMP\python-3.12.10-amd64.exe"
+        try {
+            Write-Step "Telechargement de Python 3.12.10..."
+            Invoke-WebRequest -Uri $pyInstallerUrl -OutFile $pyInstallerPath -UseBasicParsing
+            Write-Step "Installation silencieuse de Python 3.12.10..."
+            Start-Process -FilePath $pyInstallerPath -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0" -Wait
+            $pythonVersion = (python --version 2>$null)
+            if ($pythonVersion -and $pythonVersion -match "3\.12") {
+                Write-OK "Python 3.12.10 installe avec succes!"
+            } else {
+                Write-Err "Echec installation Python 3.12.10. Installer manuellement depuis: https://www.python.org/downloads/"
+            }
+        } catch {
+            Write-Err "Erreur lors du telechargement ou de l'installation de Python 3.12.10."
+            Write-Info "Installer manuellement depuis: https://www.python.org/downloads/"
+        }
     }
     Write-Info "Redemarrer le terminal apres l'installation pour utiliser python"
 }
@@ -159,31 +176,17 @@ $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";"
 # ============================================================================
 # 4. INSTALLATION DE GIT
 # ============================================================================
-Write-Title "4. INSTALLATION DE GIT"
 
-$gitExists = Get-Command git -ErrorAction SilentlyContinue
-if (-not $gitExists) {
-    Write-Step "Installation de Git..."
-    winget install Git.Git --accept-package-agreements --accept-source-agreements --silent
-    
-    if ($LASTEXITCODE -eq 0) {
-        Write-OK "Git installe!"
-    } else {
-        Write-Info "Git optionnel - continuer sans Git"
-    }
-} else {
-    Write-OK "Git deja installe: $(git --version)"
-}
-
-# Rafraichir le PATH
-$env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+Write-Info "[Git et GitHub] : Ce script ne gere pas l'installation ni la configuration de Git ou GitHub."
+Write-Info "Aucune operation de depot, clonage ou push n'est effectuee."
 
 # ============================================================================
 # 5. INSTALLATION DES DEPENDANCES NPM (React, Electron, Vite, etc.)
 # ============================================================================
 Write-Title "5. INSTALLATION DES DEPENDANCES NPM"
 
-# Verifier que npm est accessible
+
+# 1. Vérifier que npm est accessible
 $npmExists = Get-Command npm -ErrorAction SilentlyContinue
 if (-not $npmExists) {
     Write-Err "npm non trouve!"
@@ -192,27 +195,95 @@ if (-not $npmExists) {
     pause
     exit 1
 }
-
 Write-OK "npm trouve: v$(npm --version)"
 
-Write-Step "Installation des dependances npm (React, Electron, Vite, etc.)..."
+# 2. Installation des dépendances avec npm install
+Write-Step "[1/3] Installation des dependances npm (npm install)..."
 Write-Info "Cela peut prendre quelques minutes..."
-
 Set-Location $PROJECT_DIR
 npm install 2>&1 | Out-Host
-
 if ($LASTEXITCODE -eq 0) {
     Write-OK "Dependances npm installees!"
-    Write-Info "  - React (UI)"
-    Write-Info "  - Electron (application desktop)"
-    Write-Info "  - Vite (bundler)"
-    Write-Info "  - Express (serveur backend)"
-    Write-Info "  - SQLite (better-sqlite3)"
-    Write-Info "  - Socket.IO (temps reel)"
 } else {
     Write-Err "Erreur lors de npm install"
     Write-Info "Essayer: npm install --legacy-peer-deps"
 }
+
+# 3. Vérification supplémentaire avec npm i (équivalent, mais certains devs l'utilisent)
+Write-Step "[2/3] Vérification rapide avec 'npm i' (optionnel)..."
+npm i 2>&1 | Out-Null
+if ($LASTEXITCODE -eq 0) {
+    Write-Info "npm i OK"
+} else {
+    Write-Info "npm i a retourné une erreur (peut être ignoré si npm install a réussi)"
+}
+
+# 4. Vérification de npx et react
+Write-Step "[3/3] Vérification de npx et react..."
+$npxExists = Get-Command npx -ErrorAction SilentlyContinue
+if ($npxExists) {
+    Write-Info "npx disponible: $(npx --version)"
+    try {
+        $reactVersion = npx react --version 2>$null
+        if ($reactVersion) {
+            Write-Info "React (npx) disponible: $reactVersion"
+        } else {
+            Write-Info "React (npx) non trouvé, installation via npm install react..."
+            npm install react 2>&1 | Out-Null
+            $reactVersion2 = npx react --version 2>$null
+            if ($reactVersion2) {
+                Write-OK "React installé et disponible via npx."
+            } else {
+                Write-Info "React toujours non disponible via npx. Vérifier manuellement."
+            }
+        }
+    } catch {
+        Write-Info "Erreur lors de la vérification de react via npx."
+    }
+} else {
+    Write-Info "npx non trouvé, installer Node.js >= 8.2 ou relancer le terminal."
+}
+
+Write-Info "\nRésumé npm:\n- npm install (classique)\n- npm i (raccourci)\n- npx react --version (vérifie React CLI)\n- npm install react (si besoin)\n"
+
+# 5bis. Installation et vérification de better-sqlite3 pour Electron (mode accueil)
+Write-Step "Installation et vérification de better-sqlite3 pour Electron (mode accueil)..."
+try {
+    npm list better-sqlite3 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Write-OK "better-sqlite3 déjà installé."
+    } else {
+        Write-Info "better-sqlite3 non trouvé, installation..."
+        npm install better-sqlite3 2>&1 | Out-Host
+        if ($LASTEXITCODE -eq 0) {
+            Write-OK "better-sqlite3 installé avec succès."
+        } else {
+            Write-Err "Erreur lors de l'installation de better-sqlite3."
+        }
+    }
+} catch {
+    Write-Info "Erreur lors de la vérification/installation de better-sqlite3."
+}
+
+# (Optionnel) Vérifier sqlite3 si besoin
+try {
+    npm list sqlite3 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Write-OK "sqlite3 déjà installé."
+    } else {
+        Write-Info "sqlite3 non trouvé, installation..."
+        npm install sqlite3 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-OK "sqlite3 installé avec succès."
+        } else {
+            Write-Info "sqlite3 non critique, ignorable si non utilisé."
+        }
+    }
+} catch {
+    Write-Info "Erreur lors de la vérification/installation de sqlite3."
+}
+
+Write-Info "better-sqlite3 est compatible avec Electron et le mode accueil du logiciel."
 
 # ============================================================================
 # 6. CREATION DE L'ENVIRONNEMENT VIRTUEL PYTHON (pour l'IA)

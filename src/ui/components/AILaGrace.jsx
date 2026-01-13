@@ -6,9 +6,26 @@
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { io } from 'socket.io-client';
+import { getSocketUrl, getApiUrl } from '../utils/apiConfig.js';
 
-// Configuration
-const SOCKET_URL = import.meta.env.VITE_API_URL || 'http://localhost:3030';
+// Configuration - Utiliser l'URL dynamique pour compatibilité LAN
+const getSocketUrlSafe = () => {
+  const socketUrl = getSocketUrl();
+  // Si socketUrl est undefined (mode proxy), utiliser l'API URL ou détecter automatiquement
+  if (!socketUrl) {
+    const apiUrl = getApiUrl();
+    if (apiUrl) return apiUrl;
+    // Fallback: détecter depuis l'URL actuelle
+    if (typeof window !== 'undefined') {
+      const { protocol, hostname, port } = window.location;
+      if (port === '3030') return `${protocol}//${hostname}:${port}`;
+      return `${protocol}//${hostname}:3030`;
+    }
+  }
+  return socketUrl || 'http://localhost:3030';
+};
+
+const SOCKET_URL = getSocketUrlSafe();
 
 // Icônes SVG inline
 const MicrophoneIcon = ({ active }) => (

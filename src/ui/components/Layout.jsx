@@ -15,6 +15,7 @@ import {
   Wifi,
   WifiOff,
   Terminal,
+  TrendingUp,
 } from 'lucide-react';
 import { useStore } from '../store/useStore';
 import { useConnectionState, useIsLicensed, useToken, useUser } from '../store/selectors';
@@ -29,6 +30,7 @@ const menuItems = [
   { path: '/sales', icon: ShoppingCart, label: 'Ventes' },
   { path: '/sales/history', icon: FileText, label: 'Historique' },
   { path: '/products', icon: Package, label: 'Produits' },
+  { path: '/newarrivage', icon: TrendingUp, label: 'Arrivages' },
   { path: '/debts', icon: FileText, label: 'Dettes' },
   { path: '/users', icon: Users, label: 'Compte Utilisateur' },
   { path: '/analytics', icon: BarChart3, label: 'Statistiques' },
@@ -157,45 +159,26 @@ const Layout = ({ children }) => {
           </div>
         </div>
 
-        {/* Menu */}
+        {/* Menu - Simplifié pour éviter les blocages de navigation */}
         <nav className="flex-1 p-4 space-y-2">
-          {visibleMenuItems.map((item, index) => {
+          {visibleMenuItems.map((item) => {
             const Icon = item.icon;
             const isActive = location.pathname === item.path;
             return (
-              <Link key={item.path} to={item.path}>
-                <m.div
-                  initial={{ opacity: 0, x: -20 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  transition={{ delay: index * 0.05, duration: 0.3 }}
-                  whileHover={{ 
-                    x: 4,
-                    scale: 1.02,
-                    transition: { duration: 0.2 }
-                  }}
-                  whileTap={{ scale: 0.98 }}
-                  className={`flex items-center gap-3 px-4 py-3 rounded-lg transition-all relative overflow-hidden ${
-                    isActive
-                      ? 'bg-primary-500/20 text-primary-400 border border-primary-500/30'
-                      : 'text-gray-400 hover:bg-white/5 hover:text-gray-200'
-                  }`}
-                >
-                  {isActive && (
-                    <m.div
-                      layoutId="activeTab"
-                      className="absolute inset-0 bg-primary-500/10 rounded-lg pointer-events-none"
-                      initial={false}
-                      transition={{ type: 'spring', stiffness: 500, damping: 30 }}
-                    />
-                  )}
-                  <m.div
-                    animate={isActive ? { scale: 1.1 } : { scale: 1 }}
-                    transition={{ duration: 0.2 }}
-                  >
-                    <Icon className="w-5 h-5 relative z-10" />
-                  </m.div>
-                  <span className="font-medium relative z-10">{item.label}</span>
-                </m.div>
+              <Link 
+                key={item.path} 
+                to={item.path}
+                className={`flex items-center gap-3 px-4 py-3 rounded-lg transition-all duration-200 relative overflow-hidden ${
+                  isActive
+                    ? 'bg-primary-500/20 text-primary-400 border border-primary-500/30'
+                    : 'text-gray-400 hover:bg-white/5 hover:text-gray-200 hover:translate-x-1'
+                }`}
+              >
+                {isActive && (
+                  <div className="absolute inset-0 bg-primary-500/10 rounded-lg pointer-events-none" />
+                )}
+                <Icon className={`w-5 h-5 relative z-10 transition-transform duration-200 ${isActive ? 'scale-110' : ''}`} />
+                <span className="font-medium relative z-10">{item.label}</span>
               </Link>
             );
           })}
@@ -203,32 +186,33 @@ const Layout = ({ children }) => {
 
         {/* Status & User */}
         <div className="p-4 border-t border-white/10 space-y-4">
-          {/* Status connexion backend - Uniquement pour synchronisation automatique en arrière-plan */}
-          {/* Le logiciel de ventes fonctionne toujours en mode offline-first */}
+          {/* Status connexion PRO LOCAL-FIRST */}
+          {/* Priorité: Backend Local (SQL) > WebSocket > Sheets */}
           <div className="flex items-center justify-between p-3 glass rounded-lg">
             <div className="flex items-center gap-2">
               {isOnline ? (
                 <>
                   <Wifi className="w-4 h-4 text-green-400" />
                   <span className="text-xs text-gray-300">
-                    {socketConnected ? 'Sync auto active' : 'Sync...'}
+                    {socketConnected ? 'LAN connecté' : 'Backend OK'}
                   </span>
                 </>
               ) : (
                 <>
                   <WifiOff className="w-4 h-4 text-yellow-400" />
-                  <span className="text-xs text-gray-300">Sync auto en pause</span>
+                  <span className="text-xs text-gray-300">Connexion...</span>
                 </>
               )}
             </div>
-            {/* Bouton pour forcer la vérification de connexion backend */}
+            {/* Indicateur visuel de latence (si disponible) */}
             <button
               onClick={() => {
                 useStore.getState().checkConnection();
               }}
-              className="text-xs text-gray-400 hover:text-gray-200 transition-colors"
-              title="Vérifier la connexion backend pour synchronisation automatique"
+              className="text-xs text-gray-400 hover:text-gray-200 transition-colors flex items-center gap-1"
+              title="Vérifier la connexion au backend local"
             >
+              {socketConnected && <span className="text-green-400">●</span>}
               🔄
             </button>
           </div>

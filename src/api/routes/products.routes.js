@@ -126,8 +126,10 @@ router.post('/', authenticate, (req, res) => {
       }))
     });
 
-    // Audit log
-    auditRepo.log(req.user.id, 'product_upsert', { code: product.code });
+    // Audit log - ✅ Vérifier que req.user existe (mode LICENSE_ONLY n'a pas de user)
+    if (req.user?.id) {
+      auditRepo.log(req.user.id, 'product_upsert', { code: product.code });
+    }
 
     // Émettre l'événement WebSocket pour synchronisation temps réel
     const io = getSocketIO();
@@ -237,8 +239,10 @@ router.put('/:code', authenticate, async (req, res) => {
           }))
         });
 
-        // Audit log
-        auditRepo.log(req.user.id, 'product_update', { code: req.params.code });
+        // Audit log - ✅ Vérifier que req.user existe (mode LICENSE_ONLY n'a pas de user)
+        if (req.user?.id) {
+          auditRepo.log(req.user.id, 'product_update', { code: req.params.code });
+        }
 
         // Émettre l'événement WebSocket
         const io = getSocketIO();
@@ -477,17 +481,19 @@ router.put('/:code/units/:unitId/stock', authenticate, (req, res) => {
     // Récupérer l'unité mise à jour
     const updatedUnit = db.prepare('SELECT * FROM product_units WHERE id = ?').get(unitId);
     
-    // Audit log
-    auditRepo.log(req.user.id, 'stock_update', {
-      code,
-      unit_id: unitId,
-      unit_level: unit.unit_level,
-      unit_mark: unit.unit_mark,
-      stock_before: unit.stock_current,
-      stock_after: newStock,
-      delta: stockDelta,
-      reason: reason || (delta !== undefined ? 'adjustment' : 'correction')
-    });
+    // Audit log - ✅ Vérifier que req.user existe (mode LICENSE_ONLY n'a pas de user)
+    if (req.user?.id) {
+      auditRepo.log(req.user.id, 'stock_update', {
+        code,
+        unit_id: unitId,
+        unit_level: unit.unit_level,
+        unit_mark: unit.unit_mark,
+        stock_before: unit.stock_current,
+        stock_after: newStock,
+        delta: stockDelta,
+        reason: reason || (delta !== undefined ? 'adjustment' : 'correction')
+      });
+    }
     
     // ✅ NEW ARRIVAGE: Enregistrer la modification de stock
     try {
@@ -543,7 +549,8 @@ router.put('/:code/units/:unitId/stock', authenticate, (req, res) => {
 
 /**
  * DELETE /api/products/:code
- * Supprime un produit et toutes ses unités
+ * Supprime un produit (soft delete: marque deleted_at = now)
+ * ✅ Permet la réactivation si créé à nouveau avec le même code
  */
 router.delete('/:code', authenticate, (req, res) => {
   try {
@@ -557,14 +564,27 @@ router.delete('/:code', authenticate, (req, res) => {
       return res.status(404).json({ success: false, error: 'Produit non trouvé' });
     }
 
-    // Supprimer le produit (soft delete: is_active = 0)
+    // ✅ SOFT DELETE: Marquer le produit comme supprimé avec timestamp (deleted_at = now)
+    // Le produit existe toujours en DB mais est caché (hidden) pour les utilisateurs
+    // Si on recrée un produit avec le même code, il sera réactivé (deleted_at = NULL)
     const db = getDb();
-    db.prepare('UPDATE products SET is_active = 0 WHERE code = ?').run(code);
+    const deletedAt = new Date().toISOString();
+    db.prepare("UPDATE products SET deleted_at = ? WHERE code = ?").run(deletedAt, code);
     
-    logger.info(`✅ Produit marqué comme inactif: ${code}`);
+    logger.info(`✅ Produit marqué comme supprimé (soft delete): ${code}`);
 
-    // Audit log
-    auditRepo.log(req.user.id, 'product_delete', { code: code });
+    // ✅ PRO: Utiliser outboxRepo pour synchronisation robuste avec Google Sheets
+    const opId = outboxRepo.enqueueProductDeleted(product.uuid, code, {
+      name: product.name,
+      deleted_at: deletedAt,
+    });
+    
+    logger.info(`📤 [DELETE] Suppression produit enqueued: code='${code}', op_id='${opId}'`);
+
+    // Audit log - ✅ Vérifier que req.user existe (mode LICENSE_ONLY n'a pas de user)
+    if (req.user?.id) {
+      auditRepo.log(req.user.id, 'product_delete', { code: code });
+    }
 
     // Émettre l'événement WebSocket
     const io = getSocketIO();

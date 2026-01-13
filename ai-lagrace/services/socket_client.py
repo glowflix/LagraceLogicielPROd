@@ -3,7 +3,7 @@ Socket.IO Client Service
 ========================
 Communication bidirectionnelle avec le serveur Node.js
 Version PRO - Connexion persistante avec reconnexion automatique
-LOGS DÉTAILLÉS activés
+LOGS MINIMALISTES - Seulement les événements importants
 """
 
 import asyncio
@@ -34,34 +34,56 @@ except ImportError:
 sys.path.insert(0, str(__file__).replace('\\', '/').rsplit('/', 2)[0])
 from config.settings import settings
 
+# Mode silencieux pour les logs répétitifs
+VERBOSE_LOGS = False
+
 
 def log_debug(msg: str):
-    """Log de debug avec timestamp"""
-    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    print(f"{Fore.WHITE}[{ts}] [SOCKET] {msg}{Style.RESET_ALL}")
+    """Log de debug - DÉSACTIVÉ en mode pro"""
+    if VERBOSE_LOGS:
+        ts = datetime.now().strftime("%H:%M:%S")
+        print(f"{Fore.CYAN}[{ts}] [SOCKET] {msg}{Style.RESET_ALL}")
 
 
 def log_info(msg: str):
-    """Log d'info avec timestamp"""
-    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    """Log d'info - Seulement messages importants"""
+    # Filtrer les messages répétitifs
+    if any(x in msg for x in ['Tentative', 'Prochaine', 'tentative', 'Boucle', 'keepalive', 'Ping', 'Pong']):
+        if VERBOSE_LOGS:
+            ts = datetime.now().strftime("%H:%M:%S")
+            print(f"{Fore.CYAN}[{ts}] [SOCKET] {msg}{Style.RESET_ALL}")
+        return
+    ts = datetime.now().strftime("%H:%M:%S")
     print(f"{Fore.CYAN}[{ts}] [SOCKET] {msg}{Style.RESET_ALL}")
 
 
 def log_success(msg: str):
     """Log de succès avec timestamp"""
-    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    ts = datetime.now().strftime("%H:%M:%S")
     print(f"{Fore.GREEN}[{ts}] [SOCKET] ✅ {msg}{Style.RESET_ALL}")
 
 
 def log_warn(msg: str):
-    """Log d'avertissement avec timestamp"""
-    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    """Log d'avertissement - filtré"""
+    # Filtrer les avertissements répétitifs de connexion
+    if any(x in msg for x in ['Connexion refusée', 'tentative', 'Timeout', 'Pas de pong']):
+        if VERBOSE_LOGS:
+            ts = datetime.now().strftime("%H:%M:%S")
+            print(f"{Fore.YELLOW}[{ts}] [SOCKET] ⚠️  {msg}{Style.RESET_ALL}")
+        return
+    ts = datetime.now().strftime("%H:%M:%S")
     print(f"{Fore.YELLOW}[{ts}] [SOCKET] ⚠️  {msg}{Style.RESET_ALL}")
 
 
 def log_error(msg: str):
-    """Log d'erreur avec timestamp"""
-    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    """Log d'erreur - filtré"""
+    # Filtrer les erreurs répétitives de connexion
+    if any(x in msg for x in ['Erreur connexion', 'Connection error']):
+        if VERBOSE_LOGS:
+            ts = datetime.now().strftime("%H:%M:%S")
+            print(f"{Fore.RED}[{ts}] [SOCKET] ❌ {msg}{Style.RESET_ALL}")
+        return
+    ts = datetime.now().strftime("%H:%M:%S")
     print(f"{Fore.RED}[{ts}] [SOCKET] ❌ {msg}{Style.RESET_ALL}")
 
 

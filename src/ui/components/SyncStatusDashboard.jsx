@@ -18,20 +18,38 @@ import {
   Pause,
   Play,
   RotateCcw,
+  Database,
+  Server,
+  Zap,
 } from 'lucide-react';
+import { useConnectionState } from '../store/selectors';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
- * SYNC STATUS DASHBOARD - Monitoring de la synchronisation en temps réel
+ * SYNC STATUS DASHBOARD - PRO LOCAL-FIRST
  * ═══════════════════════════════════════════════════════════════════════════
  * 
+ * Architecture de connexion LOCAL-FIRST:
+ * 
+ * 1. 🗄️ Backend Local (SQLite) - PRIORITÉ #1
+ *    - Toujours accessible sur le réseau local (LAN/Wi-Fi)
+ *    - L'application fonctionne 100% même sans Internet
+ *    - Détecté via /api/health
+ * 
+ * 2. 🔌 WebSocket LAN - PRIORITÉ #2
+ *    - Sync temps réel entre tous les PC/téléphones du réseau
+ *    - Mises à jour instantanées du stock/ventes
+ * 
+ * 3. ☁️ Google Sheets - OPTIONNEL
+ *    - Sync externe pour backup et accès distant
+ *    - Ne bloque JAMAIS l'application locale
+ * 
  * Affiche:
- * - État de connexion (online/offline)
- * - Queue de synchronisation (pending, processing, failed)
- * - Dernière sync réussie
- * - Dernière erreur
- * - Statistiques de performance
- * - Boutons de contrôle (pause, resume, retry)
+ * - État du backend local (SQL)
+ * - Latence du réseau LAN
+ * - État du WebSocket
+ * - État de Google Sheets (optionnel)
+ * - Queue de synchronisation
  */
 
 // États possibles de la sync
@@ -171,21 +189,94 @@ const SyncDetailsPanel = memo(({
           </button>
         </div>
         
-        {/* État connexion */}
-        <div className="px-4 py-3 border-b border-gray-800">
+        {/* État connexion PRO LOCAL-FIRST */}
+        <div className="px-4 py-3 border-b border-gray-800 space-y-2">
+          <div className="text-sm text-gray-400 mb-2">Connexions</div>
+          
+          {/* Backend Local (SQL) - Le plus important */}
           <div className="flex items-center justify-between">
-            <span className="text-sm text-gray-400">Connexion</span>
             <div className="flex items-center gap-2">
-              {stats.isOnline ? (
+              <Database size={14} className="text-gray-500" />
+              <span className="text-xs text-gray-400">Backend Local</span>
+            </div>
+            <div className="flex items-center gap-2">
+              {stats.backendConnected ? (
                 <>
-                  <Wifi size={14} className="text-green-500" />
-                  <span className="text-sm text-green-500">En ligne</span>
+                  <CheckCircle size={14} className="text-green-500" />
+                  <span className="text-xs text-green-500">
+                    Connecté {stats.backendLatency ? `(${stats.backendLatency}ms)` : ''}
+                  </span>
                 </>
               ) : (
                 <>
-                  <WifiOff size={14} className="text-red-500" />
-                  <span className="text-sm text-red-500">Hors ligne</span>
+                  <AlertCircle size={14} className="text-red-500" />
+                  <span className="text-xs text-red-500">Déconnecté</span>
                 </>
+              )}
+            </div>
+          </div>
+          
+          {/* WebSocket LAN */}
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Zap size={14} className="text-gray-500" />
+              <span className="text-xs text-gray-400">WebSocket LAN</span>
+            </div>
+            <div className="flex items-center gap-2">
+              {stats.socketConnected ? (
+                <>
+                  <CheckCircle size={14} className="text-green-500" />
+                  <span className="text-xs text-green-500">Temps réel</span>
+                </>
+              ) : (
+                <>
+                  <AlertCircle size={14} className="text-yellow-500" />
+                  <span className="text-xs text-yellow-500">Polling</span>
+                </>
+              )}
+            </div>
+          </div>
+          
+          {/* Google Sheets (optionnel) */}
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Cloud size={14} className="text-gray-500" />
+              <span className="text-xs text-gray-400">Google Sheets</span>
+            </div>
+            <div className="flex items-center gap-2">
+              {stats.sheetsConnected === null ? (
+                <>
+                  <Clock size={14} className="text-gray-500" />
+                  <span className="text-xs text-gray-500">Pas testé</span>
+                </>
+              ) : stats.sheetsConnected ? (
+                <>
+                  <CheckCircle size={14} className="text-blue-500" />
+                  <span className="text-xs text-blue-500">Sync activée</span>
+                </>
+              ) : (
+                <>
+                  <CloudOff size={14} className="text-gray-500" />
+                  <span className="text-xs text-gray-500">Non connecté</span>
+                </>
+              )}
+            </div>
+          </div>
+          
+          {/* Indicateur global */}
+          <div className="mt-2 pt-2 border-t border-gray-700">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-medium text-gray-300">État global</span>
+              {stats.backendConnected ? (
+                <span className="text-xs font-medium text-green-400 flex items-center gap-1">
+                  <CheckCircle size={12} />
+                  Opérationnel
+                </span>
+              ) : (
+                <span className="text-xs font-medium text-red-400 flex items-center gap-1">
+                  <AlertCircle size={12} />
+                  Backend requis
+                </span>
               )}
             </div>
           </div>
@@ -326,9 +417,17 @@ const SyncStatusDashboard = memo(({
   className = '',
 }) => {
   const [isOpen, setIsOpen] = useState(false);
+  
+  // Utiliser le store pour l'état de connexion PRO LOCAL-FIRST
+  const connectionState = useConnectionState();
+  
   const [stats, setStats] = useState({
     state: SyncState.IDLE,
     isOnline: true,
+    backendConnected: false,
+    backendLatency: null,
+    socketConnected: false,
+    sheetsConnected: null,
     pushPending: 0,
     pullPending: 0,
     totalProcessed: 0,
@@ -339,7 +438,19 @@ const SyncStatusDashboard = memo(({
     queuedByPriority: {},
   });
   
-  // Charger les stats depuis le backend
+  // Synchroniser l'état du store avec les stats locales
+  useEffect(() => {
+    setStats((prev) => ({
+      ...prev,
+      isOnline: connectionState.isOnline,
+      backendConnected: connectionState.backendConnected,
+      backendLatency: connectionState.backendLatency,
+      socketConnected: connectionState.socketConnected,
+      sheetsConnected: connectionState.sheetsConnected,
+    }));
+  }, [connectionState]);
+  
+  // Charger les stats de sync depuis le backend
   useEffect(() => {
     const fetchStats = async () => {
       try {
@@ -348,49 +459,49 @@ const SyncStatusDashboard = memo(({
           const data = await response.json();
           setStats((prev) => ({
             ...prev,
-            ...data,
-            isOnline: navigator.onLine,
+            pushPending: data.pushPending || data.pending || 0,
+            pullPending: data.pullPending || 0,
+            totalProcessed: data.totalProcessed || 0,
+            totalFailed: data.totalFailed || data.errors || 0,
+            totalCoalesced: data.totalCoalesced || 0,
+            lastProcessedAt: data.lastProcessedAt || data.lastSync || null,
+            lastError: data.lastError || null,
+            queuedByPriority: data.queuedByPriority || {},
           }));
         }
       } catch (error) {
-        console.warn('Erreur chargement stats sync:', error);
-        setStats((prev) => ({
-          ...prev,
-          isOnline: false,
-          state: SyncState.OFFLINE,
-        }));
+        // Ne pas logger l'erreur si le backend n'est pas connecté
+        if (connectionState.backendConnected) {
+          console.warn('Erreur chargement stats sync:', error);
+        }
       }
     };
     
-    // Fetch initial
-    fetchStats();
-    
-    // Refresh toutes les 5 secondes
-    const interval = setInterval(fetchStats, 5000);
-    
-    // Écouter les changements de connexion
-    const handleOnline = () => {
-      setStats((prev) => ({ ...prev, isOnline: true }));
+    // Fetch initial seulement si le backend est connecté
+    if (connectionState.backendConnected) {
       fetchStats();
-    };
-    const handleOffline = () => {
-      setStats((prev) => ({ ...prev, isOnline: false, state: SyncState.OFFLINE }));
-    };
+    }
     
-    window.addEventListener('online', handleOnline);
-    window.addEventListener('offline', handleOffline);
+    // Refresh toutes les 5 secondes si connecté
+    const interval = setInterval(() => {
+      if (connectionState.backendConnected) {
+        fetchStats();
+      }
+    }, 5000);
     
     return () => {
       clearInterval(interval);
-      window.removeEventListener('online', handleOnline);
-      window.removeEventListener('offline', handleOffline);
     };
-  }, []);
+  }, [connectionState.backendConnected]);
   
-  // Déterminer l'état global
-  const currentState = stats.isOnline 
-    ? (stats.pushPending > 0 || stats.pullPending > 0 ? SyncState.SYNCING : SyncState.IDLE)
-    : SyncState.OFFLINE;
+  // Déterminer l'état global PRO LOCAL-FIRST
+  // Priorité: Backend Local > Socket > Sheets
+  const currentState = (() => {
+    if (!connectionState.backendConnected) return SyncState.OFFLINE;
+    if (stats.pushPending > 0 || stats.pullPending > 0) return SyncState.SYNCING;
+    if (stats.totalFailed > 0) return SyncState.ERROR;
+    return SyncState.IDLE;
+  })();
   
   // Handlers
   const handlePause = useCallback(async () => {

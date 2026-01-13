@@ -10,6 +10,7 @@ import { syncLogger } from '../../core/logger.js';
 import { generateUUID } from '../../core/crypto.js';
 import { getDb } from '../../db/sqlite.js';
 import bcrypt from 'bcrypt';
+import { pullDebtsFromSheets } from './pull-debts-from-sheets.js';
 
 // Intervalle de synchronisation (augmenté pour réduire la charge)
 const SYNC_INTERVAL_MS = parseInt(process.env.SYNC_INTERVAL_MS) || 10000; // 10 secondes par défaut
@@ -26,6 +27,16 @@ let _pushSyncRunning = false; // Mutex pour le push des opérations pending
 let _lastPushTime = 0; // Dernier push réussi
 let _productsSyncRunning = false; // Mutex pour la synchronisation dédiée des produits
 let _productsLoopTimeout = null; // Timeout de la boucle de synchronisation des produits
+
+// ✅ INTELLIGENT BACKOFF: Gère les retries intelligents pour sync
+let _backoffState = {
+  consecutiveFailures: 0,
+  lastFailureTime: 0,
+  nextRetryTime: 0,
+  baseDelayMs: 1000,  // 1 seconde
+  maxDelayMs: 60000,  // 60 secondes
+  maxConsecutiveFailures: 10 // Arrêter après 10 erreurs d'affilée
+};
 
 /**
  * ✅ HELPER ISO STRICT: Normalise TOUJOURS les dates en ISO 8601
@@ -94,6 +105,67 @@ function normalizeUnitFromSheets(unitValue) {
 }
 
 /**
+ * ✅ INTELLIGENT BACKOFF: Calcule le délai avant le prochain retry
+ * Utilise exponential backoff: 1s → 2s → 4s → 8s → 16s → 32s → 60s
+ */
+function getBackoffDelayMs(consecutiveFailures) {
+  const baseDelayMs = 1000; // 1 second
+  const maxDelayMs = 60000;  // 60 seconds
+  
+  if (consecutiveFailures <= 0) return 0;
+  
+  // Exponential backoff: 2^(failures-1) * base, max 60s
+  const exponentialDelay = Math.min(Math.pow(2, consecutiveFailures - 1) * baseDelayMs, maxDelayMs);
+  
+  return exponentialDelay;
+}
+
+/**
+ * ✅ INTELLIGENT BACKOFF: Enregistre une failure et retourne vrai si on doit continuer
+ * Retourne faux si trop d'erreurs d'affilée
+ */
+function recordSyncFailure(errorType = 'push') {
+  _backoffState.consecutiveFailures++;
+  _backoffState.lastFailureTime = Date.now();
+  _backoffState.nextRetryTime = Date.now() + getBackoffDelayMs(_backoffState.consecutiveFailures);
+  
+  const delayMs = getBackoffDelayMs(_backoffState.consecutiveFailures);
+  
+  if (_backoffState.consecutiveFailures >= _backoffState.maxConsecutiveFailures) {
+    syncLogger.warn(`⏸️  [BACKOFF] ${_backoffState.consecutiveFailures}/${_backoffState.maxConsecutiveFailures} failures - sync paused for ${(delayMs / 1000).toFixed(1)}s`);
+    return false; // Arrêter temporairement
+  } else {
+    syncLogger.verbose(`⚠️  [BACKOFF] Failure #${_backoffState.consecutiveFailures} - retrying in ${(delayMs / 1000).toFixed(1)}s`);
+    return true; // Continuer mais avec délai
+  }
+}
+
+/**
+ * ✅ INTELLIGENT BACKOFF: Réinitialise après succès
+ */
+function recordSyncSuccess() {
+  if (_backoffState.consecutiveFailures > 0) {
+    syncLogger.info(`✅ [BACKOFF] Connection restored - reset backoff (was ${_backoffState.consecutiveFailures} failures)`);
+  }
+  _backoffState.consecutiveFailures = 0;
+  _backoffState.lastFailureTime = 0;
+  _backoffState.nextRetryTime = 0;
+}
+
+/**
+ * ✅ INTELLIGENT BACKOFF: Vérifie s'il faut attendre avant de retry
+ */
+function shouldSkipRetryDueToBackoff() {
+  const now = Date.now();
+  if (now < _backoffState.nextRetryTime) {
+    const waitMs = _backoffState.nextRetryTime - now;
+    syncLogger.debug(`⏸️  [BACKOFF] Waiting ${(waitMs / 1000).toFixed(1)}s before retry`);
+    return true;
+  }
+  return false;
+}
+
+/**
  * Worker de synchronisation qui tourne en arrière-plan
  */
 export class SyncWorker {
@@ -105,8 +177,8 @@ export class SyncWorker {
    * Cette fonction gère les deux cas
    */
   parseOpPayload(op) {
-    // Cas 1: payload est déjà un objet
-    if (op.payload && typeof op.payload === 'object') {
+    // Cas 1: payload est déjà un objet avec des données
+    if (op.payload && typeof op.payload === 'object' && Object.keys(op.payload).length > 0) {
       return op.payload;
     }
 
@@ -116,6 +188,7 @@ export class SyncWorker {
         return JSON.parse(op.payload_json);
       } catch (e) {
         syncLogger.warn(`⚠️ [parseOpPayload] JSON parse error pour op_id=${op.op_id}: ${e.message}`);
+        console.log(`   payload_json brut: ${op.payload_json.substring(0, 100)}`);
         return {};
       }
     }
@@ -125,6 +198,10 @@ export class SyncWorker {
       return op.payload_json;
     }
 
+    // Debug: log si aucun payload trouvé
+    syncLogger.warn(`⚠️ [parseOpPayload] Aucun payload pour op_id=${op.op_id}`);
+    console.log(`   op keys: ${Object.keys(op).join(', ')}`);
+    
     // Fallback: vide
     return {};
   }
@@ -135,6 +212,13 @@ export class SyncWorker {
    */
   async start() {
     if (syncInterval) return;
+
+    // ✅ FIX: Définir syncInterval IMMÉDIATEMENT pour éviter les appels multiples
+    syncInterval = setInterval(() => {
+      if (_started && !isSyncing && isOnline) {
+        this.runSyncSafe().catch(err => syncLogger.verbose(`[SYNC-INTERVAL] ${err.message}`));
+      }
+    }, SYNC_INTERVAL_MS);
 
     // Log de démarrage condensé
     syncLogger.info(`🚀 [SYNC] Démarrage (intervalle: ${SYNC_INTERVAL_MS/1000}s) | URL: ${process.env.GOOGLE_SHEETS_WEBAPP_URL ? '✓' : '✗'}`);
@@ -181,63 +265,122 @@ export class SyncWorker {
     setTimeout(loop, 5000);
     this.startSalesSyncLoop();
     this.startProductsSyncLoop();
+    this.startRatesSyncLoop();  // ✅ PRO: Sync des taux depuis Sheets
+    this.startDebtsSyncLoop();  // ✅ PRO: Sync des dettes depuis Sheets (avec auto-delete)
     this.startPushSyncLoop();
   }
   
   /**
    * Boucle de push des opérations pending vers Google Sheets
-   * VERSION OPTIMISÉE: Logs minimaux, fonctionnement silencieux
+   * ✅ PRO: Push toutes les 10 secondes avec retry robuste
    */
   async startPushSyncLoop() {
-    const PUSH_SYNC_INTERVAL_MS = 15000;
+    const PUSH_SYNC_INTERVAL_MS = 10000; // ✅ PRO: 10 secondes pour réactivité
+    const AUTO_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // ✅ Auto-cleanup toutes les 60 minutes
+    let lastCleanupTime = 0;
     
-    syncLogger.info(`📤 [PUSH] Boucle démarrée (${PUSH_SYNC_INTERVAL_MS/1000}s)`);
+    syncLogger.info(`📤 [PUSH] Boucle PRO démarrée (${PUSH_SYNC_INTERVAL_MS/1000}s)`);
+    syncLogger.info(`🧹 [CLEANUP] Auto-cleanup activé (${AUTO_CLEANUP_INTERVAL_MS/60000}min)`);
     
     const pushLoop = async () => {
       if (!_started) return;
+      
+      // ✅ INTELLIGENT BACKOFF: Vérifie s'il faut attendre avant de retry
+      if (shouldSkipRetryDueToBackoff()) {
+        if (_started) setTimeout(pushLoop, PUSH_SYNC_INTERVAL_MS);
+        return;
+      }
+      
       if (_pushSyncRunning) {
         setTimeout(pushLoop, PUSH_SYNC_INTERVAL_MS);
         return;
       }
       
-      try {
-        // Vérifier les deux systèmes d'outbox
-        const stats = outboxRepo.getStats();
-        const legacyPending = syncRepo.getPending(1); // Juste pour vérifier s'il y en a
-        
-        if (stats.totalPending === 0 && stats.stockMovesPending === 0 && legacyPending.length === 0) {
-          setTimeout(pushLoop, PUSH_SYNC_INTERVAL_MS);
-          return;
+      // ✅ AUTO-CLEANUP: Nettoyer les anciennes erreurs toutes les 60 min
+      const now = Date.now();
+      if (now - lastCleanupTime > AUTO_CLEANUP_INTERVAL_MS) {
+        try {
+          const db = getDb();
+          const cutoffTime = new Date(now - 60 * 60 * 1000).toISOString(); // 60 min
+          
+          const result = db.prepare(`
+            DELETE FROM sync_operations
+            WHERE status = 'error' AND updated_at < ?
+          `).run(cutoffTime);
+          
+          if (result.changes > 0) {
+            syncLogger.info(`🧹 [CLEANUP] ${result.changes} opération(s) en erreur ancienne(s) supprimée(s)`);
+          }
+          
+          // ✅ Réinitialiser les conflits bloqués après 3 tentatives
+          const retried = db.prepare(`
+            UPDATE sync_operations
+            SET status = 'pending', tries = 0, last_error = NULL, updated_at = datetime('now')
+            WHERE status = 'error' AND tries >= 3
+          `).run();
+          
+          if (retried.changes > 0) {
+            syncLogger.info(`♻️  [CLEANUP] ${retried.changes} conflit(s) réinitialisé(s)`);
+          }
+          
+          lastCleanupTime = now;
+        } catch (e) {
+          syncLogger.warn(`⚠️  [CLEANUP] Erreur nettoyage: ${e.message}`);
         }
-        
-        // Log résumé uniquement si il y a des opérations
-        if (stats.totalPending > 0 || stats.stockMovesPending > 0) {
-          syncLogger.info(`📤 [PUSH] ${stats.totalPending} ops + ${stats.stockMovesPending} stock`);
-        }
-        if (legacyPending.length > 0) {
-          syncLogger.info(`📤 [PUSH-LEGACY] ${legacyPending.length}+ ops (update_stock, etc.)`);
-        }
-      } catch (e) {
-        syncLogger.error(`[PUSH] Stats error: ${e.message}`);
+      }
+      
+      // Vérifier les deux systèmes d'outbox
+      const stats = outboxRepo.getStats();
+      const legacyPending = []; // ✅ Désactivé: anti-doublon (voir 2.1 fix)
+      
+      if (stats.totalPending === 0 && stats.stockMovesPending === 0 && legacyPending.length === 0) {
+        if (_started) setTimeout(pushLoop, PUSH_SYNC_INTERVAL_MS);
+        return;
+      }
+      
+      // Log résumé uniquement si il y a des opérations
+      if (stats.totalPending > 0 || stats.stockMovesPending > 0) {
+        syncLogger.info(`📤 [PUSH] ${stats.totalPending} ops + ${stats.stockMovesPending} stock pending`);
+      }
+      if (legacyPending.length > 0) {
+        syncLogger.info(`📤 [PUSH-LEGACY] ${legacyPending.length}+ ops`);
       }
       
       _pushSyncRunning = true;
       const t0 = Date.now();
       
       try {
-        // ✅ Pusher les deux systèmes d'outbox
-        await this.pushPendingOperations(); // sync_operations (PRODUCT_PATCH, SALE, etc.)
-        await this.pushPending();           // sync_outbox (update_stock, upsert, append)
+        // ✅ PRO: Pusher les opérations UNIQUEMENT via pushPendingOperations() (anti-doublons)
+        await this.pushPendingOperations(); // sync_operations (PRODUCT_PATCH, SALE, STOCK_MOVE, etc.)
+        
+        // ✅ INTELLIGENT BACKOFF: Réinitialiser après succès
+        recordSyncSuccess();
+        
+        // Legacy pushPending() désactivé pour éviter double-push (voir 2.1 fix)
       } catch (error) {
+        // ✅ INTELLIGENT BACKOFF: Enregistrer l'erreur et déterminer s'il faut continuer
+        const shouldContinue = recordSyncFailure('push');
+        
         syncLogger.error(`[PUSH] ${error.message}`);
+        // ✅ PRO: Retry plus rapide en cas d'erreur
+        _pushSyncRunning = false;
+        
+        // Déterminer le délai suivant
+        const nextDelay = shouldContinue 
+          ? getBackoffDelayMs(_backoffState.consecutiveFailures) 
+          : PUSH_SYNC_INTERVAL_MS;
+        
+        if (_started) setTimeout(pushLoop, nextDelay);
+        return;
       } finally {
         _pushSyncRunning = false;
-        const wait = Math.max(5000, PUSH_SYNC_INTERVAL_MS - (Date.now() - t0));
+        const wait = Math.max(3000, PUSH_SYNC_INTERVAL_MS - (Date.now() - t0));
         if (_started) setTimeout(pushLoop, wait);
       }
     };
     
-    setTimeout(pushLoop, 10000);
+    // ✅ PRO: Premier push après 3 secondes
+    setTimeout(pushLoop, 3000);
   }
 
   /**
@@ -271,6 +414,89 @@ export class SyncWorker {
     };
 
     setTimeout(productsLoop, 2000);
+  }
+
+  /**
+   * ✅ PRO: Boucle dédiée taux de change - Sync depuis Sheets
+   * Fréquence: toutes les 30 secondes (les taux changent moins souvent)
+   */
+  async startRatesSyncLoop() {
+    const RATES_SYNC_INTERVAL_MS = 30000; // 30 secondes
+
+    syncLogger.info(`💱 [RATES] Boucle démarrée (${RATES_SYNC_INTERVAL_MS/1000}s)`);
+
+    let _ratesSyncRunning = false;
+
+    const ratesLoop = async () => {
+      if (!_started) return;
+
+      if (_ratesSyncRunning || !isOnline) {
+        setTimeout(ratesLoop, RATES_SYNC_INTERVAL_MS);
+        return;
+      }
+
+      _ratesSyncRunning = true;
+      const t0 = Date.now();
+
+      try {
+        await this.syncRatesFromSheets();
+      } catch (e) {
+        syncLogger.warn(`[RATES] ${e.message}`);
+      } finally {
+        _ratesSyncRunning = false;
+        const wait = Math.max(5000, RATES_SYNC_INTERVAL_MS - (Date.now() - t0));
+        if (_started) setTimeout(ratesLoop, wait);
+      }
+    };
+
+    // Premier sync après 3 secondes (laisser le temps aux autres de démarrer)
+    setTimeout(ratesLoop, 3000);
+  }
+
+  /**
+   * ✅ PRO: Boucle dédiée dettes - Sync depuis Sheets avec auto-delete
+   * Fréquence: toutes les 60 secondes (les dettes changent moins souvent)
+   * 
+   * Cette boucle:
+   * 1. Télécharge les dettes depuis Sheets
+   * 2. Upsert dans la base locale
+   * 3. SUPPRIME les dettes locales qui n'existent plus dans Sheets (si pas pending)
+   */
+  async startDebtsSyncLoop() {
+    const DEBTS_SYNC_INTERVAL_MS = 60000; // 60 secondes
+
+    syncLogger.info(`💳 [DEBTS] Boucle démarrée (${DEBTS_SYNC_INTERVAL_MS/1000}s) - Auto-delete activé`);
+
+    let _debtsSyncRunning = false;
+
+    const debtsLoop = async () => {
+      if (!_started) return;
+
+      if (_debtsSyncRunning || !isOnline) {
+        setTimeout(debtsLoop, DEBTS_SYNC_INTERVAL_MS);
+        return;
+      }
+
+      _debtsSyncRunning = true;
+      const t0 = Date.now();
+
+      try {
+        const result = await pullDebtsFromSheets();
+        
+        if (result && (result.upserted > 0 || result.deleted > 0)) {
+          syncLogger.info(`💳 [DEBTS] ↓${result.invoices} dettes (+${result.upserted} upsert, -${result.deleted || 0} supprimées)`);
+        }
+      } catch (e) {
+        syncLogger.warn(`[DEBTS] ${e.message}`);
+      } finally {
+        _debtsSyncRunning = false;
+        const wait = Math.max(10000, DEBTS_SYNC_INTERVAL_MS - (Date.now() - t0));
+        if (_started) setTimeout(debtsLoop, wait);
+      }
+    };
+
+    // Premier sync après 5 secondes
+    setTimeout(debtsLoop, 5000);
   }
   
   /**
@@ -321,6 +547,34 @@ export class SyncWorker {
         pushedCount += sales.length;
       }
       
+      // 6. Push des suppression ventes (SALE_DELETED) vers Sheets
+      const saleDeletes = outboxRepo.getPendingOperations('SALE_DELETED', 50);
+      if (saleDeletes.length > 0) {
+        await this.pushSaleDeleted(saleDeletes);
+        pushedCount += saleDeletes.length;
+      }
+      
+      // 7. ✅ PRO: Push des suppressions produits (PRODUCT_DELETED) vers Sheets
+      const productDeletes = outboxRepo.getPendingOperations('PRODUCT_DELETED', 50);
+      if (productDeletes.length > 0) {
+        await this.pushProductDeleted(productDeletes);
+        pushedCount += productDeletes.length;
+      }
+      
+      // 8. ✅ PRO: Push des taux de change (RATE) vers Sheets
+      const rates = outboxRepo.getPendingOperations('RATE', 10);
+      if (rates.length > 0) {
+        await this.pushRates(rates);
+        pushedCount += rates.length;
+      }
+      
+      // 9. ✅ PRO: Push des utilisateurs (USER) vers Sheets (feuille "Compter Utilisateur")
+      const users = outboxRepo.getPendingOperations('USER', 20);
+      if (users.length > 0) {
+        await this.pushUsers(users);
+        pushedCount += users.length;
+      }
+      
       outboxRepo.retryErrorOperations();
       _lastPushTime = Date.now();
       
@@ -339,8 +593,15 @@ export class SyncWorker {
         }, 2000);
       }
       
+      // ✅ INTELLIGENT BACKOFF: Succès → reset backoff
+      recordSyncSuccess();
+      
     } catch (error) {
       syncLogger.error(`[PUSH] ${error.message}`);
+      
+      // ✅ INTELLIGENT BACKOFF: Enregistrer l'erreur
+      recordSyncFailure('pushPendingOperations');
+      
       if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND') {
         isOnline = false;
       }
@@ -467,7 +728,7 @@ export class SyncWorker {
       const batch = ops.slice(i, i + batchSize);
 
       try {
-        const result = await sheetsClient.pushBatch(batch, { timeout: 30000 });
+        const result = await sheetsClient.pushBatch(batch, { timeout: 60000 });
         totalSent += batch.length;
         const ackedCount = result.acked_count || (result.success ? batch.length : 0);
         totalAcked += ackedCount;
@@ -544,7 +805,7 @@ export class SyncWorker {
     });
     
     try {
-      const result = await sheetsClient.pushBatch(ops);
+      const result = await sheetsClient.pushBatch(ops, { timeout: 60000 });
       
       if (result.success) {
         for (const applied of (result.applied || [])) {
@@ -570,71 +831,187 @@ export class SyncWorker {
   }
   
   /**
-   * Push les mouvements de stock vers Sheets - VERSION OPTIMISÉE
+   * Push les mouvements de stock vers Sheets - VERSION PRO avec stock_absolute
+   * ✅ Utilise stock_absolute (valeur finale) au lieu de delta pour éviter les désynchronisations
    */
   async pushStockMoves(moves) {
     const ackedOpIds = [];
     const ackedMoveIds = [];
     
-    if (!moves || moves.length === 0) return;
+    if (!moves || moves.length === 0) {
+      console.log('   ⚠️ PUSH STOCK_MOVE: Aucun mouvement à envoyer');
+      return;
+    }
 
-    // Regrouper par unité
+    // ═══════════════════════════════════════════════════════════════════
+    // LOG TRÈS VISIBLE DANS LE TERMINAL
+    // ═══════════════════════════════════════════════════════════════════
+    console.log('\n' + '═'.repeat(70));
+    console.log('📤 [SYNC] PUSH STOCK_MOVE VERS GOOGLE SHEETS');
+    console.log('═'.repeat(70));
+    console.log(`   📦 Mouvements reçus: ${moves.length}`);
+    
+    // Afficher les op_id reçus
+    const moveOpIds = moves.map(m => m.op_id);
+    console.log(`   🆔 Op IDs reçus: ${moveOpIds.join(', ')}`);
+    console.log('═'.repeat(70));
+
+    // Regrouper par unité et prendre le stock_absolute le plus récent
     const movesByUnit = {};
     for (const op of moves) {
       const payload = this.parseOpPayload(op);
+      
+      // ✅ Vérifier que le payload est valide
+      if (!payload.product_code || !payload.unit_level) {
+        console.log(`   ⚠️ Payload invalide (op_id: ${op.op_id}): product_code=${payload.product_code}, unit_level=${payload.unit_level}`);
+        syncLogger.warn(`[STOCK] Payload invalide: ${JSON.stringify(payload).substring(0, 100)}`);
+        outboxRepo.markAsError(op.op_id, 'Payload invalide: product_code ou unit_level manquant');
+        continue;
+      }
+      
       const key = `${payload.product_code}-${payload.unit_level}-${payload.unit_mark || ''}`;
       if (!movesByUnit[key]) {
-        movesByUnit[key] = { product_code: payload.product_code, unit_level: payload.unit_level, unit_mark: payload.unit_mark || '', moves: [] };
+        movesByUnit[key] = { 
+          product_code: payload.product_code, 
+          unit_level: payload.unit_level, 
+          unit_mark: payload.unit_mark || '', 
+          moves: [],
+          // ✅ PRO: Garder le stock_absolute le plus récent
+          latestStockAbsolute: null
+        };
       }
       movesByUnit[key].moves.push({ op, payload });
+      // ✅ PRO: Mettre à jour avec la valeur la plus récente (dernier move)
+      if (payload.stock_absolute !== undefined && payload.stock_absolute !== null) {
+        movesByUnit[key].latestStockAbsolute = payload.stock_absolute;
+      }
     }
     
     // Créer les opérations
     const ops = [];
     for (const key in movesByUnit) {
       const unitMoves = movesByUnit[key];
-      const totalDelta = unitMoves.moves.reduce((sum, m) => sum + m.payload.delta, 0);
+      
+      // ✅ PRO: Utiliser stock_absolute si disponible, sinon fallback sur delta
+      const hasAbsolute = unitMoves.latestStockAbsolute !== null;
+      const totalDelta = unitMoves.moves.reduce((sum, m) => sum + (m.payload.delta || 0), 0);
+      
+      // ✅ FIX: Récupérer le reason du premier move (adjustment, SALE, etc.)
+      const firstReason = unitMoves.moves[0]?.payload?.reason || 'unknown';
+      
+      const opPayload = {
+        product_code: String(unitMoves.product_code).trim(),
+        unit_level: unitMoves.unit_level,
+        unit_mark: unitMoves.unit_mark || '',
+        move_ids: unitMoves.moves.map(m => m.payload.move_id).filter(Boolean),
+        op_ids: unitMoves.moves.map(m => m.op.op_id),
+        device_id: process.env.DEVICE_ID || 'PC-1',
+        reason: firstReason // ✅ Transmettre le reason pour permettre les ajouts positifs
+      };
+      
+      if (hasAbsolute) {
+        // ✅ PRO: Mode absolu - écraser avec la valeur finale
+        opPayload.stock_absolute = Math.round(unitMoves.latestStockAbsolute * 100) / 100;
+        console.log(`   📦 ${unitMoves.product_code}/${unitMoves.unit_level}: stock_absolute=${opPayload.stock_absolute}`);
+        syncLogger.info(`📦 [STOCK] ${unitMoves.product_code}/${unitMoves.unit_level}: absolute=${opPayload.stock_absolute}`);
+      } else {
+        // Fallback: Mode delta (ancien système)
+        opPayload.delta = totalDelta;
+        console.log(`   📦 ${unitMoves.product_code}/${unitMoves.unit_level}: delta=${totalDelta} (fallback)`);
+        syncLogger.info(`📦 [STOCK] ${unitMoves.product_code}/${unitMoves.unit_level}: delta=${totalDelta}`);
+      }
+      
       ops.push({
         op_id: unitMoves.moves[0].op.op_id,
         entity: 'stock_moves',
-        op: 'delta_apply',
-        payload: {
-          product_code: unitMoves.product_code,
-          unit_level: unitMoves.unit_level,
-          unit_mark: unitMoves.unit_mark || '',
-          delta: totalDelta,
-          move_ids: unitMoves.moves.map(m => m.payload.move_id),
-          op_ids: unitMoves.moves.map(m => m.op.op_id)
-        }
+        op: hasAbsolute ? 'update_stock' : 'delta_apply',
+        payload: opPayload
       });
     }
     
-    if (ops.length === 0) return;
+    if (ops.length === 0) {
+      console.log('   ⚠️ Aucune opération valide à envoyer');
+      console.log('═'.repeat(70) + '\n');
+      return;
+    }
+    
+    console.log('─'.repeat(70));
+    console.log(`   🚀 Envoi de ${ops.length} opération(s) vers Sheets...`);
     
     try {
-      const result = await sheetsClient.pushBatch(ops, { timeout: 9000 });
+      // ✅ PRO: Timeout de 60s pour permettre le traitement des stock moves
+      const result = await sheetsClient.pushBatch(ops, { timeout: 60000 });
+      console.log('   📡 RÉPONSE de Sheets:');
+      console.log(`      success: ${result.success}`);
+      console.log(`      applied: ${(result.applied || []).length}`);
+      console.log(`      failed: ${(result.failed || []).length}`);
+      console.log(`      conflicts: ${(result.conflicts || []).length}`);
+      console.log(`      stats: ${JSON.stringify(result.stats || {})}`);
       
-      if (result.success || result.applied) {
-        const allAckIds = [];
-        for (const op of ops) {
-          allAckIds.push(...(op.payload.op_ids || [op.op_id]));
-          if (op.payload.move_ids) ackedMoveIds.push(...op.payload.move_ids);
-        }
-        const uniqueAckIds = [...new Set(allAckIds)];
-        ackedOpIds.push(...uniqueAckIds);
-        syncLogger.info(`📤 [STOCK] ↑${uniqueAckIds.length} ops`);
-        syncLogger.incrementPushed('stock', uniqueAckIds.length);
-      } else {
+      // ✅ PRO: Logique correcte (accepter noop si skipped == reçus)
+      const { success, applied = [], failed = [], stats = {}, conflicts = [] } = result;
+      const isNoopOk = (applied.length === 0 && (stats.failed ?? failed.length) === 0 && (stats.skipped ?? 0) === (stats.received ?? ops.length));
+      
+      if (!success || failed.length > 0) {
+        console.log(`   ❌ ERREUR: ${result.error || 'BatchPush failed'} (${failed.length} failed)`);
+        console.log('═'.repeat(70) + '\n');
         for (const op of ops) {
           for (const id of (op.payload.op_ids || [op.op_id])) {
-            outboxRepo.markAsError(id, result.error || 'Erreur');
+            outboxRepo.markAsError(id, result.error || `${failed.length} failed`);
           }
         }
-        syncLogger.warn(`[STOCK] ${result.error}`);
+        syncLogger.warn(`[STOCK] Failed batch: ${failed.length} errors`);
         syncLogger.incrementErrors('stock', ops.length);
         return;
       }
+      
+      // ❌ PROBLÈME: Si CONFLICTS > 0, les opérations n'ont pas été appliquées!
+      if (conflicts.length > 0) {
+        console.log(`   ⚠️ CONFLITS DÉTECTÉS: ${conflicts.length} opération(s) en conflit!`);
+        console.log(`   ⚠️ Ces opérations NE SONT PAS appliquées à Sheets et seront renvoyées!`);
+        console.log('═'.repeat(70) + '\n');
+        for (const conflict of conflicts) {
+          console.log(`      Conflit: ${conflict.op_id || 'unknown'} - ${conflict.reason || 'conflict'}`);
+          if (conflict.op_id) {
+            outboxRepo.markAsError(conflict.op_id, conflict.reason || 'Conflict - not applied to Sheets');
+          }
+        }
+        syncLogger.warn(`[STOCK] Conflits: ${conflicts.length} ops not applied`);
+        syncLogger.incrementErrors('stock', conflicts.length);
+        return;  // ← NE PAS marquer comme acked si conflits!
+      }
+      
+      if (applied.length === 0 && !isNoopOk) {
+        console.log(`   ❌ ZERO_APPLIED without noop evidence (stats: ${JSON.stringify(stats)})`);
+        console.log('═'.repeat(70) + '\n');
+        for (const op of ops) {
+          for (const id of (op.payload.op_ids || [op.op_id])) {
+            outboxRepo.markAsError(id, 'ZERO_APPLIED without noop');
+          }
+        }
+        return;
+      }
+      
+      // ✅ OK: Soit appliqué, soit noop valide (skipped = all)
+      const allAckIds = [];
+      for (const op of ops) {
+        allAckIds.push(...(op.payload.op_ids || [op.op_id]));
+        if (op.payload.move_ids) ackedMoveIds.push(...op.payload.move_ids);
+      }
+      const uniqueAckIds = [...new Set(allAckIds)];
+      ackedOpIds.push(...uniqueAckIds);
+      
+      const msg = isNoopOk ? `(noop: all skipped)` : `(${applied.length} applied)`;
+      console.log(`   ✅ SUCCÈS! ${uniqueAckIds.length} opération(s) ${msg}`);
+      console.log(`   ✅ ackIds à marquer: ${uniqueAckIds.join(', ')}`);
+      console.log('═'.repeat(70) + '\n');
+      
+      syncLogger.info(`📤 [STOCK] ↑${uniqueAckIds.length} ops ${msg}`);
+      syncLogger.incrementPushed('stock', uniqueAckIds.length);
     } catch (error) {
+      console.log(`   ❌ EXCEPTION: ${error.message}`);
+      console.log('═'.repeat(70) + '\n');
+      
       for (const op of ops) {
         for (const id of (op.payload.op_ids || [op.op_id])) {
           outboxRepo.markAsError(id, error.message);
@@ -645,7 +1022,20 @@ export class SyncWorker {
       return;
     }
     
-    if (ackedOpIds.length > 0) outboxRepo.markAsAcked(ackedOpIds);
+    // ✅ MARQUER LES OPÉRATIONS COMME ACKED
+    console.log(`   📌 [MARK-ACKED] ackedOpIds.length = ${ackedOpIds.length}`);
+    if (ackedOpIds.length > 0) {
+      console.log(`   📌 [MARK-ACKED] Marking ${ackedOpIds.length} ops: ${ackedOpIds.join(', ')}`);
+      try {
+        outboxRepo.markAsAcked(ackedOpIds);
+        console.log(`   ✅ [MARK-ACKED] ${ackedOpIds.length} ops marked as acked successfully`);
+      } catch (ackErr) {
+        console.log(`   ❌ [MARK-ACKED] ERREUR: ${ackErr.message}`);
+        syncLogger.error(`[STOCK] Error marking as acked: ${ackErr.message}`);
+      }
+    } else {
+      console.log(`   ⚠️ [MARK-ACKED] Aucune opération à marquer!`);
+    }
     if (ackedMoveIds.length > 0) outboxRepo.markStockMovesSynced(ackedMoveIds);
   }
 
@@ -707,19 +1097,30 @@ export class SyncWorker {
 
       if (ops.length === 0) return;
       
-      const result = await sheetsClient.pushBatch(ops, { timeout: 15000 });
+      const result = await sheetsClient.pushBatch(ops, { timeout: 60000 });
       
-      if (result.success || result.applied) {
-        const pushedOpIds = ops.map(o => o.op_id);
-        ackedOpIds.push(...pushedOpIds);
-        syncLogger.info(`📤 [DEBT] ↑${pushedOpIds.length}`);
-        syncLogger.incrementPushed('debts', pushedOpIds.length);
-      } else {
+      // ✅ PRO: Logique correcte (accepter noop)
+      const { success, applied = [], failed = [], stats = {} } = result;
+      const isNoopOk = (applied.length === 0 && (stats.failed ?? failed.length) === 0 && (stats.skipped ?? 0) === (stats.received ?? ops.length));
+      
+      if (!success || failed.length > 0) {
         for (const op of debtOps) outboxRepo.markAsError(op.op_id, result.error || 'Erreur');
-        syncLogger.warn(`[DEBT] ${result.error}`);
+        syncLogger.warn(`[DEBT] ${result.error || `${failed.length} failed`}`);
         syncLogger.incrementErrors('debts', debtOps.length);
         return;
       }
+      
+      if (applied.length === 0 && !isNoopOk) {
+        syncLogger.warn(`[DEBT] ZERO_APPLIED without noop`);
+        for (const op of debtOps) outboxRepo.markAsError(op.op_id, 'ZERO_APPLIED');
+        return;
+      }
+      
+      // ✅ OK
+      const pushedOpIds = ops.map(o => o.op_id);
+      ackedOpIds.push(...pushedOpIds);
+      syncLogger.info(`📤 [DEBT] ↑${pushedOpIds.length}`);
+      syncLogger.incrementPushed('debts', pushedOpIds.length);
     } catch (error) {
       for (const op of debtOps) outboxRepo.markAsError(op.op_id, error.message);
       syncLogger.error(`[DEBT] ${error.message}`);
@@ -732,10 +1133,149 @@ export class SyncWorker {
       outboxRepo.markAsAcked(ackedOpIds);
     }
   }
+
+  /**
+   * Push les taux de change vers Google Sheets (feuille "Taux")
+   * ✅ Format: Taux, USD, Fc, DATE, _uuid, _updated_at
+   */
+  async pushRates(rateOps) {
+    if (!rateOps || rateOps.length === 0) return;
+
+    const ackedOpIds = [];
+    
+    try {
+      const ops = [];
+      for (const op of rateOps) {
+        const payload = this.parseOpPayload(op);
+
+        const rate = parseFloat(payload.rate_fc_per_usd) || 2800;
+        const uuid = String(payload.uuid || op.entity_uuid || '').trim();
+        const effectiveAt = payload.effective_at || new Date().toISOString();
+
+        if (!rate || rate <= 0) {
+          outboxRepo.markAsError(op.op_id, 'Taux invalide');
+          continue;
+        }
+
+        ops.push({
+          op_id: op.op_id,
+          entity: 'rates',
+          op: 'upsert',
+          payload: {
+            uuid,
+            rate_fc_per_usd: rate,
+            effective_at: effectiveAt,
+            device_id: payload._device_id || op.device_id || ''
+          }
+        });
+      }
+
+      if (ops.length === 0) return;
+      
+      const result = await sheetsClient.pushBatch(ops, { timeout: 30000 });
+      
+      const { success, applied = [], failed = [] } = result;
+      
+      if (!success || failed.length > 0) {
+        for (const op of rateOps) outboxRepo.markAsError(op.op_id, result.error || 'Erreur');
+        syncLogger.warn(`[RATE] ${result.error || `${failed.length} failed`}`);
+        return;
+      }
+      
+      // ✅ OK
+      const pushedOpIds = ops.map(o => o.op_id);
+      ackedOpIds.push(...pushedOpIds);
+      syncLogger.info(`💱 [RATE] ↑${pushedOpIds.length} taux synchronisé(s)`);
+    } catch (error) {
+      for (const op of rateOps) outboxRepo.markAsError(op.op_id, error.message);
+      syncLogger.error(`[RATE] ${error.message}`);
+      return;
+    }
+    
+    // Marquer dans la BD comme ackés
+    if (ackedOpIds.length > 0) {
+      outboxRepo.markAsAcked(ackedOpIds);
+    }
+  }
   
   /**
+   * Push les utilisateurs vers Google Sheets (feuille "Compter Utilisateur")
+   * ✅ Format: Nom, Mode passe, Numero, Valide, date de creation, Token Expo Push, 
+   *    marque, Urlprofile, admi, _uuid, Vendeur, Gerent Stock, Porudits est Vender
+   */
+  async pushUsers(userOps) {
+    if (!userOps || userOps.length === 0) return;
+
+    const ackedOpIds = [];
+    
+    try {
+      const ops = [];
+      for (const op of userOps) {
+        const payload = this.parseOpPayload(op);
+
+        const username = (payload.username || '').trim();
+        const uuid = String(payload.uuid || op.entity_uuid || '').trim();
+
+        if (!username) {
+          outboxRepo.markAsError(op.op_id, 'Username manquant');
+          continue;
+        }
+
+        ops.push({
+          op_id: op.op_id,
+          entity: 'users',
+          op: 'upsert',
+          payload: {
+            uuid,
+            username,
+            phone: payload.phone || '',
+            is_admin: payload.is_admin || 0,
+            is_active: payload.is_active !== undefined ? payload.is_active : 1,
+            is_vendeur: payload.is_vendeur !== undefined ? payload.is_vendeur : 1,
+            is_gerant_stock: payload.is_gerant_stock || 0,
+            can_manage_products: payload.can_manage_products || 0,
+            created_at: payload.created_at || new Date().toISOString(),
+            updated_at: payload.updated_at || new Date().toISOString(),
+            device_brand: payload.device_brand || '',
+            profile_url: payload.profile_url || '',
+            expo_push_token: payload.expo_push_token || '',
+            device_id: payload._device_id || op.device_id || ''
+          }
+        });
+      }
+
+      if (ops.length === 0) return;
+      
+      const result = await sheetsClient.pushBatch(ops, { timeout: 30000 });
+      
+      const { success, applied = [], failed = [] } = result;
+      
+      if (!success || failed.length > 0) {
+        for (const op of userOps) outboxRepo.markAsError(op.op_id, result.error || 'Erreur');
+        syncLogger.warn(`[USER] ${result.error || `${failed.length} failed`}`);
+        return;
+      }
+      
+      // ✅ OK
+      const pushedOpIds = ops.map(o => o.op_id);
+      ackedOpIds.push(...pushedOpIds);
+      syncLogger.info(`👤 [USER] ↑${pushedOpIds.length} utilisateur(s) synchronisé(s)`);
+    } catch (error) {
+      for (const op of userOps) outboxRepo.markAsError(op.op_id, error.message);
+      syncLogger.error(`[USER] ${error.message}`);
+      return;
+    }
+    
+    // Marquer dans la BD comme ackés
+    if (ackedOpIds.length > 0) {
+      outboxRepo.markAsAcked(ackedOpIds);
+    }
+  }
+
+  /**
    * Push les ventes vers Google Sheets (feuille "Ventes")
-   * ✅ NOUVEAU: Synchronise les ventes locales vers Sheets
+   * ✅ FIX DOUBLONS: Envoie chaque item comme une ligne séparée, 
+   * avec UUID stable pour éviter les duplications
    */
   async pushSales(saleOps) {
     if (!saleOps || saleOps.length === 0) return;
@@ -756,72 +1296,259 @@ export class SyncWorker {
         const sale = payload.sale || payload;
         const items = payload.items || [];
 
-        const uuid = String(sale.uuid || op.entity_uuid || '').trim();
+        const saleUuid = String(sale.uuid || op.entity_uuid || '').trim();
         const invoiceNumber = String(sale.invoice_number || op.entity_code || '').trim();
 
-        if (!uuid || !invoiceNumber) {
+        if (!saleUuid || !invoiceNumber) {
           outboxRepo.markAsError(op.op_id, 'Vente invalide (uuid/invoice manquant)');
           continue;
         }
 
-        // Créer une opération pour la vente principale
-        ops.push({
-          op_id: op.op_id,
-          entity: 'sales',
-          op: 'upsert',
-          payload: {
-            uuid,
-            invoice_number: invoiceNumber,
-            client_name: sale.client_name || 'Client comptant',
-            client_phone: sale.client_phone || null,
-            total_fc: normalizeNumber(sale.total_fc),
-            total_usd: normalizeNumber(sale.total_usd),
-            paid_fc: normalizeNumber(sale.paid_fc),
-            paid_usd: normalizeNumber(sale.paid_usd),
-            change_fc: normalizeNumber(sale.change_fc),
-            change_usd: normalizeNumber(sale.change_usd),
-            payment_method: sale.payment_method || 'cash',
-            status: sale.status || 'completed',
-            user_id: sale.user_id || null,
-            user_name: sale.user_name || null,
-            created_at: sale.created_at || new Date().toISOString(),
-            device_id: op.device_id || '',
-            // Items sérialisés pour référence
-            items_count: items.length,
-            items_json: JSON.stringify(items.map(item => ({
-              product_code: item.product_code,
-              product_name: item.product_name,
-              unit_level: item.unit_level,
-              unit_mark: item.unit_mark || '',
-              qty: item.qty,
-              unit_price_fc: item.unit_price_fc,
-              unit_price_usd: item.unit_price_usd,
-              line_total_fc: item.line_total_fc,
-              line_total_usd: item.line_total_usd
-            })))
+        // ✅ FIX: Créer une opération par ITEM (pas juste une pour la vente)
+        // Cela correspond à la structure de la feuille Ventes (une ligne par produit)
+        if (items.length === 0) {
+          outboxRepo.markAsError(op.op_id, 'Vente sans items');
+          continue;
+        }
+
+        for (let idx = 0; idx < items.length; idx++) {
+          const item = items[idx];
+          // ✅ Ignorer les items avec qty <= 0
+          const qty = normalizeNumber(item.qty);
+          if (qty <= 0) {
+            syncLogger.verbose(`[SALE] Item ignoré (qty=0): ${invoiceNumber}/${item.product_code}`);
+            continue;
           }
-        });
+
+          const unitLevel = String(item.unit_level || 'CARTON').trim();
+          const unitMark = String(item.unit_mark || '').trim();
+          const lineNo = (item.line_no !== undefined && item.line_no !== null) ? item.line_no : idx;
+
+          // ✅ UUID stable et unique par ligne (2.3 fix)
+          const itemUuid =
+            (item.uuid && String(item.uuid).trim()) ||
+            `${saleUuid}:${invoiceNumber}:${String(item.product_code || '').trim()}:${unitLevel}:${unitMark}:${lineNo}`;
+
+          ops.push({
+            op_id: op.op_id, // Même op_id pour tous les items d'une vente
+            entity: 'sale_items', // ✅ Utiliser sale_items au lieu de sales
+            op: 'upsert',
+            payload: {
+              uuid: itemUuid,
+              invoice_number: invoiceNumber,
+              sold_at: sale.sold_at || sale.created_at || new Date().toISOString(),
+              client_name: sale.client_name || 'Client comptant',
+              client_phone: sale.client_phone || null,
+              seller_name: sale.seller_name || sale.user_name || null,
+              product_code: String(item.product_code || '').trim(),
+              product_name: item.product_name || '',
+              unit_level: unitLevel,
+              unit_mark: unitMark,
+              qty: qty,
+              qty_label: item.qty_label || qty.toString(),
+              unit_price_fc: normalizeNumber(item.unit_price_fc),
+              subtotal_fc: normalizeNumber(item.subtotal_fc || item.line_total_fc),
+              unit_price_usd: normalizeNumber(item.unit_price_usd),
+              subtotal_usd: normalizeNumber(item.subtotal_usd || item.line_total_usd),
+              device_id: op.device_id || ''
+            }
+          });
+        }
       }
 
-      if (ops.length === 0) return;
+      if (ops.length === 0) {
+        // Marquer quand même comme ackés si pas d'items à pusher
+        for (const op of saleOps) {
+          outboxRepo.markAsAcked([op.op_id]);
+        }
+        return;
+      }
       
-      const result = await sheetsClient.pushBatch(ops, { timeout: 20000 });
+      const result = await sheetsClient.pushBatch(ops, { timeout: 60000 });
       
-      if (result.success || result.applied) {
-        const pushedOpIds = ops.map(o => o.op_id);
-        ackedOpIds.push(...pushedOpIds);
-        syncLogger.info(`📤 [SALE] ↑${pushedOpIds.length} vente(s)`);
-        syncLogger.incrementPushed('sales', pushedOpIds.length);
-      } else {
+      // ✅ PRO: Logique correcte (accepter noop)
+      const { success, applied = [], failed = [], stats = {} } = result;
+      const isNoopOk = (applied.length === 0 && (stats.failed ?? failed.length) === 0 && (stats.skipped ?? 0) === (stats.received ?? ops.length));
+      
+      if (!success || failed.length > 0) {
         for (const op of saleOps) outboxRepo.markAsError(op.op_id, result.error || 'Erreur sync vente');
-        syncLogger.warn(`[SALE] ${result.error}`);
+        syncLogger.warn(`[SALE] ${result.error || `${failed.length} failed`}`);
         syncLogger.incrementErrors('sales', saleOps.length);
         return;
       }
+      
+      if (applied.length === 0 && !isNoopOk) {
+        syncLogger.warn(`[SALE] ZERO_APPLIED without noop`);
+        for (const op of saleOps) outboxRepo.markAsError(op.op_id, 'ZERO_APPLIED');
+        return;
+      }
+      
+      // ✅ OK
+      const uniqueOpIds = [...new Set(ops.map(o => o.op_id))];
+      ackedOpIds.push(...uniqueOpIds);
+      syncLogger.info(`📤 [SALE] ↑${ops.length} ligne(s) de vente (${uniqueOpIds.length} facture(s))`);
+      syncLogger.incrementPushed('sales', ops.length);
     } catch (error) {
       for (const op of saleOps) outboxRepo.markAsError(op.op_id, error.message);
       syncLogger.error(`[SALE] ${error.message}`);
       syncLogger.incrementErrors('sales', saleOps.length);
+      return;
+    }
+    
+    // Marquer comme ackés
+    if (ackedOpIds.length > 0) {
+      outboxRepo.markAsAcked(ackedOpIds);
+    }
+  }
+
+  /**
+   * ✅ NOUVEAU: Push des suppressions de vente (SALE_DELETED) vers Sheets
+   * - Envoie opérations SALE_DELETED pour supprimer les lignes
+   * - Restaure le stock automatiquement (déjà dans STOCK_MOVE créés par enqueueSaleDeleted)
+   */
+  async pushSaleDeleted(deleteOps) {
+    if (!deleteOps || deleteOps.length === 0) return;
+
+    const ackedOpIds = [];
+    
+    try {
+      const ops = [];
+      for (const op of deleteOps) {
+        const payload = this.parseOpPayload(op);
+        const invoiceNumber = String(payload.invoice_number || op.entity_code || '').trim();
+
+        if (!invoiceNumber) {
+          outboxRepo.markAsError(op.op_id, 'Invoice number manquant');
+          continue;
+        }
+
+        ops.push({
+          op_id: op.op_id,
+          entity: 'sales', // ✅ Entity 'sales' pour correspondre à handleSaleDeleted() du Code.gs
+          op: 'delete',
+          payload: {
+            invoice_number: invoiceNumber,
+            deleted_at: payload.deleted_at || new Date().toISOString(),
+            items_count: payload.items_count || 0,
+            device_id: op.device_id || ''
+          }
+        });
+      }
+
+      if (ops.length === 0) {
+        // Marquer comme ackés si pas d'opérations valides
+        for (const op of deleteOps) {
+          outboxRepo.markAsAcked([op.op_id]);
+        }
+        return;
+      }
+      
+      const result = await sheetsClient.pushBatch(ops, { timeout: 60000 });
+      
+      const { success, applied = [], failed = [], stats = {} } = result;
+      const isNoopOk = (applied.length === 0 && (stats.failed ?? failed.length) === 0 && (stats.skipped ?? 0) === (stats.received ?? ops.length));
+      
+      if (!success || failed.length > 0) {
+        for (const op of deleteOps) outboxRepo.markAsError(op.op_id, result.error || 'Erreur sync suppression');
+        syncLogger.warn(`[SALE_DELETED] ${result.error || `${failed.length} failed`}`);
+        syncLogger.incrementErrors('sales', deleteOps.length);
+        return;
+      }
+      
+      if (applied.length === 0 && !isNoopOk) {
+        syncLogger.warn(`[SALE_DELETED] ZERO_APPLIED without noop`);
+        for (const op of deleteOps) outboxRepo.markAsError(op.op_id, 'ZERO_APPLIED');
+        return;
+      }
+      
+      // ✅ OK
+      const uniqueOpIds = [...new Set(ops.map(o => o.op_id))];
+      ackedOpIds.push(...uniqueOpIds);
+      syncLogger.info(`🗑️ [SALE_DELETED] ↑${ops.length} suppression(s) de vente`);
+      syncLogger.incrementPushed('sales', ops.length);
+    } catch (error) {
+      for (const op of deleteOps) outboxRepo.markAsError(op.op_id, error.message);
+      syncLogger.error(`[SALE_DELETED] ${error.message}`);
+      syncLogger.incrementErrors('sales', deleteOps.length);
+      return;
+    }
+    
+    // Marquer comme ackés
+    if (ackedOpIds.length > 0) {
+      outboxRepo.markAsAcked(ackedOpIds);
+    }
+  }
+
+  /**
+   * ✅ PRO: Push des suppressions de produit (PRODUCT_DELETED) vers Sheets
+   * - Envoie opérations PRODUCT_DELETED pour supprimer les lignes dans toutes les feuilles
+   * - Supprime Carton, Milliers, Piece selon où le produit existe
+   */
+  async pushProductDeleted(deleteOps) {
+    if (!deleteOps || deleteOps.length === 0) return;
+
+    const ackedOpIds = [];
+    
+    try {
+      const ops = [];
+      for (const op of deleteOps) {
+        const payload = this.parseOpPayload(op);
+        const productCode = String(payload.product_code || op.entity_code || '').trim();
+
+        if (!productCode) {
+          outboxRepo.markAsError(op.op_id, 'Product code manquant');
+          continue;
+        }
+
+        ops.push({
+          op_id: op.op_id,
+          entity: 'products', // ✅ Entity 'products' pour handleProductDeleted() du Code.gs
+          op: 'delete',
+          payload: {
+            code: productCode,
+            product_uuid: payload.product_uuid || '',
+            product_name: payload.product_name || '',
+            deleted_at: payload.deleted_at || new Date().toISOString(),
+            device_id: op.device_id || ''
+          }
+        });
+      }
+
+      if (ops.length === 0) {
+        // Marquer comme ackés si pas d'opérations valides
+        for (const op of deleteOps) {
+          outboxRepo.markAsAcked([op.op_id]);
+        }
+        return;
+      }
+      
+      const result = await sheetsClient.pushBatch(ops, { timeout: 60000 });
+      
+      const { success, applied = [], failed = [], stats = {} } = result;
+      const isNoopOk = (applied.length === 0 && (stats.failed ?? failed.length) === 0 && (stats.skipped ?? 0) === (stats.received ?? ops.length));
+      
+      if (!success || failed.length > 0) {
+        for (const op of deleteOps) outboxRepo.markAsError(op.op_id, result.error || 'Erreur sync suppression produit');
+        syncLogger.warn(`[PRODUCT_DELETED] ${result.error || `${failed.length} failed`}`);
+        syncLogger.incrementErrors('products', deleteOps.length);
+        return;
+      }
+      
+      if (applied.length === 0 && !isNoopOk) {
+        syncLogger.warn(`[PRODUCT_DELETED] ZERO_APPLIED without noop`);
+        for (const op of deleteOps) outboxRepo.markAsError(op.op_id, 'ZERO_APPLIED');
+        return;
+      }
+      
+      // ✅ OK
+      const uniqueOpIds = [...new Set(ops.map(o => o.op_id))];
+      ackedOpIds.push(...uniqueOpIds);
+      syncLogger.info(`🗑️ [PRODUCT_DELETED] ↑${ops.length} suppression(s) de produit`);
+      syncLogger.incrementPushed('products', ops.length);
+    } catch (error) {
+      for (const op of deleteOps) outboxRepo.markAsError(op.op_id, error.message);
+      syncLogger.error(`[PRODUCT_DELETED] ${error.message}`);
+      syncLogger.incrementErrors('products', deleteOps.length);
       return;
     }
     
@@ -868,6 +1595,56 @@ export class SyncWorker {
     } catch (error) {
       syncLogger.error(`[PRODUCTS] ${error.message}`);
       throw error;
+    }
+  }
+
+  /**
+   * ✅ PRO: Synchronise les taux de change depuis Google Sheets (pull)
+   * Télécharge TOUS les taux de la feuille "Taux" vers la base locale
+   * Prend en compte les taux AVEC ou SANS UUID
+   * Met à jour le setting exchange_rate_fc_per_usd avec le dernier taux
+   */
+  async syncRatesFromSheets() {
+    const t0 = Date.now();
+    
+    try {
+      // ✅ Pull depuis Sheets - depuis le début pour avoir tous les taux
+      const sinceDate = new Date(0).toISOString();
+      
+      const result = await sheetsClient.pull('rates', sinceDate, {
+        full: true,
+        maxRetries: 3,
+        timeout: 15000,
+        limit: 500  // Limiter pour éviter les timeouts
+      });
+      
+      if (!result.success) {
+        syncLogger.verbose(`[RATES] Pull échoué: ${result.error}`);
+        return;
+      }
+      
+      if (!result.data || result.data.length === 0) {
+        syncLogger.verbose(`[RATES] Aucun taux à synchroniser`);
+        return;
+      }
+      
+      // ✅ Appliquer les taux en local
+      const { inserted, updated, latestRate } = ratesRepo.upsertFromSheets(result.data);
+      
+      // Mettre à jour la date de dernier pull
+      syncRepo.setLastPullDate('rates', new Date().toISOString());
+      
+      const ms = Date.now() - t0;
+      
+      if (inserted > 0 || updated > 0) {
+        syncLogger.info(`💱 [RATES] ↓${result.data.length} taux (+${inserted} nouveaux), dernier: ${latestRate} FC/USD (${ms}ms)`);
+        syncLogger.incrementPulled('rates', inserted);
+      } else {
+        syncLogger.verbose(`[RATES] Pas de nouveaux taux (${ms}ms)`);
+      }
+      
+    } catch (error) {
+      syncLogger.error(`[RATES] Erreur sync: ${error.message}`);
     }
   }
   
@@ -994,8 +1771,13 @@ export class SyncWorker {
         syncLogger.incrementPulled('sales', totalProcessed);
       }
       
-      // Sync bidirectionnelle silencieuse
-      try { await this.syncLocalSalesToSheets(); } catch (e) { syncLogger.verbose(`[SALES] Push: ${e.message}`); }
+      // ✅ FIX DOUBLONS: Ne plus appeler syncLocalSalesToSheets()
+      // La synchronisation des ventes est maintenant gérée par pushSales() via l'outbox
+      // Ce qui évite les doublons causés par deux mécanismes de sync parallèles
+      // try { await this.syncLocalSalesToSheets(); } catch (e) { syncLogger.verbose(`[SALES] Push: ${e.message}`); }
+      
+      // Sync bidirectionnelle silencieuse - DÉSACTIVÉE car pushSales() s'en occupe
+      // try { await this.syncLocalSalesToSheets(); } catch (e) { syncLogger.verbose(`[SALES] Push: ${e.message}`); }
       
       // Cleanup silencieux
       if (isOnline) {
@@ -1012,28 +1794,7 @@ export class SyncWorker {
   /**
    * Vérifie les ventes - VERSION OPTIMISÉE (silencieuse sauf erreurs)
    */
-  async verifySalesSync() {
-    try {
-      const { getDb } = await import('../../db/sqlite.js');
-      const db = getDb();
-      
-      const totalSales = db.prepare('SELECT COUNT(*) as count FROM sales').get();
-      const salesFromSheets = db.prepare('SELECT COUNT(*) as count FROM sales WHERE origin = ?').get('SHEETS');
-      const salesWithoutItems = db.prepare(`
-        SELECT COUNT(DISTINCT s.id) as count FROM sales s
-        LEFT JOIN sale_items si ON s.id = si.sale_id WHERE si.id IS NULL
-      `).get();
-      
-      // Log résumé uniquement si problèmes ou mode verbose
-      if (salesWithoutItems.count > 0) {
-        syncLogger.warn(`[VERIFY-SALES] ${salesWithoutItems.count} vente(s) sans items`);
-      }
-      
-      syncLogger.verbose(`[VERIFY-SALES] Total: ${totalSales.count}, Sheets: ${salesFromSheets.count}`);
-    } catch (error) {
-      syncLogger.error(`[VERIFY-SALES] ${error.message}`);
-    }
-  }
+  // ✅ REMOVED: Duplicate verifySalesSync (2.4 fix) - Voir version en bas de la classe
   
   /**
    * Synchronise les ventes locales vers Sheets - VERSION OPTIMISÉE
@@ -1397,51 +2158,16 @@ export class SyncWorker {
     const syncStartTime = Date.now();
 
     try {
-      // Utiliser setImmediate pour différer chaque étape et donner priorité aux requêtes API
-      // Push: envoyer les opérations en attente (avec timeout)
-      try {
-        await new Promise((resolve, reject) => {
-          setImmediate(async () => {
-            try {
-              await Promise.race([
-                this.pushPending(),
-                new Promise((_, rejectTimeout) => 
-                  setTimeout(() => rejectTimeout(new Error('Push timeout')), 2 * 60 * 1000)
-                )
-              ]);
-              resolve();
-            } catch (error) {
-              reject(error);
-            }
-          });
-        });
-      } catch (pushError) {
-        syncLogger.warn('⚠️ Erreur push (non bloquant):', pushError.message);
-        // Continue même si push échoue
-      }
+      // ✅ FIXED: Push est maintenant géré par startPushSyncLoop() → pushPendingOperations()
+      // Le push legacy (syncRepo.getPending via pushPending()) est COMPLÈTEMENT DÉSACTIVÉ
+      // Cela évite les doublons où les opérations partent 2 fois vers Google Sheets
 
       // Pull: récupérer les données depuis Sheets (avec timeout)
-      // Utiliser process.nextTick pour donner encore plus de priorité aux requêtes API
-      try {
-        await new Promise((resolve, reject) => {
-          process.nextTick(async () => {
-            try {
-              await Promise.race([
-                this.pullUpdates(),
-                new Promise((_, rejectTimeout) => 
-                  setTimeout(() => rejectTimeout(new Error('Pull timeout')), 3 * 60 * 1000)
-                )
-              ]);
-              resolve();
-            } catch (error) {
-              reject(error);
-            }
-          });
-        });
-      } catch (pullError) {
-        syncLogger.warn('⚠️ Erreur pull (non bloquant):', pullError.message);
-        // Continue même si pull échoue partiellement
-      }
+      // ✅ FIXED: Pull products et autres entités est maintenant géré par:
+      // - startProductsSyncLoop() → syncProductsFromSheets()
+      // - startSalesSyncLoop() → syncSalesOnly()
+      // - Pas de pullUpdates() systématique pour éviter les races et doublons
+      // Seulement un full pull sur bootstrap si DB vide
       
       const duration = Date.now() - syncStartTime;
       syncLogger.debug(`✅ Sync terminée en ${duration}ms`);
@@ -1458,8 +2184,15 @@ export class SyncWorker {
 
   /**
    * Push les opérations en attente vers Google Sheets (mode PRO avec batch ou concurrence limitée)
+   * ⚠️  LEGACY: Cette fonction est DÉSACTIVÉE (remplacée par pushPendingOperations)
+   * Elle est gardée seulement pour compatibilité, mais ne doit jamais être appelée
    */
   async pushPending() {
+    // ✅ DÉSACTIVÉ: Utiliser pushPendingOperations() dans startPushSyncLoop() à la place
+    syncLogger.warn('[LEGACY] pushPending() appelée - utiliser pushPendingOperations() à la place');
+    return;
+    
+    // Code legacy ci-dessous - NE JAMAIS EXÉCUTER
     // Ne pas push si pas de connexion
     if (!isOnline) {
       syncLogger.debug(`⏸️  [PUSH] Pas de connexion Internet, push annulé`);
@@ -1480,34 +2213,51 @@ export class SyncWorker {
         payload: this.parseOpPayload(op)
       }));
       
-      const batchResult = await sheetsClient.pushBatch(ops, { timeout: 9000 });
+      // ✅ PRO: Timeout 60s pour batch fiable
+      const batchResult = await sheetsClient.pushBatch(ops, { timeout: 60000 });
       
-      if (batchResult.applied) {
-        for (const applied of batchResult.applied) {
-          syncRepo.markAsSent(applied.op_id);
+      // ✅ PRO: Logique correcte (accepter noop)
+      const { success, applied = [], failed = [], stats = {} } = batchResult;
+      const isNoopOk = (applied.length === 0 && (stats.failed ?? failed.length) === 0 && (stats.skipped ?? 0) === (stats.received ?? ops.length));
+      
+      if (!success || failed.length > 0) {
+        syncLogger.warn(`[PUSH] BatchPush failed: ${failed.length} errors`);
+        for (const fail of failed) {
+          syncRepo.markAsError(fail.op_id, fail.error || 'HANDLER_ERROR');
         }
-        if (batchResult.applied.length > 0) {
-          syncLogger.info(`📤 [PUSH] ↑${batchResult.applied.length} ops`);
+        if (batchResult.error && (batchResult.error.includes('network') || batchResult.error.includes('ECONNREFUSED') || batchResult.error.includes('timeout'))) {
+          isOnline = false;
         }
+        return;
+      }
+      
+      if (applied.length === 0 && !isNoopOk) {
+        syncLogger.warn(`[PUSH] ZERO_APPLIED without noop evidence`);
+        return;
+      }
+      
+      // ✅ Mark applied ops as sent
+      if (applied.length > 0) {
+        for (const appliedOp of applied) {
+          syncRepo.markAsSent(appliedOp.op_id);
+        }
+        syncLogger.info(`📤 [PUSH] ↑${applied.length} ops`);
+      } else if (isNoopOk) {
+        syncLogger.info(`📤 [PUSH] ↑${ops.length} ops (all skipped - noop)`);
       }
 
+      // Mark conflicts/skipped if present
       if (batchResult.conflicts && batchResult.conflicts.length > 0) {
         for (const conflict of batchResult.conflicts) {
-          syncRepo.markAsError(conflict.op_id, new Error(conflict.error || 'Conflit'));
+          syncRepo.markAsError(conflict.op_id, conflict.error || conflict.reason || 'Conflict');
         }
       }
-
-      if (!batchResult.success && batchResult.error) {
-        if (batchResult.error.includes('network') || batchResult.error.includes('ECONNREFUSED') || batchResult.error.includes('timeout')) {
-              isOnline = false;
-            }
-          }
-        } catch (error) {
+    } catch (error) {
       syncLogger.error('❌ [PUSH] Erreur pushPending:', error.message);
-          // Si erreur réseau, marquer comme hors ligne
-          if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND' || error.code === 'ETIMEDOUT') {
-            isOnline = false;
-          }
+      // Si erreur réseau, marquer comme hors ligne
+      if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND' || error.code === 'ETIMEDOUT') {
+        isOnline = false;
+      }
     }
   }
 
@@ -1537,7 +2287,10 @@ export class SyncWorker {
     const globalStartTime = Date.now();
 
     try {
-      const entities = ['users', 'rates', 'debts', 'products', 'sales'];
+      // ✅ FIX DOUBLONS: 'sales' retiré de cette liste
+      // Les ventes sont gérées UNIQUEMENT par syncSalesOnly() (startSalesSyncLoop)
+      // Cela évite le double pull qui causait les doublons
+      const entities = ['users', 'rates', 'debts', 'products'];
       const results = [];
       
       // Construire sinceMap pour tous
@@ -1604,6 +2357,9 @@ export class SyncWorker {
         }
         
         // 3) Sales - paginé
+        // ✅ FIX DOUBLONS: Désactivé - les ventes sont gérées par syncSalesOnly()
+        // Ce bloc causait un double pull lors de l'import initial
+        /*
         try {
           const cursor = syncRepo.getCursor('sales');
           
@@ -1626,6 +2382,7 @@ export class SyncWorker {
         } catch (error) {
           results.push({ entity: 'sales', success: false, data: [], error: error.message });
         }
+        */
         
       } else {
         // Mode incrémental normal
@@ -1939,6 +2696,20 @@ export class SyncWorker {
         // Vérifier si le produit existe déjà
         const existing = productsRepo.findByCode(code);
         const isNew = !existing;
+        
+        // ✅ PRO: Vérifier si le produit est marqué comme supprimé localement
+        // Si oui, ne PAS le recréer depuis Sheets (la suppression est en attente de sync)
+        const db = getDb();
+        const deletedProduct = db.prepare(`
+          SELECT id, deleted_at FROM products 
+          WHERE code = ? AND deleted_at IS NOT NULL
+        `).get(code);
+        
+        if (deletedProduct) {
+          syncLogger.verbose(`⏭️ [SKIP] ${code}: supprimé localement (deleted_at=${deletedProduct.deleted_at})`);
+          skippedPendingCount++;
+          continue;
+        }
         
         // 🆔 AUTO-GÉNÉRER UUID SI MANQUANT (même pour les anciens produits)
         let productUuid = product.uuid;
@@ -2280,6 +3051,11 @@ export class SyncWorker {
       const itemsCountResult = db.prepare('SELECT COUNT(*) as count FROM sale_items').get();
       const totalItemsInDb = itemsCountResult?.count || 0;
       
+      // Log résumé si problèmes
+      if (totalSalesInDb !== salesFromSheets.length) {
+        syncLogger.verbose(`[VERIFY-SALES] Total: ${totalSalesInDb}, Sheets: ${salesFromSheets.length}, Items: ${totalItemsInDb}`);
+      }
+      
       return {
         totalSales: totalSalesInDb,
         salesFromSheets: salesFromSheets.length,
@@ -2572,8 +3348,8 @@ export class SyncWorker {
             byUuid.set(userUuid, existing);
             repaired++;
             
-            // Pousser vers Sheets pour backfill UUID - PRO et TOP
-            syncRepo.addToOutbox('users', existing.id.toString(), 'upsert', {
+            // ✅ PRO: Pousser vers Sheets pour backfill UUID via outboxRepo
+            outboxRepo.enqueueUser({
               uuid: userUuid,
               username: existing.username,
               phone: existing.phone || '',
@@ -2582,7 +3358,7 @@ export class SyncWorker {
               is_vendeur: existing.is_vendeur !== undefined ? existing.is_vendeur : 1,
               is_gerant_stock: existing.is_gerant_stock || 0,
               can_manage_products: existing.can_manage_products || 0,
-            });
+            }, 'update');
           }
           
           // Mettre à jour (PRÉSERVER les URLs existantes)
@@ -2638,8 +3414,8 @@ export class SyncWorker {
           byUsername.set(normalized, newUser);
           inserted++;
           
-          // Pousser vers Sheets pour backfill UUID - PRO et TOP
-          syncRepo.addToOutbox('users', newUser.id.toString(), 'upsert', {
+          // ✅ PRO: Pousser vers Sheets pour backfill UUID via outboxRepo
+          outboxRepo.enqueueUser({
             uuid: newUuid,
             username: newUser.username,
             phone: newUser.phone || '',
@@ -2648,7 +3424,7 @@ export class SyncWorker {
             is_vendeur: newUser.is_vendeur !== undefined ? newUser.is_vendeur : 1,
             is_gerant_stock: newUser.is_gerant_stock || 0,
             can_manage_products: newUser.can_manage_products || 0,
-          });
+          }, 'create');
         }
       } catch (error) {
         // Logger les erreurs proprement (éviter les objets caractère par caractère)

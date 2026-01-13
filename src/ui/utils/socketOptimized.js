@@ -91,55 +91,73 @@ export function batchCalls(fn, delay = 100) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Configuration par défaut pour Socket.IO
+ * ═══════════════════════════════════════════════════════════════════════════
+ * CONFIGURATION SOCKET.IO ULTRA-OPTIMISÉE - Version 2.0
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 
+ * Objectifs:
+ * ⚡ Connexion ultra-rapide (< 1s)
+ * 🔄 Reconnexion agressive (jamais perdre la connexion)
+ * 💪 Détection rapide des problèmes (heartbeat fréquent)
+ * 📦 Messages garantis (buffer offline)
  */
+
 const DEFAULT_CONFIG = {
-  // Transport
-  transports: ['websocket', 'polling'], // WebSocket prioritaire, polling fallback
+  // ═══════════════════════════════════════════════════════════════
+  // TRANSPORT - WebSocket prioritaire pour latence minimale
+  // ═══════════════════════════════════════════════════════════════
+  transports: ['websocket', 'polling'], // WebSocket d'abord
+  upgrade: true,                         // Upgrade polling → websocket
+  rememberUpgrade: true,                 // Se souvenir du transport OK
   
-  // Reconnexion robuste
+  // ═══════════════════════════════════════════════════════════════
+  // RECONNEXION ULTRA-AGRESSIVE
+  // ═══════════════════════════════════════════════════════════════
   reconnection: true,
-  reconnectionDelay: 1000,
-  reconnectionDelayMax: 10000,  // Max 10s entre tentatives
-  reconnectionAttempts: Infinity,
+  reconnectionDelay: 200,               // ⚡ 200ms (très rapide!)
+  reconnectionDelayMax: 3000,           // ⚡ Max 3s (pas 10s)
+  reconnectionAttempts: Infinity,        // Jamais abandonner
+  randomizationFactor: 0.2,              // Légère variation
   
-  // Timeouts adaptés au LAN
-  timeout: 20000,               // 20s pour connexion
-  pingTimeout: 30000,           // 30s avant de considérer déconnecté
-  pingInterval: 15000,          // Ping toutes les 15s
+  // ═══════════════════════════════════════════════════════════════
+  // TIMEOUTS OPTIMISÉS
+  // ═══════════════════════════════════════════════════════════════
+  timeout: 5000,                        // ⚡ 5s pour connexion (pas 20s)
   
-  // Performance
+  // ═══════════════════════════════════════════════════════════════
+  // HEARTBEAT TRÈS FRÉQUENT - Détection rapide des problèmes
+  // ═══════════════════════════════════════════════════════════════
+  pingTimeout: 10000,                   // ⚡ 10s (pas 30s)
+  pingInterval: 3000,                   // ⚡ Ping toutes les 3s (pas 15s)
+  
+  // ═══════════════════════════════════════════════════════════════
+  // PERFORMANCE & FIABILITÉ
+  // ═══════════════════════════════════════════════════════════════
   forceNew: false,
   multiplex: true,
-  
-  // Buffer pour messages offline
-  volatile: false,              // Garantir la livraison
-  
-  // Options avancées
+  volatile: false,                      // Garantir livraison
   autoConnect: true,
-  upgrade: true,                // Tenter upgrade polling → websocket
-  rememberUpgrade: true,        // Se souvenir du transport fonctionnel
   
-  // Compression (si supporté)
+  // ═══════════════════════════════════════════════════════════════
+  // COMPRESSION
+  // ═══════════════════════════════════════════════════════════════
   perMessageDeflate: {
-    threshold: 1024,            // Compresser si > 1KB
+    threshold: 512,                     // Compresser si > 512 bytes
   },
 };
 
 /**
- * Configuration spécifique pour le mode LAN
+ * Configuration pour mode LAN (réseau local)
  */
 const LAN_CONFIG = {
   ...DEFAULT_CONFIG,
   
-  // Timeouts plus longs pour le LAN
-  timeout: 30000,               // 30s (réseau peut être plus lent)
-  pingTimeout: 60000,           // 60s
-  pingInterval: 25000,          // 25s
-  
-  // Reconnexion plus agressive
-  reconnectionDelay: 500,
-  reconnectionDelayMax: 5000,
+  // ⚡ LAN = encore plus rapide
+  reconnectionDelay: 100,               // 100ms
+  reconnectionDelayMax: 2000,           // Max 2s
+  timeout: 3000,                        // 3s connexion
+  pingTimeout: 8000,                    // 8s
+  pingInterval: 2000,                   // Ping toutes les 2s
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -160,19 +178,28 @@ export function createOptimizedSocket(options = {}) {
   const messageQueue = [];
   let isConnected = false;
   
-  // Throttlers pour événements fréquents
+  // ⚡ Throttlers OPTIMISÉS - Plus réactifs
   const throttlers = {
     'product:updated': throttle((data) => {
       socket._originalEmit('product:updated', data);
-    }, 500),
+    }, 200),  // ⚡ 200ms (pas 500ms)
     
     'stock:updated': throttle((data) => {
       socket._originalEmit('stock:updated', data);
-    }, 500),
+    }, 200),  // ⚡ 200ms (pas 500ms)
     
     'rate:updated': throttle((data) => {
       socket._originalEmit('rate:updated', data);
-    }, 1000),
+    }, 500),  // ⚡ 500ms (pas 1000ms)
+    
+    // ⚡ Nouveau: Événements d'impression ultra-rapides
+    'print:job': (data) => {
+      socket._originalEmit('print:job', data);
+    }, // Pas de throttle pour l'impression
+    
+    'print:status': throttle((data) => {
+      socket._originalEmit('print:status', data);
+    }, 100),  // ⚡ 100ms pour statut impression
   };
   
   // Batch pour produits multiples
@@ -260,20 +287,20 @@ export function createOptimizedSocket(options = {}) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Crée un handler d'événements throttlé pour le store
+ * ⚡ Crée un handler d'événements ULTRA-RÉACTIF pour le store
  */
 export function createThrottledEventHandler(socket, store) {
   const handlers = {
-    // Produits: batch + throttle
+    // ⚡ Produits: throttle réduit pour réactivité
     'product:updated': throttle((product) => {
       store.setState((state) => ({
         products: state.products.map((p) =>
           p.id === product.id ? { ...p, ...product } : p
         ),
       }));
-    }, 300),
+    }, 100),  // ⚡ 100ms (pas 300ms)
     
-    // Batch de produits
+    // ⚡ Batch de produits: débounce rapide
     'products:batch-updated': debounce((products) => {
       store.setState((state) => {
         const productMap = new Map(products.map(p => [p.id, p]));
@@ -283,30 +310,39 @@ export function createThrottledEventHandler(socket, store) {
           ),
         };
       });
-    }, 200),
+    }, 100),  // ⚡ 100ms (pas 200ms)
     
-    // Stock: throttle pour éviter trop de re-renders
+    // ⚡ Stock: throttle réduit
     'stock:updated': throttle((stock) => {
       store.setState((state) => ({
         stock: state.stock.map((s) =>
           s.id === stock.id ? { ...s, ...stock } : s
         ),
       }));
-    }, 300),
+    }, 100),  // ⚡ 100ms (pas 300ms)
     
-    // Ventes: pas de throttle (critique)
+    // ⚡ Ventes: PAS de throttle (critique, doit être instantané)
     'sale:created': (sale) => {
       store.setState((state) => ({
-        sales: [sale, ...state.sales].slice(0, 100), // Garder les 100 dernières
+        sales: [sale, ...state.sales].slice(0, 100),
       }));
     },
     
-    // Taux: throttle fort (change rarement)
+    // ⚡ Impression: PAS de throttle (critique)
+    'print:completed': (data) => {
+      console.log('🖨️ Impression terminée:', data.invoice_number);
+    },
+    
+    'print:error': (data) => {
+      console.error('🖨️ Erreur impression:', data.error);
+    },
+    
+    // ⚡ Taux: throttle modéré (change rarement)
     'rate:updated': throttle((rate) => {
       store.setState({ currentRate: rate.rate });
-    }, 2000),
+    }, 500),  // ⚡ 500ms (pas 2000ms)
     
-    // Dettes: pas de throttle
+    // ⚡ Dettes: PAS de throttle
     'debt:updated': (debt) => {
       store.setState((state) => ({
         debts: state.debts.map((d) =>
@@ -314,6 +350,12 @@ export function createThrottledEventHandler(socket, store) {
         ),
       }));
     },
+    
+    // ⚡ Nouveau: Événement de sync terminée
+    'sync:completed': debounce(() => {
+      // Rafraîchir les données après sync
+      store.getState().loadProducts?.();
+    }, 500),
   };
   
   // Attacher les handlers au socket

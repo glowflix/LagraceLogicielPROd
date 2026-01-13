@@ -19,16 +19,18 @@ const SyncPage = () => {
 
   useEffect(() => {
     loadSyncStatus();
-    const interval = setInterval(loadSyncStatus, 5000);
+    // ✅ PRO: Intervalle de 30s au lieu de 5s
+    const interval = setInterval(loadSyncStatus, 30000);
     return () => clearInterval(interval);
   }, []);
 
+  // ✅ PRO: Timeout court de 2s
   const loadSyncStatus = async () => {
     try {
-      const response = await axios.get(`${API_URL}/api/sync/status`);
+      const response = await axios.get(`${API_URL}/api/sync/status`, { timeout: 2000 });
       setSyncStatus(response.data);
     } catch (error) {
-      console.error('Erreur chargement statut sync:', error);
+      // Silencieux
     }
   };
 

@@ -42,9 +42,13 @@ export const useStore = create(
       user: null,
       token: null,
 
-      // État de connexion
-      isOnline: navigator.onLine,
+      // État de connexion PRO LOCAL-FIRST
+      isOnline: true,               // Optimiste au démarrage (local-first)
+      backendConnected: false,      // Connexion au backend SQLite local
+      backendLatency: null,         // Latence en ms vers le backend
+      sheetsConnected: null,        // Connexion Google Sheets (null = pas testé)
       lastSync: null,
+      lastHealthCheck: null,        // Dernière vérification du backend
 
       // Socket
       socket: null,
@@ -344,77 +348,124 @@ export const useStore = create(
         // Utiliser getSocketUrl() pour la compatibilité LAN
         // En mode proxy Vite, socketUrl sera undefined (utilise l'origine actuelle)
         const socketUrl = getSocketUrl();
+        
+        // ✅ CONFIGURATION SOCKET.IO ULTRA-OPTIMISÉE
+        // Objectif: Connexion rapide, stable, sans coupures ni retards
         const socket = io(socketUrl, {
-          transports: ['websocket', 'polling'],
-          // Reconnexion automatique avec backoff exponentiel
+          // ═══════════════════════════════════════════════════════════════
+          // TRANSPORT - WebSocket prioritaire pour vitesse maximale
+          // ═══════════════════════════════════════════════════════════════
+          transports: ['websocket', 'polling'], // WebSocket d'abord, polling en backup
+          upgrade: true,                         // Essayer d'upgrader polling → websocket
+          rememberUpgrade: true,                 // Se souvenir du transport fonctionnel
+          
+          // ═══════════════════════════════════════════════════════════════
+          // RECONNEXION AGRESSIVE - Jamais perdre la connexion longtemps
+          // ═══════════════════════════════════════════════════════════════
           reconnection: true,
-          reconnectionDelay: 1000,
-          reconnectionDelayMax: 5000,
-          reconnectionAttempts: Infinity, // Reconnexion infinie
-          // Timeout pour les connexions
-          timeout: 20000,
-          // Ping/pong pour maintenir la connexion active
-          pingTimeout: 60000,
-          pingInterval: 25000,
-          // Forcer le polling si WebSocket échoue
-          forceNew: false,
-          // Améliorer la gestion des erreurs réseau
-          autoConnect: true,
+          reconnectionDelay: 300,               // ⚡ Retry après 300ms (très rapide)
+          reconnectionDelayMax: 2000,           // ⚡ Max 2s entre tentatives (pas 5s)
+          reconnectionAttempts: Infinity,        // Ne jamais abandonner
+          randomizationFactor: 0.3,              // Petite variation pour éviter les collisions
+          
+          // ═══════════════════════════════════════════════════════════════
+          // TIMEOUTS OPTIMISÉS - Réponse rapide
+          // ═══════════════════════════════════════════════════════════════
+          timeout: 8000,                        // ⚡ 8s max pour connexion (pas 20s)
+          
+          // ═══════════════════════════════════════════════════════════════
+          // HEARTBEAT FRÉQUENT - Détecter les déconnexions rapidement
+          // ═══════════════════════════════════════════════════════════════
+          pingTimeout: 15000,                   // ⚡ 15s avant de considérer mort (pas 60s)
+          pingInterval: 5000,                   // ⚡ Ping toutes les 5s (pas 25s)
+          
+          // ═══════════════════════════════════════════════════════════════
+          // CONNEXION
+          // ═══════════════════════════════════════════════════════════════
+          forceNew: false,                      // Réutiliser la connexion existante
+          autoConnect: true,                    // Connecter immédiatement
+          multiplex: true,                      // Partager la connexion entre namespaces
+          
+          // ═══════════════════════════════════════════════════════════════
+          // PERFORMANCE - Buffer et compression
+          // ═══════════════════════════════════════════════════════════════
+          perMessageDeflate: {
+            threshold: 512,                     // Compresser si > 512 bytes
+          },
         });
 
+        // ═══════════════════════════════════════════════════════════════
+        // ÉVÉNEMENTS SOCKET - Gestion optimisée sans logs excessifs
+        // ═══════════════════════════════════════════════════════════════
+        
+        let lastConnectLog = 0;
+        let lastDisconnectLog = 0;
+        let reconnectAttempts = 0;
+        
         socket.on('connect', () => {
-          console.log('✅ Socket connecté:', socket.id);
+          const now = Date.now();
+          // ⚡ Limiter les logs à 1 par seconde max
+          if (now - lastConnectLog > 1000) {
+            console.log('✅ Socket connecté:', socket.id);
+            lastConnectLog = now;
+          }
+          
+          // Réinitialiser le compteur de tentatives
+          reconnectAttempts = 0;
           
           // Initialiser l'AudioHandler pour recevoir l'audio de l'IA
           if (!get().audioHandler) {
-            console.log('🎵 Initialisation AudioHandler...');
             const audioHandler = new AudioHandler(socket);
             set({ audioHandler });
-            console.log('🎵 ✅ AudioHandler initialisé');
           }
           
           set({ socketConnected: true, isOnline: true });
         });
 
         socket.on('disconnect', (reason) => {
-          console.log('❌ Socket déconnecté:', reason);
-          set({ socketConnected: false });
-          
-          // Si la déconnexion est due à une erreur réseau, essayer de reconnecter
-          if (reason === 'io server disconnect') {
-            // Le serveur a forcé la déconnexion, ne pas reconnecter automatiquement
-            console.warn('⚠️ Serveur a fermé la connexion');
-          } else if (reason === 'io client disconnect') {
-            // Le client a fermé la connexion volontairement
-            console.log('ℹ️ Connexion fermée par le client');
-          } else {
-            // Erreur réseau ou autre, laisser Socket.IO reconnecter automatiquement
-            console.log('🔄 Tentative de reconnexion en cours...');
+          const now = Date.now();
+          // ⚡ Limiter les logs de déconnexion
+          if (now - lastDisconnectLog > 2000) {
+            console.log('❌ Socket déconnecté:', reason);
+            lastDisconnectLog = now;
           }
           
-          // Vérifier si c'est vraiment offline ou juste une déconnexion temporaire
-          get().checkConnection();
+          set({ socketConnected: false });
+          
+          // ⚡ Ne vérifier la connexion que pour les vraies erreurs réseau
+          if (reason !== 'io client disconnect' && reason !== 'io server disconnect') {
+            // Erreur réseau, Socket.IO reconnecte automatiquement
+            // Pas besoin de checkConnection() ici
+          }
         });
 
         socket.on('connect_error', (error) => {
-          console.error('❌ Erreur connexion socket:', error.message);
+          // ⚡ Log limité pour éviter le spam en cas de problème réseau
+          if (reconnectAttempts === 0 || reconnectAttempts % 10 === 0) {
+            console.warn('⚠️ Erreur connexion socket:', error.message);
+          }
           set({ socketConnected: false });
-          
-          // Ne pas appeler checkConnection() trop souvent pour éviter les boucles
-          // Socket.IO gère déjà la reconnexion automatique
         });
 
         socket.on('reconnect', (attemptNumber) => {
           console.log(`✅ Socket reconnecté après ${attemptNumber} tentative(s)`);
+          reconnectAttempts = 0;
           set({ socketConnected: true, isOnline: true });
         });
 
         socket.on('reconnect_attempt', (attemptNumber) => {
-          console.log(`🔄 Tentative de reconnexion ${attemptNumber}...`);
+          reconnectAttempts = attemptNumber;
+          // ⚡ Log uniquement toutes les 5 tentatives pour éviter le spam
+          if (attemptNumber <= 3 || attemptNumber % 5 === 0) {
+            console.log(`🔄 Reconnexion socket... tentative ${attemptNumber}`);
+          }
         });
 
         socket.on('reconnect_error', (error) => {
-          console.error('❌ Erreur lors de la reconnexion:', error.message);
+          // ⚡ Log limité
+          if (reconnectAttempts % 10 === 0) {
+            console.warn('⚠️ Erreur reconnexion:', error.message);
+          }
         });
 
         socket.on('reconnect_failed', () => {
@@ -689,72 +740,142 @@ export const useStore = create(
         }
       },
 
-      // Vérifier la connexion réelle au serveur
+      // ═══════════════════════════════════════════════════════════════════════════
+      // CONNEXION PRO LOCAL-FIRST
+      // ═══════════════════════════════════════════════════════════════════════════
+      
+      // État de connexion détaillé (ajouté au state initial via set)
+      backendConnected: false,      // Connexion au backend SQLite local
+      backendLatency: null,         // Latence en ms du backend
+      sheetsConnected: null,        // Connexion à Google Sheets (null = pas testé)
+      lastHealthCheck: null,        // Dernière vérification du backend
+      
       /**
-       * Vérifie la connexion au backend pour la synchronisation automatique en arrière-plan
-       * IMPORTANT: Cette fonction est uniquement pour la synchronisation automatique.
-       * Le logiciel de ventes fonctionne toujours en mode offline-first et ne dépend pas de cette connexion.
+       * Vérifie la connexion au BACKEND LOCAL (SQLite) - pas à Internet
+       * IMPORTANT: Pour une app local-first, on détecte le backend SQL local, pas l'internet.
+       * 
+       * Priorité: Backend Local > Socket > navigator.onLine
+       * 
+       * Cette architecture permet:
+       * - Fonctionnement 100% hors-ligne avec SQLite local
+       * - Sync en temps réel via WebSocket sur LAN
+       * - Sync externe vers Google Sheets (optionnel)
        */
       checkConnection: async () => {
+        const startTime = performance.now();
+        
         try {
-          // Vérifier d'abord navigator.onLine
-          if (!navigator.onLine) {
-            set({ isOnline: false, socketConnected: false });
-            return false;
-          }
+          // 1. Vérifier la connexion au backend local (la plus importante!)
+          const response = await axios.get(`${API_URL}/api/health`, {
+            timeout: 5000, // 5 secondes pour le LAN
+            headers: {
+              'Cache-Control': 'no-cache',
+              'Pragma': 'no-cache',
+            },
+          });
 
-          // Tester la connexion réelle au serveur avec un timeout court
-          // Ceci est uniquement pour permettre la synchronisation automatique en arrière-plan
-          try {
-            const response = await axios.get(`${API_URL}/api/health`, {
-              timeout: 3000,
-              headers: {
-                'Cache-Control': 'no-cache',
-              },
+          const latency = Math.round(performance.now() - startTime);
+
+          if (response.status === 200) {
+            // ✅ Backend local connecté = application fonctionnelle
+            set({ 
+              isOnline: true, 
+              backendConnected: true,
+              backendLatency: latency,
+              lastHealthCheck: new Date().toISOString(),
             });
-
-            if (response.status === 200) {
-              set({ isOnline: true });
-              // Si le socket n'est pas connecté, essayer de le reconnecter
-              // Le socket est utilisé pour les notifications en temps réel, pas pour les ventes
-              if (!get().socketConnected && !get().socket) {
-                get().initSocket();
-              }
-              return true;
-            } else {
-              set({ isOnline: false });
-              return false;
+            
+            // Log uniquement si la latence est élevée
+            if (latency > 500) {
+              console.warn(`⚠️ [LAN] Latence élevée: ${latency}ms`);
             }
-          } catch (error) {
-            if (error.code === 'ECONNABORTED' || error.code === 'ERR_NETWORK' || error.code === 'ECONNREFUSED') {
-              console.warn('⚠️ [CONNECTION] Serveur backend inaccessible - Synchronisation automatique en pause');
+            
+            // Si le socket n'est pas connecté, essayer de le reconnecter
+            if (!get().socketConnected && !get().socket) {
+              get().initSocket();
             }
-            set({ isOnline: false });
+            return true;
+          } else {
+            set({ 
+              isOnline: false, 
+              backendConnected: false,
+              backendLatency: null,
+            });
             return false;
           }
         } catch (error) {
-          console.error('❌ [CONNECTION] Erreur vérification connexion backend:', error);
-          set({ isOnline: false });
+          // ❌ Backend local inaccessible
+          const isNetworkError = ['ECONNABORTED', 'ERR_NETWORK', 'ECONNREFUSED', 'ETIMEDOUT'].includes(error.code);
+          
+          if (isNetworkError) {
+            // Erreur réseau locale = backend pas démarré ou inaccessible
+            console.warn('⚠️ [LOCAL] Backend SQL local inaccessible - vérifier que le serveur est démarré');
+          }
+          
+          set({ 
+            isOnline: false, 
+            backendConnected: false,
+            backendLatency: null,
+          });
+          return false;
+        }
+      },
+      
+      /**
+       * Vérifie la connexion à Google Sheets (sync externe)
+       * Retourne true si Sheets est accessible, false sinon
+       * Ne bloque jamais l'application locale
+       */
+      checkSheetsConnection: async () => {
+        try {
+          const response = await axios.get(`${API_URL}/api/sync/status`, {
+            timeout: 10000, // Plus de temps pour Sheets (réseau externe)
+          });
+          
+          if (response.data) {
+            set({ 
+              sheetsConnected: response.data.connected ?? true,
+              lastSync: response.data.lastSync || response.data.last_sync || null,
+            });
+            return true;
+          }
+          set({ sheetsConnected: false });
+          return false;
+        } catch (error) {
+          // Sheets inaccessible = pas grave, on continue en local
+          set({ sheetsConnected: false });
           return false;
         }
       },
 
-      // Écouter les changements de connexion
+      /**
+       * Écouter les changements de connexion - PRO LOCAL-FIRST
+       * IMPORTANT: navigator.onLine détecte Internet, pas le backend local.
+       * On l'utilise comme indicateur secondaire, le backend local prime.
+       */
       updateOnlineStatus: () => {
         const wasOnline = get().isOnline;
-        const nowOnline = navigator.onLine;
+        const wasBackendConnected = get().backendConnected;
+        const nowNavigatorOnline = navigator.onLine;
         
-        set({ isOnline: nowOnline });
-        
-        // Si la connexion vient de revenir, vérifier la connexion réelle
-        if (!wasOnline && nowOnline) {
-          console.log('🌐 [CONNECTION] Connexion détectée, vérification du serveur...');
+        // Si navigator dit offline, vérifier quand même le backend local
+        // Car le LAN peut fonctionner sans Internet
+        if (!nowNavigatorOnline) {
+          console.log('⚠️ [CONNECTION] Navigator.onLine = false, vérification du backend local...');
+          // Vérifier le backend local (peut fonctionner sur LAN sans Internet)
+          get().checkConnection();
+        } else if (!wasOnline && nowNavigatorOnline) {
+          // Connexion Internet revenue, vérifier le backend
+          console.log('🌐 [CONNECTION] Connexion détectée, vérification du backend local...');
           setTimeout(() => {
             get().checkConnection();
-          }, 500);
-        } else if (wasOnline && !nowOnline) {
-          console.log('❌ [CONNECTION] Connexion perdue');
-          set({ isOnline: false, socketConnected: false });
+          }, 300);
+        }
+        
+        // Si on était connecté au backend et on ne l'est plus
+        if (wasBackendConnected && !get().backendConnected) {
+          console.log('❌ [LOCAL] Connexion au backend local perdue');
+          set({ socketConnected: false });
         }
       },
     }),
@@ -773,28 +894,59 @@ export const useStore = create(
   )
 );
 
-// Écouter les changements de connexion réseau
+// ═══════════════════════════════════════════════════════════════════════════════
+// GESTION CONNEXION PRO LOCAL-FIRST
+// ═══════════════════════════════════════════════════════════════════════════════
+// 
+// Architecture de connexion:
+// 1. Backend Local (SQLite) - Toujours prioritaire, vérifié via /api/health
+// 2. WebSocket LAN - Pour sync temps réel entre PC/téléphones
+// 3. Google Sheets - Sync externe optionnelle (ne bloque jamais)
+//
+// L'application fonctionne TOUJOURS tant que le backend local est accessible,
+// même sans connexion Internet. C'est le principe LOCAL-FIRST.
+// ═══════════════════════════════════════════════════════════════════════════════
+
 if (typeof window !== 'undefined') {
-  // Vérifier la connexion au démarrage
+  // Vérifier la connexion au démarrage (plus rapide: 1s)
   setTimeout(() => {
+    console.log('🚀 [LOCAL-FIRST] Vérification du backend local...');
     useStore.getState().checkConnection();
-  }, 2000); // Attendre 2 secondes après le chargement pour laisser le serveur démarrer
+  }, 1000);
   
-  // Vérifier périodiquement la connexion (toutes les 30 secondes)
+  // Vérifier périodiquement le backend local (toutes les 10 secondes)
+  // IMPORTANT: On vérifie le BACKEND LOCAL, pas Internet
+  const healthCheckInterval = setInterval(() => {
+    // Toujours vérifier le backend local, même si navigator.onLine est false
+    // Car le LAN peut fonctionner sans connexion Internet
+    useStore.getState().checkConnection();
+  }, 10000);
+  
+  // Vérifier périodiquement Google Sheets (toutes les 60 secondes)
+  // C'est secondaire et ne doit jamais bloquer l'application
   setInterval(() => {
-    if (navigator.onLine) {
-      useStore.getState().checkConnection();
+    const state = useStore.getState();
+    // Seulement si le backend local est connecté
+    if (state.backendConnected) {
+      state.checkSheetsConnection?.();
     }
-  }, 30000);
+  }, 60000);
   
+  // Écouter les événements navigator (indicateur secondaire)
   window.addEventListener('online', () => {
-    console.log('🌐 [CONNECTION] Événement "online" détecté');
+    console.log('🌐 [NETWORK] Navigator "online" - vérification du backend local...');
     useStore.getState().updateOnlineStatus();
   });
   
   window.addEventListener('offline', () => {
-    console.log('❌ [CONNECTION] Événement "offline" détecté');
+    console.log('⚠️ [NETWORK] Navigator "offline" - vérification du backend local...');
+    // NOTE: Le LAN peut fonctionner sans Internet, on vérifie quand même le backend
     useStore.getState().updateOnlineStatus();
+  });
+  
+  // Cleanup on unload
+  window.addEventListener('beforeunload', () => {
+    clearInterval(healthCheckInterval);
   });
 }
 

@@ -1,0 +1,97 @@
+🗑️ [SalesHistory] Demande suppression: "20260109125857"
+SalesHistory.jsx:505    📤 DELETE /api/sales/20260109125857
+SalesHistory.jsx:507 
+        
+        
+       DELETE http://127.0.0.1:5173/api/sales/20260109125857 500 (Internal Server Error)
+dispatchXhrRequest @ axios.js?v=ae1f9666:1696
+xhr @ axios.js?v=ae1f9666:1573
+dispatchRequest @ axios.js?v=ae1f9666:2107
+Promise.then (async)
+_request @ axios.js?v=ae1f9666:2310
+request @ axios.js?v=ae1f9666:2219
+Axios.<computed> @ axios.js?v=ae1f9666:2346
+wrap @ axios.js?v=ae1f9666:8
+(anonymous) @ SalesHistory.jsx:507
+onClick @ SalesHistory.jsx:939
+callCallback2 @ chunk-NUMECXU6.js?v=ae1f9666:3674
+invokeGuardedCallbackDev @ chunk-NUMECXU6.js?v=ae1f9666:3699
+invokeGuardedCallback @ chunk-NUMECXU6.js?v=ae1f9666:3733
+invokeGuardedCallbackAndCatchFirstError @ chunk-NUMECXU6.js?v=ae1f9666:3736
+executeDispatch @ chunk-NUMECXU6.js?v=ae1f9666:7014
+processDispatchQueueItemsInOrder @ chunk-NUMECXU6.js?v=ae1f9666:7034
+processDispatchQueue @ chunk-NUMECXU6.js?v=ae1f9666:7043
+dispatchEventsForPlugins @ chunk-NUMECXU6.js?v=ae1f9666:7051
+(anonymous) @ chunk-NUMECXU6.js?v=ae1f9666:7174
+batchedUpdates$1 @ chunk-NUMECXU6.js?v=ae1f9666:18913
+batchedUpdates @ chunk-NUMECXU6.js?v=ae1f9666:3579
+dispatchEventForPluginEventSystem @ chunk-NUMECXU6.js?v=ae1f9666:7173
+dispatchEventWithEnableCapturePhaseSelectiveHydrationWithoutDiscreteEventReplay @ chunk-NUMECXU6.js?v=ae1f9666:5478
+dispatchEvent @ chunk-NUMECXU6.js?v=ae1f9666:5472
+dispatchDiscreteEvent @ chunk-NUMECXU6.js?v=ae1f9666:5449
+Show 22 more frames
+Show less
+SalesHistory.jsx:540 ❌ Erreur suppression: AxiosError {message: 'Request failed with status code 500', name: 'AxiosError', code: 'ERR_BAD_RESPONSE', config: {…}, request: XMLHttpRequest, …}
+(anonymous) @ SalesHistory.jsx:540
+await in (anonymous) (async)
+onClick @ SalesHistory.jsx:939
+callCallback2 @ chunk-NUMECXU6.js?v=ae1f9666:3674
+invokeGuardedCallbackDev @ chunk-NUMECXU6.js?v=ae1f9666:3699
+invokeGuardedCallback @ chunk-NUMECXU6.js?v=ae1f9666:3733
+invokeGuardedCallbackAndCatchFirstError @ chunk-NUMECXU6.js?v=ae1f9666:3736
+executeDispatch @ chunk-NUMECXU6.js?v=ae1f9666:7014
+processDispatchQueueItemsInOrder @ chunk-NUMECXU6.js?v=ae1f9666:7034
+processDispatchQueue @ chunk-NUMECXU6.js?v=ae1f9666:7043
+dispatchEventsForPlugins @ chunk-NUMECXU6.js?v=ae1f9666:7051
+(anonymous) @ chunk-NUMECXU6.js?v=ae1f9666:7174
+batchedUpdates$1 @ chunk-NUMECXU6.js?v=ae1f9666:18913
+batchedUpdates @ chunk-NUMECXU6.js?v=ae1f9666:3579
+dispatchEventForPluginEventSystem @ chunk-NUMECXU6.js?v=ae1f9666:7173
+dispatchEventWithEnableCapturePhaseSelectiveHydrationWithoutDiscreteEventReplay @ chunk-NUMECXU6.js?v=ae1f9666:5478
+dispatchEvent @ chunk-NUMECXU6.js?v=ae1f9666:5472
+dispatchDiscreteEvent @ chunk-NUMECXU6.js?v=ae1f9666:5449
+Show 15 more frames
+Show less
+SalesHistory.jsx:541    Status: 500
+(anonymous) @ SalesHistory.jsx:541
+await in (anonymous) (async)
+onClick @ SalesHistory.jsx:939
+callCallback2 @ chunk-NUMECXU6.js?v=ae1f9666:3674
+invokeGuardedCallbackDev @ chunk-NUMECXU6.js?v=ae1f9666:3699
+invokeGuardedCallback @ chunk-NUMECXU6.js?v=ae1f9666:3733
+invokeGuardedCallbackAndCatchFirstError @ chunk-NUMECXU6.js?v=ae1f9666:3736
+executeDispatch @ chunk-NUMECXU6.js?v=ae1f9666:7014
+processDispatchQueueItemsInOrder @ chunk-NUMECXU6.js?v=ae1f9666:7034
+processDispatchQueue @ chunk-NUMECXU6.js?v=ae1f9666:7043
+dispatchEventsForPlugins @ chunk-NUMECXU6.js?v=ae1f9666:7051
+(anonymous) @ chunk-NUMECXU6.js?v=ae1f9666:7174
+batchedUpdates$1 @ chunk-NUMECXU6.js?v=ae1f9666:18913
+batchedUpdates @ chunk-NUMECXU6.js?v=ae1f9666:3579
+dispatchEventForPluginEventSystem @ chunk-NUMECXU6.js?v=ae1f9666:7173
+dispatchEventWithEnableCapturePhaseSelectiveHydrationWithoutDiscreteEventReplay @ chunk-NUMECXU6.js?v=ae1f9666:5478
+dispatchEvent @ chunk-NUMECXU6.js?v=ae1f9666:5472
+dispatchDiscreteEvent @ chunk-NUMECXU6.js?v=ae1f9666:5449
+Show 15 more frames
+Show less
+SalesHistory.jsx:542    Data: {success: false, error: 'FOREIGN KEY constraint failed'}
+(anonymous) @ SalesHistory.jsx:542
+await in (anonymous) (async)
+onClick @ SalesHistory.jsx:939
+callCallback2 @ chunk-NUMECXU6.js?v=ae1f9666:3674
+invokeGuardedCallbackDev @ chunk-NUMECXU6.js?v=ae1f9666:3699
+invokeGuardedCallback @ chunk-NUMECXU6.js?v=ae1f9666:3733
+invokeGuardedCallbackAndCatchFirstError @ chunk-NUMECXU6.js?v=ae1f9666:3736
+executeDispatch @ chunk-NUMECXU6.js?v=ae1f9666:7014
+processDispatchQueueItemsInOrder @ chunk-NUMECXU6.js?v=ae1f9666:7034
+processDispatchQueue @ chunk-NUMECXU6.js?v=ae1f9666:7043
+dispatchEventsForPlugins @ chunk-NUMECXU6.js?v=ae1f9666:7051
+(anonymous) @ chunk-NUMECXU6.js?v=ae1f9666:7174
+batchedUpdates$1 @ chunk-NUMECXU6.js?v=ae1f9666:18913
+batchedUpdates @ chunk-NUMECXU6.js?v=ae1f9666:3579
+dispatchEventForPluginEventSystem @ chunk-NUMECXU6.js?v=ae1f9666:7173
+dispatchEventWithEnableCapturePhaseSelectiveHydrationWithoutDiscreteEventReplay @ chunk-NUMECXU6.js?v=ae1f9666:5478
+dispatchEvent @ chunk-NUMECXU6.js?v=ae1f9666:5472
+dispatchDiscreteEvent @ chunk-NUMECXU6.js?v=ae1f9666:5449
+Show 15 more frames
+Show less
+useStore.js:579 ✅ 248 produit(s) chargé(

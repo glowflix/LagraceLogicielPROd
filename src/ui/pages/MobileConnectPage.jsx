@@ -31,24 +31,31 @@ const MobileConnectPage = () => {
   // Détecter les adresses IP du serveur
   const detectIpAddresses = useCallback(async () => {
     setLoading(true);
+    // Helper pour vérifier si c'est une vraie adresse IPv4
+    const isValidIPv4 = (ip) => /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip);
+    
     try {
       // Essayer de récupérer les IPs via l'API
       const response = await fetch('/api/system/network-info');
       if (response.ok) {
         const data = await response.json();
         if (data.ips && data.ips.length > 0) {
-          setIpAddresses(data.ips);
-          setSelectedIp(data.ips[0]);
-          return;
+          // Filtrer pour ne garder que les vraies adresses IPv4
+          const validIps = data.ips.filter(ip => isValidIPv4(ip));
+          if (validIps.length > 0) {
+            setIpAddresses(validIps);
+            setSelectedIp(validIps[0]);
+            return;
+          }
         }
       }
     } catch (e) {
       console.log('API network-info non disponible, utilisation de fallback');
     }
 
-    // Fallback: Utiliser l'URL actuelle
+    // Fallback: Utiliser l'URL actuelle (seulement si c'est une vraie IP)
     const currentHost = window.location.hostname;
-    if (currentHost && currentHost !== 'localhost' && currentHost !== '127.0.0.1') {
+    if (currentHost && isValidIPv4(currentHost) && currentHost !== '127.0.0.1') {
       setIpAddresses([currentHost]);
       setSelectedIp(currentHost);
     } else {

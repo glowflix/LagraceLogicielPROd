@@ -171,59 +171,114 @@ export class OutboxRepository {
   }
 
   // ========================================
+  // PRODUCT DELETED (Suppression produit)
+  // ========================================
+
+  /**
+   * ✅ PRO: Enqueue une suppression de produit
+   * Crée une opération PRODUCT_DELETED pour synchroniser avec Sheets
+   * 
+   * @param {string} productUuid - UUID du produit
+   * @param {string} productCode - Code du produit
+   * @param {object} options - Options supplémentaires { deleted_at?, name? }
+   * @returns {string} op_id de l'opération
+   */
+  enqueueProductDeleted(productUuid, productCode, options = {}) {
+    const db = getDb();
+    try {
+      const opId = generateUUID();
+      const deviceId = this.getDeviceId();
+      
+      const payload = {
+        product_uuid: productUuid,
+        product_code: productCode,
+        product_name: options.name || null,
+        deleted_at: options.deleted_at || new Date().toISOString(),
+        device_id: deviceId
+      };
+
+      // ✅ Supprimer les anciennes opérations pending pour ce produit (évite doublons)
+      db.prepare(`
+        DELETE FROM sync_operations 
+        WHERE entity_code = ? 
+          AND op_type IN ('PRODUCT_PATCH', 'PRODUCT_DELETED')
+          AND status = 'pending'
+      `).run(productCode);
+
+      db.prepare(`
+        INSERT INTO sync_operations (op_id, op_type, entity_uuid, entity_code, payload_json, device_id, status)
+        VALUES (?, 'PRODUCT_DELETED', ?, ?, ?, ?, 'pending')
+      `).run(opId, productUuid || productCode, productCode, JSON.stringify(payload), deviceId);
+
+      logger.info(`🗑️ [OUTBOX] PRODUCT_DELETED enqueued: code='${productCode}', uuid='${productUuid}', op_id='${opId}'`);
+      
+      return opId;
+    } catch (error) {
+      logger.error('Erreur enqueueProductDeleted:', error);
+      throw error;
+    }
+  }
+
+  // ========================================
   // STOCK MOVES (Deltas, jamais valeur absolue)
   // ========================================
 
   /**
    * Enqueue un mouvement de stock (delta)
    * IMPORTANT: Ne jamais envoyer de valeur absolue, seulement des deltas
+   * ✅ FIX: Déduplication last-write-wins avec entity_uuid par unité (CARTON/PIECE différenciés)
    * 
    * @param {string} productUuid - UUID du produit
    * @param {string} productCode - Code du produit
    * @param {string} unitLevel - Niveau d'unité
    * @param {string} unitMark - Mark de l'unité
    * @param {number} delta - Mouvement (+50, -3, etc.)
-   * @param {string} reason - adjustment|sale|void|inventory|correction
+   * @param {string} reason - adjustment|sale|void|inventory|correction|sale_deleted
    * @param {string} referenceId - UUID de la vente, ajustement, etc.
-   * @returns {string} move_id du mouvement
+   * @returns {object} { op_id, move_id } - op_id pour sync, move_id pour journal
    */
   enqueueStockMove(productUuid, productCode, unitLevel, unitMark, delta, reason, referenceId = null) {
     const db = getDb();
     try {
-      const moveId = generateUUID();
-      const deviceId = this.getDeviceId();
+      // ✅ PRO: Normaliser unit_level
+      let unitLevelNorm = (unitLevel || '').toString().toUpperCase();
+      if (unitLevelNorm === 'MILLIERS') unitLevelNorm = 'MILLIER';
 
-      // Récupérer le stock actuel pour traçabilité
+      // ✅ FIX: entity_uuid par unité pour vraie déduplication last-write-wins
+      const stockEntityUuid = `${productUuid}-${unitLevelNorm}-${unitMark || ''}`;
+
+      // ✅ DÉDUPLICATION: Vérifier si opération STOCK_MOVE pending existe pour cette unité
+      const existing = db.prepare(`
+        SELECT id, op_id, payload_json
+        FROM sync_operations
+        WHERE entity_uuid = ?
+          AND op_type = 'STOCK_MOVE'
+          AND status = 'pending'
+        ORDER BY created_at DESC
+        LIMIT 1
+      `).get(stockEntityUuid);
+
+      // Récupérer le stock actuel pour traçabilité (stock_current pour la valeur réelle)
       const currentStock = db.prepare(`
         SELECT pu.stock_current
         FROM product_units pu
         JOIN products p ON pu.product_id = p.id
         WHERE p.uuid = ? AND pu.unit_level = ? AND pu.unit_mark = ?
-      `).get(productUuid, unitLevel, unitMark || '');
+      `).get(productUuid, unitLevelNorm, unitMark || '');
 
       const stockBefore = currentStock?.stock_current || 0;
       const stockAfter = stockBefore + delta;
 
-      // Insérer dans stock_moves
-      db.prepare(`
-        INSERT INTO stock_moves (
-          move_id, product_uuid, product_code, unit_level, unit_mark,
-          delta, reason, reference_id, stock_before, stock_after, device_id, synced
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-      `).run(
-        moveId, productUuid, productCode, unitLevel, unitMark || '',
-        delta, reason, referenceId, stockBefore, stockAfter, deviceId
-      );
-
-      // Créer aussi une opération sync pour le batch push
-      const opId = generateUUID();
+      // ✅ FIX: Utiliser stock_current (pas stock_initial) pour stock_absolute
+      const moveId = generateUUID();
       const payload = {
         move_id: moveId,
         product_uuid: productUuid,
-        product_code: productCode,
-        unit_level: unitLevel,
+        product_code: String(productCode).trim(),
+        unit_level: unitLevelNorm,
         unit_mark: unitMark || '',
+        // ✅ FIX: stock_absolute basé sur stock_current (valeur réelle actuelle)
+        stock_absolute: Math.round(stockAfter * 100) / 100,
         delta,
         reason,
         reference_id: referenceId,
@@ -231,13 +286,47 @@ export class OutboxRepository {
         stock_after: stockAfter
       };
 
+      if (existing) {
+        // ✅ DEDUP: Remplacer par la valeur finale la plus récente (last-write-wins)
+        db.prepare(`
+          UPDATE sync_operations
+          SET payload_json = ?, updated_at = datetime('now')
+          WHERE id = ?
+        `).run(JSON.stringify(payload), existing.id);
+
+        logger.info(`🔄 [OUTBOX] STOCK_MOVE dédupliqué (last-write-wins): ${productCode}/${unitLevelNorm} delta=${delta}`);
+        // ✅ FIX: Retourner l'op_id existant et le move_id EXISTANT du payload
+        try {
+          const existingPayload = JSON.parse(existing.payload_json);
+          return { op_id: existing.op_id, move_id: existingPayload.move_id };
+        } catch (e) {
+          return { op_id: existing.op_id, move_id: moveId }; // Fallback
+        }
+      }
+
+      // Créer une nouvelle opération
+      const opId = generateUUID();
+      const deviceId = this.getDeviceId();
+
+      db.prepare(`
+        INSERT INTO stock_moves (
+          move_id, product_uuid, product_code, unit_level, unit_mark,
+          delta, reason, reference_id, stock_before, stock_after, device_id, synced
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+      `).run(
+        moveId, productUuid, String(productCode).trim(), unitLevelNorm, unitMark || '',
+        delta, reason, referenceId, stockBefore, stockAfter, deviceId
+      );
+
       db.prepare(`
         INSERT INTO sync_operations (op_id, op_type, entity_uuid, entity_code, payload_json, device_id, status)
         VALUES (?, 'STOCK_MOVE', ?, ?, ?, ?, 'pending')
-      `).run(opId, productUuid, productCode, JSON.stringify(payload), deviceId);
+      `).run(opId, stockEntityUuid, String(productCode).trim(), JSON.stringify(payload), deviceId);
 
-      logger.info(`📊 [STOCK] Mouvement enregistré: ${productCode}/${unitLevel} ${delta > 0 ? '+' : ''}${delta} (${reason})`);
-      return moveId;
+      logger.info(`📊 [STOCK] ${productCode}/${unitLevelNorm}: ${stockBefore} → ${stockAfter} (${reason})`);
+      // ✅ FIX: Retourner les deux IDs
+      return { op_id: opId, move_id: moveId };
     } catch (error) {
       logger.error('Erreur enqueueStockMove:', error);
       throw error;
@@ -275,12 +364,155 @@ export class OutboxRepository {
     }
   }
 
+  /**
+   * Enqueue la suppression d'une vente (SALE_DELETED) + restauration du stock
+   * ✅ Crée opération pour supprimer la ligne dans Sheets + restaure le stock
+   * 
+   * @param {string} invoiceNumber - Numéro de facture à supprimer
+   * @param {array} items - Articles vendus (pour restaurer le stock)
+   * @returns {object} { saleDeletedOpId, stockMoveOpIds }
+   */
+  enqueueSaleDeleted(invoiceNumber, items) {
+    const db = getDb();
+    const transaction = db.transaction(() => {
+      try {
+        const deviceId = this.getDeviceId();
+        const stockMoveOpIds = [];
+
+        // ═══════════════════════════════════════════════════════════════════
+        // 1. SALE_DELETED: Supprime la ligne dans Sheets
+        // ═══════════════════════════════════════════════════════════════════
+        console.log('\n' + '═'.repeat(70));
+        console.log('🗑️ [OUTBOX] ENQUEUE SUPPRESSION VENTE + SYNC STOCK');
+        console.log('═'.repeat(70));
+        console.log(`   📄 Facture: ${invoiceNumber}`);
+        console.log(`   📦 Items: ${items.length}`);
+        console.log('═'.repeat(70));
+
+        const saleDeletedOpId = generateUUID();
+        const payload = {
+          invoice_number: invoiceNumber,
+          deleted_at: new Date().toISOString(),
+          items_count: items.length
+        };
+
+        db.prepare(`
+          INSERT INTO sync_operations (op_id, op_type, entity_uuid, entity_code, payload_json, device_id, status)
+          VALUES (?, 'SALE_DELETED', ?, ?, ?, ?, 'pending')
+        `).run(saleDeletedOpId, invoiceNumber, invoiceNumber, JSON.stringify(payload), deviceId);
+
+        logger.info(`🗑️ [OUTBOX] SALE_DELETED enqueued: ${invoiceNumber} (op_id: ${saleDeletedOpId})`);
+
+        // ═══════════════════════════════════════════════════════════════════
+        // 2. STOCK_MOVE: Synchronise la restauration du stock vers Sheets
+        //    IMPORTANT: reason='sale_deleted' pour que Code.gs sache ne pas créer de nouvelle ligne!
+        // ═══════════════════════════════════════════════════════════════════
+        let stockRestored = 0;
+        for (const item of items) {
+          // Récupérer le produit
+          const product = db.prepare('SELECT id, uuid, name FROM products WHERE code = ?').get(item.product_code);
+          if (!product) {
+            console.log(`   ⚠️ Produit non trouvé: ${item.product_code}`);
+            logger.warn(`[OUTBOX] Produit non trouvé: ${item.product_code}`);
+            continue;
+          }
+
+          // Normaliser unit_level
+          let unitLevelNorm = (item.unit_level || 'CARTON').toString().toUpperCase();
+          if (unitLevelNorm === 'MILLIERS') unitLevelNorm = 'MILLIER';
+
+          // Récupérer le stock actuel
+          const currentStock = db.prepare(`
+            SELECT pu.stock_current, pu.unit_mark
+            FROM product_units pu
+            WHERE pu.product_id = ? AND pu.unit_level = ?
+            LIMIT 1
+          `).get(product.id, unitLevelNorm);
+
+          if (!currentStock) {
+            console.log(`   ⚠️ Unité non trouvée: ${item.product_code}/${unitLevelNorm}`);
+            logger.warn(`[OUTBOX] Unité non trouvée: ${item.product_code}/${unitLevelNorm}`);
+            continue;
+          }
+
+          const unitMark = currentStock.unit_mark || item.unit_mark || '';
+          const stockBefore = currentStock.stock_current;
+          const delta = +item.qty; // POSITIF = restauration
+          const stockAfter = stockBefore + delta;
+
+          // Créer STOCK_MOVE pour le journal
+          const moveId = generateUUID();
+          db.prepare(`
+            INSERT INTO stock_moves (
+              move_id, product_uuid, product_code, unit_level, unit_mark,
+              delta, reason, reference_id, stock_before, stock_after, device_id, synced
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 'sale_deleted', ?, ?, ?, ?, 0)
+          `).run(
+            moveId, product.uuid, item.product_code, unitLevelNorm, unitMark,
+            delta, invoiceNumber, stockBefore, stockAfter, deviceId
+          );
+
+          // Créer opération STOCK_MOVE pour Sheets
+          // ✅ IMPORTANT: reason='sale_deleted' pour que Code.gs ne crée pas de nouvelle ligne!
+          const stockOpId = generateUUID();
+          const stockEntityUuid = `${product.uuid}-${unitLevelNorm}-${unitMark || ''}`;
+          const stockPayload = {
+            move_id: moveId,
+            product_uuid: product.uuid,
+            product_code: String(item.product_code).trim(),
+            unit_level: unitLevelNorm,
+            unit_mark: unitMark,
+            stock_absolute: Math.round(stockAfter * 100) / 100,
+            delta: delta,
+            reason: 'sale_deleted',  // ✅ CRITICAL: indique à Code.gs de ne pas créer de ligne de vente
+            reference_id: invoiceNumber,
+            stock_before: stockBefore,
+            stock_after: stockAfter
+          };
+
+          db.prepare(`
+            INSERT INTO sync_operations (op_id, op_type, entity_uuid, entity_code, payload_json, device_id, status)
+            VALUES (?, 'STOCK_MOVE', ?, ?, ?, ?, 'pending')
+          `).run(stockOpId, stockEntityUuid, String(item.product_code).trim(), JSON.stringify(stockPayload), deviceId);
+
+          stockMoveOpIds.push(stockOpId);
+          stockRestored++;
+
+          // LOG VISIBLE
+          console.log(`   📦 ${item.product_code} (${product.name})`);
+          console.log(`      └─ ${unitLevelNorm}: ${stockBefore} → ${stockAfter} (delta: +${delta})`);
+          logger.info(`📦 [STOCK-RESTORE] ${item.product_code}/${unitLevelNorm}: ${stockBefore} → ${stockAfter} (sale_deleted)`);
+        }
+
+        console.log('─'.repeat(70));
+        console.log(`✅ [OUTBOX] Suppression vente ${invoiceNumber} enqueued`);
+        console.log(`   📋 SALE_DELETED: ${saleDeletedOpId.substring(0, 12)}...`);
+        console.log(`   📊 STOCK_MOVE: ${stockRestored}/${items.length} articles`);
+        console.log(`   ⏳ Sync vers Sheets dans ~10 secondes...`);
+        console.log(`   ℹ️  Code.gs détecte reason='sale_deleted' et MAJ stock SEULEMENT`);
+        console.log('═'.repeat(70) + '\n');
+
+        logger.info(`💰 [OUTBOX] Vente supprimée: ${invoiceNumber} (${saleDeletedOpId}) - ${stockRestored} articles à restaurer`);
+        
+        return { saleDeletedOpId, stockMoveOpIds };
+      } catch (error) {
+        console.error('❌ [OUTBOX] Erreur enqueueSaleDeleted:', error.message);
+        logger.error('Erreur enqueueSaleDeleted:', error);
+        throw error;
+      }
+    });
+
+    return transaction();
+  }
+
   // ========================================
   // SALES (Ventes avec mouvements de stock implicites)
   // ========================================
 
   /**
    * Enqueue une vente (la vente génère automatiquement des STOCK_MOVE négatifs)
+   * ✅ PRO: Crée les opérations STOCK_MOVE avec stock_absolute pour sync vers Sheets
    * 
    * @param {object} sale - Données de la vente
    * @param {array} items - Lignes de vente
@@ -294,50 +526,132 @@ export class OutboxRepository {
         const deviceId = this.getDeviceId();
         const payload = { sale, items };
 
+        // ═══════════════════════════════════════════════════════════════════
+        // LOG TRÈS VISIBLE DANS LE TERMINAL
+        // ═══════════════════════════════════════════════════════════════════
+        console.log('\n' + '═'.repeat(70));
+        console.log('📤 [OUTBOX] ENQUEUE VENTE + STOCK_MOVE POUR SYNC SHEETS');
+        console.log('═'.repeat(70));
+        console.log(`   📄 Facture: ${sale.invoice_number}`);
+        console.log(`   📦 Items: ${items.length}`);
+        console.log('═'.repeat(70));
+
         // Enqueue l'opération de vente
         db.prepare(`
           INSERT INTO sync_operations (op_id, op_type, entity_uuid, entity_code, payload_json, device_id, status)
           VALUES (?, 'SALE', ?, ?, ?, ?, 'pending')
         `).run(opId, sale.uuid, sale.invoice_number, JSON.stringify(payload), deviceId);
 
+        logger.info(`📤 [OUTBOX] SALE enqueued: ${sale.invoice_number} (op_id: ${opId})`);
+
         // IMPORTANT: Les mouvements de stock sont gérés par les triggers SQL
-        // Pas besoin de créer des STOCK_MOVE séparés ici car les triggers font déjà le travail
-        // Mais on enregistre quand même les mouvements pour le push vers Sheets
+        // Les triggers décrémentent le stock localement, on crée les opérations 
+        // STOCK_MOVE avec stock_absolute pour synchroniser vers Google Sheets
 
+        let stockMovesCreated = 0;
         for (const item of items) {
-          // Récupérer l'UUID du produit
-          const product = db.prepare('SELECT uuid FROM products WHERE code = ?').get(item.product_code);
-          if (product) {
-            // Le stock a déjà été décrémenté par le trigger trg_sale_items_stock_decrease_ai
-            // On enregistre juste le mouvement pour la sync (sans appliquer localement)
-            const moveId = generateUUID();
-            const stockMove = db.prepare(`
-              SELECT pu.stock_current
-              FROM product_units pu
-              JOIN products p ON pu.product_id = p.id
-              WHERE p.code = ? AND pu.unit_level = ? AND pu.unit_mark = ?
-            `).get(item.product_code, item.unit_level, item.unit_mark || '');
-
-            // Note: stock_after est APRÈS le trigger, donc c'est la valeur actuelle
-            const stockAfter = stockMove?.stock_current || 0;
-            const stockBefore = stockAfter + item.qty; // Avant la vente
-
-            db.prepare(`
-              INSERT INTO stock_moves (
-                move_id, product_uuid, product_code, unit_level, unit_mark,
-                delta, reason, reference_id, stock_before, stock_after, device_id, synced
-              )
-              VALUES (?, ?, ?, ?, ?, ?, 'sale', ?, ?, ?, ?, 0)
-            `).run(
-              moveId, product.uuid, item.product_code, item.unit_level, item.unit_mark || '',
-              -item.qty, sale.uuid, stockBefore, stockAfter, deviceId
-            );
+          // Récupérer l'UUID et les infos du produit
+          const product = db.prepare('SELECT id, uuid, name FROM products WHERE code = ?').get(item.product_code);
+          if (!product) {
+            console.log(`   ⚠️ Produit non trouvé: ${item.product_code}`);
+            logger.warn(`[OUTBOX] Produit non trouvé: ${item.product_code}`);
+            continue;
           }
+
+          // Le stock a déjà été décrémenté par le trigger trg_sale_items_stock_decrease_ai
+          // On enregistre le mouvement ET on crée l'opération de sync
+          const moveId = generateUUID();
+          
+          // Normaliser unit_level pour la requête
+          let unitLevelNorm = (item.unit_level || 'CARTON').toString().toUpperCase();
+          if (unitLevelNorm === 'MILLIERS') unitLevelNorm = 'MILLIER';
+          
+          // ✅ PRO: Chercher d'abord avec mark, puis sans mark si non trouvé
+          let stockMove = db.prepare(`
+            SELECT pu.stock_initial, pu.stock_current, pu.unit_mark
+            FROM product_units pu
+            WHERE pu.product_id = ? AND pu.unit_level = ? AND pu.unit_mark = ?
+          `).get(product.id, unitLevelNorm, item.unit_mark || '');
+
+          // Si pas trouvé avec mark, chercher juste par unit_level
+          if (!stockMove) {
+            stockMove = db.prepare(`
+              SELECT pu.stock_initial, pu.stock_current, pu.unit_mark
+              FROM product_units pu
+              WHERE pu.product_id = ? AND pu.unit_level = ?
+              LIMIT 1
+            `).get(product.id, unitLevelNorm);
+          }
+
+          if (!stockMove) {
+            console.log(`   ⚠️ Unité non trouvée: ${item.product_code}/${unitLevelNorm}`);
+            logger.warn(`[OUTBOX] Unité non trouvée: ${item.product_code}/${unitLevelNorm}`);
+            continue;
+          }
+
+          // Note: stock_after est APRÈS le trigger, donc c'est la valeur actuelle
+          const stockAfterCurrent = stockMove?.stock_current || 0;
+          const stockBefore = stockAfterCurrent + item.qty; // Avant la vente
+          const delta = -item.qty;
+          const unitMark = stockMove?.unit_mark || item.unit_mark || '';
+
+          // 1. Insérer dans stock_moves pour le journal
+          db.prepare(`
+            INSERT INTO stock_moves (
+              move_id, product_uuid, product_code, unit_level, unit_mark,
+              delta, reason, reference_id, stock_before, stock_after, device_id, synced
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 'sale', ?, ?, ?, ?, 0)
+          `).run(
+            moveId, product.uuid, item.product_code, unitLevelNorm, unitMark,
+            delta, sale.uuid, stockBefore, stockAfterCurrent, deviceId
+          );
+
+          // 2. ✅ FIX: Créer l'opération STOCK_MOVE avec stock_absolute basé sur stock_current
+          const stockOpId = generateUUID();
+          // ✅ FIX: entity_uuid par unité pour vraie déduplication
+          const stockEntityUuid = `${product.uuid}-${unitLevelNorm}-${unitMark || ''}`;
+          
+          const stockPayload = {
+            move_id: moveId,
+            product_uuid: product.uuid,
+            product_code: String(item.product_code).trim(), // Toujours string pour Sheets
+            unit_level: unitLevelNorm,
+            unit_mark: unitMark,
+            // ✅ FIX: Utiliser stock_current (pas stock_initial) pour valeur réelle
+            stock_absolute: Math.round(stockAfterCurrent * 100) / 100,
+            delta: delta, // Garder delta pour le log
+            reason: 'sale',
+            reference_id: sale.uuid,
+            stock_before: stockBefore,
+            stock_after: stockAfterCurrent
+          };
+
+          db.prepare(`
+            INSERT INTO sync_operations (op_id, op_type, entity_uuid, entity_code, payload_json, device_id, status)
+            VALUES (?, 'STOCK_MOVE', ?, ?, ?, ?, 'pending')
+          `).run(stockOpId, stockEntityUuid, String(item.product_code).trim(), JSON.stringify(stockPayload), deviceId);
+
+          stockMovesCreated++;
+          
+          // ✅ LOG VISIBLE DANS LE TERMINAL
+          console.log(`   📦 ${item.product_code} (${product.name})`);
+          console.log(`      └─ ${unitLevelNorm}: ${stockBefore} → ${stockAfterCurrent} (delta: ${delta})`);
+          console.log(`      └─ STOCK_MOVE pending op_id=${stockOpId} (stock_absolute: ${stockPayload.stock_absolute})`);
+          
+          logger.info(`📦 [STOCK-SYNC] ${item.product_code}/${unitLevelNorm}: ${stockBefore} → ${stockAfterCurrent} (pending)`);
         }
 
-        logger.info(`💰 [OUTBOX] Vente enqueued: ${sale.invoice_number} (${opId})`);
+        console.log('─'.repeat(70));
+        console.log(`✅ [OUTBOX] Vente ${sale.invoice_number} enqueued`);
+        console.log(`   📊 STOCK_MOVE créés: ${stockMovesCreated}/${items.length}`);
+        console.log(`   ⏳ Sync vers Sheets dans ~10 secondes...`);
+        console.log('═'.repeat(70) + '\n');
+
+        logger.info(`💰 [OUTBOX] Vente enqueued: ${sale.invoice_number} (${opId}) - ${stockMovesCreated} STOCK_MOVE`);
         return opId;
       } catch (error) {
+        console.error('❌ [OUTBOX] Erreur enqueueSale:', error.message);
         logger.error('Erreur enqueueSale:', error);
         throw error;
       }
@@ -664,6 +978,129 @@ export class OutboxRepository {
   }
 
   // ========================================
+  // RATES (Taux de change avec sync vers feuille "Taux")
+  // ========================================
+
+  /**
+   * Enqueue une mise à jour de taux pour sync vers Google Sheets (feuille "Taux")
+   * ✅ Format des colonnes Sheets: Taux, USD, Fc, DATE, _uuid, _updated_at
+   * 
+   * @param {number} rateValue - Taux FC par USD (ex: 2800)
+   * @param {string} effectiveAt - Date d'effet (ISO string)
+   * @returns {string} op_id de l'opération
+   */
+  enqueueRate(rateValue, effectiveAt = null) {
+    const db = getDb();
+    try {
+      const opId = generateUUID();
+      const deviceId = this.getDeviceId();
+      const now = effectiveAt || new Date().toISOString();
+      const rateUuid = generateUUID();
+
+      // Normaliser le taux
+      const rate = parseFloat(rateValue) || 2800;
+
+      // ✅ Payload exact pour Google Sheets (colonnes de la feuille "Taux")
+      const payload = {
+        uuid: rateUuid,
+        rate_fc_per_usd: rate,
+        usd: 100,  // Standard: 100 USD
+        fc: rate * 100, // 100 USD en FC
+        effective_at: now,
+        _updated_at: now,
+        _device_id: deviceId
+      };
+
+      // ✅ Supprimer les anciennes opérations pending (évite doublons)
+      db.prepare(`
+        DELETE FROM sync_operations 
+        WHERE op_type = 'RATE' 
+          AND status = 'pending'
+      `).run();
+
+      db.prepare(`
+        INSERT INTO sync_operations (op_id, op_type, entity_uuid, entity_code, payload_json, device_id, status)
+        VALUES (?, 'RATE', ?, 'current', ?, ?, 'pending')
+      `).run(opId, rateUuid, JSON.stringify(payload), deviceId);
+
+      logger.info(`💱 [OUTBOX] RATE queued: ${rate} FC/USD, op_id='${opId}'`);
+      
+      return opId;
+    } catch (error) {
+      logger.error('❌ [OUTBOX] Erreur enqueueRate:', error);
+      throw error;
+    }
+  }
+
+  // ========================================
+  // USERS (Utilisateurs avec sync vers feuille "Compter Utilisateur")
+  // ========================================
+
+  /**
+   * Enqueue un utilisateur pour sync vers Google Sheets (feuille "Compter Utilisateur")
+   * ✅ Format des colonnes Sheets: Nom, Mode passe, Numero, Valide, date de creation, 
+   *    Token Expo Push, marque, Urlprofile, admi, _uuid, Vendeur, Gerent Stock, Porudits est Vender
+   * 
+   * @param {object} userData - Données de l'utilisateur
+   * @param {string} operation - Type d'opération: 'create', 'update', 'delete'
+   * @returns {string} op_id de l'opération
+   */
+  enqueueUser(userData, operation = 'upsert') {
+    const db = getDb();
+    try {
+      const opId = generateUUID();
+      const deviceId = this.getDeviceId();
+      const now = new Date().toISOString();
+
+      // ✅ Générer UUID si manquant
+      const userUuid = userData.uuid || generateUUID();
+
+      // ✅ Payload exact pour Google Sheets (colonnes de la feuille "Compter Utilisateur")
+      const payload = {
+        // Données utilisateur
+        uuid: userUuid,
+        username: userData.username || '',
+        phone: userData.phone || '',
+        is_admin: userData.is_admin || 0,
+        is_active: userData.is_active !== undefined ? userData.is_active : 1,
+        is_vendeur: userData.is_vendeur !== undefined ? userData.is_vendeur : 1,
+        is_gerant_stock: userData.is_gerant_stock || 0,
+        can_manage_products: userData.can_manage_products || 0,
+        created_at: userData.created_at || now,
+        updated_at: userData.updated_at || now,
+        device_brand: userData.device_brand || '',
+        profile_url: userData.profile_url || '',
+        expo_push_token: userData.expo_push_token || '',
+        
+        // Colonnes techniques
+        _uuid: userUuid,
+        _updated_at: now,
+        _device_id: deviceId
+      };
+
+      // ✅ Supprimer les anciennes opérations pending pour cet utilisateur (évite doublons)
+      db.prepare(`
+        DELETE FROM sync_operations 
+        WHERE entity_uuid = ? 
+          AND op_type = 'USER'
+          AND status = 'pending'
+      `).run(userUuid);
+
+      db.prepare(`
+        INSERT INTO sync_operations (op_id, op_type, entity_uuid, entity_code, payload_json, device_id, status)
+        VALUES (?, 'USER', ?, ?, ?, ?, 'pending')
+      `).run(opId, userUuid, userData.username || userUuid, JSON.stringify(payload), deviceId);
+
+      logger.info(`👤 [OUTBOX] USER queued: ${userData.username} (${operation}), op_id='${opId}'`);
+      
+      return opId;
+    } catch (error) {
+      logger.error('❌ [OUTBOX] Erreur enqueueUser:', error);
+      throw error;
+    }
+  }
+
+  // ========================================
   // BATCH OPERATIONS (Récupération et acknowledgment)
   // ========================================
 
@@ -691,10 +1128,23 @@ export class OutboxRepository {
       query += ' ORDER BY created_at ASC LIMIT ?';
       params.push(limit);
 
-      return db.prepare(query).all(...params).map(row => ({
-        ...row,
-        payload: JSON.parse(row.payload_json)
-      }));
+      const rows = db.prepare(query).all(...params);
+      
+      // ✅ LOG: Afficher le nombre d'opérations retournées
+      if (opType && rows.length > 0) {
+        console.log(`   📌 [getPendingOperations] ${opType}: ${rows.length} opération(s) pending trouvées`);
+      }
+      
+      return rows.map(row => {
+        try {
+          const payload = JSON.parse(row.payload_json);
+          return { ...row, payload };
+        } catch (e) {
+          logger.error(`[getPendingOperations] JSON parse error pour op_id=${row.op_id}: ${e.message}`);
+          logger.error(`   payload_json: ${(row.payload_json || '').substring(0, 100)}`);
+          return { ...row, payload: {} };
+        }
+      });
     } catch (error) {
       logger.error('Erreur getPendingOperations:', error);
       return [];
@@ -750,24 +1200,34 @@ export class OutboxRepository {
   markAsAcked(opIds) {
     const db = getDb();
     try {
-      const transaction = db.transaction(() => {
-        const stmt = db.prepare(`
-          UPDATE sync_operations
-          SET status = 'acked',
-              acked_at = datetime('now'),
-              updated_at = datetime('now')
-          WHERE op_id = ?
-        `);
+      if (!opIds || opIds.length === 0) {
+        logger.warn('⚠️ [OUTBOX] markAsAcked appelée avec 0 opIds');
+        return;
+      }
 
-        for (const opId of opIds) {
-          stmt.run(opId);
-        }
-      });
+      // ✅ Utiliser UPDATE avec WHERE IN au lieu de transaction
+      // (Plus robuste et plus simple)
+      const placeholders = opIds.map(() => '?').join(',');
+      const stmt = db.prepare(`
+        UPDATE sync_operations
+        SET status = 'acked',
+            acked_at = datetime('now'),
+            updated_at = datetime('now')
+        WHERE op_id IN (${placeholders})
+      `);
 
-      transaction();
-      logger.info(`✅ [OUTBOX] ${opIds.length} opération(s) confirmée(s)`);
+      const result = stmt.run(...opIds);
+      
+      if (result.changes === 0) {
+        logger.warn(`⚠️ [OUTBOX] markAsAcked: ${opIds.length} opIds fournis mais 0 rows mises à jour!`);
+        logger.warn(`   opIds: ${opIds.join(', ')}`);
+      } else {
+        logger.info(`✅ [OUTBOX] ${result.changes} opération(s) marquée(s) acked (${opIds.length} demandées)`);
+      }
     } catch (error) {
-      logger.error('Erreur markAsAcked:', error);
+      logger.error('❌ Erreur markAsAcked:', error);
+      logger.error(`   opIds: ${JSON.stringify(opIds)}`);
+      throw error;
     }
   }
 

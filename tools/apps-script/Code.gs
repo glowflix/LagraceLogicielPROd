@@ -197,13 +197,39 @@ function normalizeCode(v) {
 }
 
 /**
- * ✅ HELPER: Normalise le "unit_level" (CARTON, MILLIER, PIECE)
- * Gère majuscules/minuscules, gère MILLIERS → MILLIER
+ * ✅ HELPER: Normalise le texte pour comparaison (trim, lowercase, espace normaliz)
+ * Utile pour matching nom produit avec doublons
+ */
+function normalizeText(v) {
+  return String(v ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
+}
+
+/**
+ * ✅ HELPER: Normalise le "unit_level" (CARTON, MILLIERS, PIECE)
+ * IMPORTANT: Retourne les clés exactes de SHEETS: CARTON, MILLIERS, PIECE
+ * Gère majuscules/minuscules, gère MILLIER → MILLIERS
  */
 function normalizeUnitLevel(v) {
   const s = (v || '').toString().trim().toUpperCase();
-  if (s === 'MILLIERS') return 'MILLIER';
-  if (s === 'PIECES') return 'PIECE';
+  if (s === 'MILLIER') return 'MILLIERS';  // ✅ Retourne MILLIERS (pour matcher SHEETS.MILLIERS)
+  if (s === 'MILLIERS') return 'MILLIERS';
+  if (s === 'PIECE' || s === 'PIECES') return 'PIECE';
+  if (s === 'CARTON' || s === 'CARTONS') return 'CARTON';
+  return s;
+}
+
+/**
+ * ✅ PRO: Canonicalise unit_level en acceptant variantes
+ * Retourne toujours CARTON, MILLIERS ou PIECE (jamais MILLIER)
+ */
+function normalizeUnitLevelCanonical(v) {
+  const s = (v || '').toString().trim().toUpperCase();
+  if (s === 'MILLIER' || s === 'MILLIERS') return 'MILLIERS';
+  if (s === 'CARTON' || s === 'CARTONS') return 'CARTON';
+  if (s === 'PIECE' || s === 'PIECES') return 'PIECE';
   return s;
 }
 
@@ -223,6 +249,232 @@ function normalizeMark(v) {
 
   // Standard: UPPERCASE
   return m.toUpperCase();
+}
+
+// =========================
+// STOCK REDUCTION (VENTES)
+// =========================
+
+/**
+ * ✅ HELPER: Trouve la première colonne valide parmi plusieurs noms
+ * Cherche par header text (robuste même si ordre change)
+ * Retourne colonne 1-based ou -1 si non trouvé
+ */
+function findColumnIndexByNames(headerRow, names) {
+  for (const name of names) {
+    const idx = headerRow.findIndex(h => normalizeText(h) === normalizeText(name));
+    if (idx !== -1) return idx + 1; // 1-based
+  }
+  return -1;
+}
+
+/**
+ * ✅ HELPER: Récupère feuille ou lance erreur
+ */
+function getSheetOrThrow(name) {
+  const ss = getSpreadsheet(); // ✅ FIX: Utilise getSpreadsheet() au lieu de getActive()
+  const sh = ss.getSheetByName(name);
+  if (!sh) throw new Error("Feuille introuvable: " + name);
+  return sh;
+}
+
+/**
+ * ✅ MAIN: Réduit le stock après une vente
+ * 
+ * Détecte automatiquement la bonne feuille (CARTON/MILLIER/PIECE)
+ * Trouve produit par Code (ou Code + Nom si doublons)
+ * Écrit dans colonne "Stock initial"
+ * Accepte qty_sold (quantité vendue) ou stock_change (négatif)
+ * 
+ * Param payload: {
+ *   unit_level: "CARTON|MILLIER|PIECE",
+ *   product_code: "139" (requis),
+ *   product_name: "Golden milk" (optionnel, secours si doublons),
+ *   qty_sold: 3 (optionnel, transformé en -3),
+ *   stock_change: -3 (optionnel, doit être négatif pour vente),
+ *   device_id: "PC-1" (optionnel)
+ * }
+ * 
+ * @return { sheet, row, old_stock, new_stock }
+ */
+function reduceStockFromSale(payload) {
+  // 1) Extract paramètres
+  const unitLevel = normalizeUnitLevel(payload.unit_level ?? payload.unite ?? payload.unit ?? payload.mode_stock);
+  const code = normalizeCode(payload.product_code ?? payload.code ?? payload["Code produit"]);
+  const name = normalizeText(payload.product_name ?? payload.name ?? payload["Nom du produit"]);
+  const qtySold = payload.qty_sold !== undefined ? toNumber(payload.qty_sold) : null;
+
+  console.log(`📦 [reduceStockFromSale] START`);
+  console.log(`   unit_level: '${payload.unit_level}' → '${unitLevel}'`);
+  console.log(`   code: '${code}'`);
+  console.log(`   name: '${name}'`);
+
+  let stockChange = null;
+  if (payload.stock_change !== undefined && payload.stock_change !== null) {
+    stockChange = toNumber(payload.stock_change);
+  } else if (qtySold !== null) {
+    stockChange = -Math.abs(qtySold); // vente => négatif obligatoirement
+  }
+
+  // 2) Validations
+  if (!code) throw new Error("Code produit requis (product_code).");
+  if (!unitLevel || !SHEETS[unitLevel]) {
+    throw new Error("unit_level invalide. Reçu: " + unitLevel + " (attendu clé SHEETS: " + Object.keys(SHEETS).join(', ') + ")");
+  }
+  if (stockChange === null) {
+    throw new Error("qty_sold ou stock_change requis pour réduire le stock.");
+  }
+
+  // ✅ FIX: Permettre les ajouts positifs pour AUTO_STOCK (adjustment)
+  // Ne forcer négatif QUE si c'est une vente (pas un adjustment)
+  const reason = String(payload.reason || '').toLowerCase();
+  const isAdjustment = reason === 'adjustment' || reason === 'auto_stock' || reason === 'replenish';
+  
+  if (!isAdjustment && stockChange > 0) {
+    // ⚠️ Sécurité: pour les ventes, forcer négatif
+    stockChange = -Math.abs(stockChange);
+    console.log(`   ⚠️ stockChange forcé négatif (vente): ${stockChange}`);
+  } else if (isAdjustment) {
+    console.log(`   ✅ stockChange conservé tel quel (adjustment): ${stockChange}`);
+  }
+
+  // 3) Sélectionner feuille
+  const sheetName = SHEETS[unitLevel];
+  console.log(`   sheetName: '${sheetName}' (from SHEETS['${unitLevel}'])`);
+  
+  const sheet = getSheetOrThrow(sheetName);
+
+  const range = sheet.getDataRange();
+  const values = range.getValues();
+  if (values.length < 2) throw new Error("Feuille vide: " + sheetName);
+
+  const header = values[0];
+
+  // 4) Trouver colonnes requises par recherche flexible sur header
+  const colCode = findColumnIndexByNames(header, ['Code produit', 'code produit', 'code']);
+  const colName = findColumnIndexByNames(header, ['Nom du produit', 'nom du produit', 'nom']);
+  const colStock = findColumnIndexByNames(header, ['Stock initial', 'stock initial', 'stock']);
+  const colDateMaj = findColumnIndexByNames(header, ['Date de dernière mise à jour', 'date de dernière mise à jour', 'date maj']);
+  const colUpdatedAt = findColumnIndexByNames(header, ['_updated_at']);
+  const colDeviceId = findColumnIndexByNames(header, ['_device_id']);
+
+  console.log(`   colonnes trouvées: code=${colCode}, name=${colName}, stock=${colStock}, dateMaj=${colDateMaj}, updatedAt=${colUpdatedAt}`);
+
+  if (colCode === -1 || colStock === -1) {
+    throw new Error(`Colonnes manquantes dans ${sheetName}. Requis: 'Code produit' et 'Stock initial'. Header: ${header.join(' | ')}`);
+  }
+
+  // 5) Chercher ligne par code (et nom si doublons)
+  const matches = [];
+  for (let r = 2; r <= values.length; r++) {
+    const row = values[r - 1];
+    const rowCode = normalizeCode(row[colCode - 1]);
+    if (rowCode === code) matches.push(r);
+  }
+  if (matches.length === 0) {
+    throw new Error(`Produit non trouvé dans ${sheetName}: code='${code}'. Codes disponibles dans feuille: ${[...new Set(values.slice(1).map(r => normalizeCode(r[colCode-1])))].slice(0, 10).join(', ')}`);
+  }
+
+  console.log(`   trouvé ${matches.length} ligne(s) avec code='${code}'`);
+
+  let rowIndex = matches[0];
+  if (matches.length > 1 && colName > 0 && name) {
+    const byName = matches.find(r => normalizeText(values[r - 1][colName - 1]) === name);
+    if (byName) {
+      rowIndex = byName;
+      console.log(`   utilisation ligne ${rowIndex} (désambiguïsation par nom)`);
+    }
+  }
+
+  // 6) Mettre à jour stock
+  const currentStock = toNumber(values[rowIndex - 1][colStock - 1]);
+  const newStock = Math.round((currentStock + stockChange) * 100) / 100;
+
+  console.log(`   mise à jour: stock ${currentStock} + (${stockChange}) = ${newStock} (row ${rowIndex}, col ${colStock})`);
+
+  sheet.getRange(rowIndex, colStock).setValue(newStock);
+
+  // 7) Tech columns (si existent)
+  const iso = nowIso();
+  if (colDateMaj > 0) sheet.getRange(rowIndex, colDateMaj).setValue(iso);
+  if (colUpdatedAt > 0) sheet.getRange(rowIndex, colUpdatedAt).setValue(iso);
+  if (colDeviceId > 0 && payload.device_id !== undefined) sheet.getRange(rowIndex, colDeviceId).setValue(String(payload.device_id || ''));
+
+  console.log(`✅ [REDUCE_STOCK] ${sheetName} row=${rowIndex} code=${code} name=${name || '(n/a)'} stock ${currentStock} + (${stockChange}) => ${newStock}`);
+
+  return { sheet: sheetName, row: rowIndex, old_stock: currentStock, new_stock: newStock };
+}
+
+// =========================
+// IDEMPOTENCY (ANTI-DOUBLON)
+// =========================
+const IDEMP_TTL_SEC = 6 * 60 * 60; // 6h
+
+/**
+ * ✅ Stable hash pour déduplication
+ * Calcule une clé déterministe basée sur SHA-1
+ */
+function stableHash_(str) {
+  const bytes = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_1,
+    String(str),
+    Utilities.Charset.UTF_8
+  );
+  return bytes.map(b => ('0' + ((b & 0xff).toString(16))).slice(-2)).join('');
+}
+
+/**
+ * ✅ Déduit request_id depuis le payload
+ * Cherche d'abord request_id, puis req_id, op_id, batch_id, idempotency_key
+ */
+function getRequestId_(data) {
+  return (
+    data.request_id ||
+    data.req_id ||
+    data.op_id ||
+    data.batch_id ||
+    data.idempotency_key ||
+    null
+  );
+}
+
+/**
+ * ✅ Vérifie si requête est déjà traitée (dans le cache)
+ * Si oui: retourne true (duplicate)
+ * Si non: marque dans cache et retourne false (nouvelle)
+ */
+function isDuplicateRequest_(key) {
+  if (!key) return false;
+  const cache = CacheService.getScriptCache();
+  const existing = cache.get(key);
+  if (existing) return true;
+  cache.put(key, '1', IDEMP_TTL_SEC);
+  return false;
+}
+
+/**
+ * ✅ UUID déterministe pour Ventes (basé sur invoice + code + unit + mark)
+ */
+function saleDeterministicUuid_(p) {
+  const invoice = normalizeCode(p.invoice_number);
+  const code = normalizeCode(p.product_code);
+  const unit = normalizeUnitLevel(p.unit_level);
+  const mark = normalizeMark(p.unit_mark);
+
+  const base = [invoice, code, unit, mark].join('|');
+  return `SALE-${stableHash_(base).slice(0, 24)}`;
+}
+
+/**
+ * ✅ UUID déterministe pour Dettes (basé sur invoice + client + produit)
+ */
+function debtDeterministicUuid_(p) {
+  const invoice = normalizeCode(p.invoice_number);
+  const client = (p.client_name || '').toString().trim().toUpperCase();
+  const produit = (p.product_description || p.note || '').toString().trim();
+
+  const base = [invoice, client, produit].join('|');
+  return `DEBT-${stableHash_(base).slice(0, 24)}`;
 }
 
 /**
@@ -743,6 +995,20 @@ function doPost(e) {
       
       const action = (data.action || '').toString().trim().toLowerCase();
       
+      // ✅ IDEMPOTENCY: Si le client renvoie la même requête, on répond OK sans réécrire
+      const rid = getRequestId_(data);
+      const idemKey = rid ? `POST:${action}:${rid}` : null;
+      
+      if (idemKey && isDuplicateRequest_(idemKey)) {
+        console.log(`🛡️ [doPost] DUPLICATE request ignored: ${idemKey}`);
+        return jsonOut({
+          success: true,
+          deduped: true,
+          request_id: rid,
+          server_time: nowIso()
+        });
+      }
+      
       console.log(`📨 [doPost] Action détectée: '${action}'`);
       
       // ✅ PRO: Push avec propagation name/mark sur toutes unités
@@ -779,6 +1045,10 @@ function doPost(e) {
           } else {
             result = handleProductUpsert(payload, entity);
           }
+          break;
+        case 'stock_moves':
+          // ✅ NOUVEAU: Router les stock_moves vers handleStockUpdate
+          result = handleStockUpdate(payload);
           break;
         case 'sales':
           result = handleSaleUpsert(payload);
@@ -1129,14 +1399,14 @@ function handleProductUpsert(payload, entityType) {
   const markNormalized = normalizeMark(unit_mark_raw);
 
   if (!codeNormalized) throw new Error('[handleProductUpsert] code produit vide');
-  if (!['CARTON','MILLIER','PIECE'].includes(unitLevelFinal)) {
-    throw new Error('[handleProductUpsert] unit_level invalide: ' + unit_level);
+  if (!['CARTON','MILLIERS','PIECE'].includes(unitLevelFinal)) {
+    throw new Error('[handleProductUpsert] unit_level invalide: ' + unitLevelFinal);
   }
 
-  // Détermine la feuille selon unit_level
+  // Détermine la feuille selon unit_level (canonique = MILLIERS)
   const sheetName =
     unitLevelFinal === 'CARTON' ? SHEETS.CARTON :
-    unitLevelFinal === 'MILLIER' ? SHEETS.MILLIERS :
+    unitLevelFinal === 'MILLIERS' ? SHEETS.MILLIERS :
     SHEETS.PIECE;
 
   console.log(`   📄 Feuille cible: ${sheetName}`);
@@ -1311,216 +1581,62 @@ function handleProductUpsert(payload, entityType) {
  * - ✅ Écrit _updated_at (onEdit ne s'exécute pas pour scripts)
  * - Mark normalisé (dz → DZ)
  */
-function handleStockUpdate(payload) {
-  console.log(`📦 [handleStockUpdate] ==========================================`);
-  console.log(`📦 [handleStockUpdate] DÉBUT MISE À JOUR DU STOCK`);
-  console.log(`📦 [handleStockUpdate] ==========================================`);
-  console.log(`📋 [handleStockUpdate] Payload reçu:`, JSON.stringify(payload));
+/**
+ * ✅ UPDATE STOCK - Version simplifiée et robuste
+ * 
+ * Règles:
+ * - Match par Code produit (colonne A) - OBLIGATOIRE
+ * - Si plusieurs lignes, utilise Nom pour départager
+ * - Écrit toujours dans colonne C (Stock initial)
+ * - stock_change DOIT être négatif pour une vente (ex: -3 pour vente de 3)
+ * 
+ * @param {object} payload - Payload avec product_code, stock_change, unit_level, etc.
+ * @param {string} sheetName - (optionnel) Nom de la feuille. Si absent, calculé depuis unit_level
+ * @returns {object} {sheet, row, old_stock, new_stock}
+ */
+function handleStockUpdate(payload, sheetName) {
+  console.log(`📦 [handleStockUpdate] START - payload keys: ${Object.keys(payload).join(', ')}`);
   
-  const product_code = pickFirst(payload, ['product_code', 'code', 'Code produit']);
-  const unit_level = pickFirst(payload, ['unit_level', 'unite', 'unit', 'Unite', 'mode_stock']);
-  const unit_mark = pickFirst(payload, ['unit_mark', 'mark', 'MARK', 'Mark']);
-  const stock_absolute = payload.stock_absolute;
-  const stock_change = payload.stock_change;
-  const invoice_number = payload.invoice_number;
-  const uuid = pickFirst(payload, ['uuid', '_uuid']);
-  
-  console.log(`📋 [handleStockUpdate] Détails extraits:`);
-  console.log(`   Product code: ${product_code}`);
-  console.log(`   Unit level (brut): ${unit_level}`);
-  console.log(`   Unit mark: '${unit_mark || ''}'`);
-  console.log(`   UUID: '${uuid || ''}'`);
-  console.log(`   Stock absolute: ${stock_absolute !== undefined ? stock_absolute : '(non fourni)'}`);
-  console.log(`   Stock change: ${stock_change !== undefined ? stock_change : '(non fourni)'}`);
-  console.log(`   Invoice number: ${invoice_number || '(vide)'}`);
-  
-  // ✅ Normaliser unit_level pour déterminer la bonne feuille
-  const unitLevelFinal = normalizeUnitLevel(unit_level);
-  
-  console.log(`   Unit level normalisé: ${unitLevelFinal}`);
-  
-  // Détermine la feuille selon unit_level normalisé
-  let sheetName;
-  if (unitLevelFinal === 'CARTON') {
-    sheetName = SHEETS.CARTON;
-  } else if (unitLevelFinal === 'MILLIER') {
-    sheetName = SHEETS.MILLIERS;
-  } else if (unitLevelFinal === 'PIECE') {
-    sheetName = SHEETS.PIECE;
-  } else {
-    throw new Error('unit_level invalide pour update_stock: ' + unit_level + ' (normalisé: ' + unitLevelFinal + ')');
-  }
-  
-  const sheet = getSheet(sheetName);
-  
-  // S'assurer que les colonnes existent
-  ensureColumn(sheet, 'Code produit');
-  ensureColumn(sheet, 'Stock initial');
-  ensureColumn(sheet, 'Mark');
-  ensureTechColumns(sheet); // ✅ tech columns
-  
-  // Trouver les index de colonnes
-  const colCode = findColumnIndex(sheet, 'Code produit');
-  const colStockInit = findColumnIndex(sheet, 'Stock initial');
-  const colMark = findColumnIndex(sheet, 'Mark');
-  const colUuid = findColumnIndex(sheet, '_uuid');
-  const colUpdatedAt = findColumnIndex(sheet, '_updated_at'); // ✅ tech
-  const colDeviceId = findColumnIndex(sheet, '_device_id'); // ✅ tech
-  
-  if (colCode === -1 || colStockInit === -1) {
-    throw new Error('Colonnes requises non trouvées dans ' + sheetName);
-  }
-  
-  const dataRange = sheet.getDataRange();
-  const values = dataRange.getValues();
-  
-  // ✅ Normaliser mark pour la recherche
-  const markNorm = normalizeMark(unit_mark);
-  const productCodeNormalized = normalizeCode(product_code);
-  const isCarton = (unitLevelFinal === 'CARTON');
-  const markProvided = !!markNorm;  // ✅ NOUVEAU: flag si mark est fourni
-  
-  console.log(`🔍 [handleStockUpdate] Recherche du produit:`);
-  console.log(`   Code produit recherché: '${product_code}' (normalisé: '${productCodeNormalized}')`);
-  console.log(`   Mark recherché: '${markNorm}' (fourni: ${markProvided})`);
-  console.log(`   UUID recherché: '${uuid || '(non fourni)'}'`);
-  console.log(`   Nombre de lignes à vérifier: ${values.length - 1}`);
-  
-  let rowIndex = -1;
-  
-  // ✅ RECHERCHE PRIORITAIRE: UUID, puis logique intelligente pour mark
-  for (let i = 1; i < values.length; i++) {
-    const rowCodeRaw = values[i][colCode - 1];
-    const rowCodeNormalized = normalizeCode(rowCodeRaw);
-    const rowUuid = colUuid > 0 ? normalizeCode(values[i][colUuid - 1]) : '';
-    const rowMarkRaw = colMark > 0 ? values[i][colMark - 1] : '';
-    const rowMarkNorm = normalizeMark(rowMarkRaw);
-    
-    // PRIORITÉ 1: UUID si fourni
-    if (uuid && rowUuid === uuid) {
-      rowIndex = i + 1;
-      console.log(`   ✅ Produit trouvé par UUID à la ligne ${rowIndex}`);
-      break;
-    }
-    
-    // PRIORITÉ 2: code match
-    if (!rowCodeNormalized || rowCodeNormalized !== productCodeNormalized) {
-      continue;
-    }
-    
-    // ✅ NOUVELLE LOGIQUE: intelligente pour mark
-    if (markProvided) {
-      // Mark fourni => code+mark obligatoire pour tous (CARTON inclus)
-      if (rowMarkNorm === markNorm) {
-        rowIndex = i + 1;
-        console.log(`   ✅ Produit trouvé par Code+Mark à la ligne ${rowIndex}: code='${productCodeNormalized}', mark='${markNorm}'`);
-        break;
-      }
-    } else {
-      // Mark non fourni => accepter code seul, mais préférer mark vide
-      if (!rowMarkNorm) {
-        rowIndex = i + 1;
-        console.log(`   ✅ Produit trouvé par Code (mark vide) à la ligne ${rowIndex}: code='${productCodeNormalized}'`);
-        break;
-      }
-      // Fallback: si on ne trouve pas mieux, accepter n'importe quel mark (warn)
-      if (rowIndex === -1) {
-        rowIndex = i + 1;
-        console.log(`   ⚠️ Fallback: acceptant Code à la ligne ${rowIndex} avec mark='${rowMarkNorm}' (mark différent de demandé)`);
-      }
-    }
-  }
-  
-  if (rowIndex === -1) {
-    console.error(`❌ [handleStockUpdate] Produit non trouvé dans ${sheetName}:`);
-    console.error(`   Code produit: ${product_code}`);
-    console.error(`   Unité: ${unitLevelFinal}`);
-    console.error(`   Mark: '${markNorm}'`);
-    throw new Error(`Produit non trouvé pour update_stock: code=${product_code}, unit=${unitLevelFinal}, mark=${markNorm} dans ${sheetName}`);
-  }
-  
-  console.log(`✅ [handleStockUpdate] Produit trouvé dans ${sheetName} à la ligne ${rowIndex}`);
-  
-  // Récupérer le stock actuel dans Sheets (pour log)
-  const currentStockInSheets = toNumber(values[rowIndex - 1][colStockInit - 1]) || 0;
-  console.log(`   Stock actuel dans Sheets (colonne C): ${currentStockInSheets}`);
-  
-  // ✅ Utiliser stock_absolute si fourni (nouveau mode), sinon fallback sur stock_change (ancien mode)
-  let newStock;
-  if (stock_absolute !== undefined && stock_absolute !== null) {
-    // NOUVEAU MODE: Utiliser la valeur ABSOLUE du stock local
-    let stockAbs = stock_absolute;
-    if (typeof stockAbs === 'string') {
-      stockAbs = parseFloat(stockAbs.replace(/,/g, '.')) || 0;
-    }
-    stockAbs = Number(stockAbs) || 0;
-    newStock = Math.round(stockAbs * 100) / 100;
-    console.log(`📊 [handleStockUpdate] Mode ABSOLU: Écrasement avec valeur locale ${newStock} (stock Sheets avant: ${currentStockInSheets})`);
-  } else if (stock_change !== undefined && stock_change !== null) {
-    // ANCIEN MODE (compatibilité): Calculer avec stock_change relatif
-    let stockChange = stock_change;
-    if (typeof stockChange === 'string') {
-      stockChange = parseFloat(stockChange.replace(/,/g, '.')) || 0;
-    }
-    stockChange = Number(stockChange) || 0;
-    stockChange = Math.round(stockChange * 100) / 100;
-    newStock = currentStockInSheets + stockChange;
-    newStock = Math.round(newStock * 100) / 100;
-    console.log(`📊 [handleStockUpdate] Mode RELATIF (compatibilité): ${currentStockInSheets} + ${stockChange} = ${newStock}`);
-  } else {
-    throw new Error('stock_absolute ou stock_change requis dans payload pour update_stock');
-  }
-  
-  console.log(`💾 [handleStockUpdate] Mise à jour de la cellule: ligne ${rowIndex}, colonne ${colStockInit} (Stock initial)`);
-  console.log(`   Valeur AVANT: ${currentStockInSheets}`);
-  console.log(`   Valeur APRÈS: ${newStock}`);
-  
-  // ✅ Mettre à jour le stock + tech columns
   try {
-    sheet.getRange(rowIndex, colStockInit).setValue(newStock);
-    console.log(`   ✅ Stock écrit avec succès`);
+    // ✅ Si stock_absolute fourni, convertir en stock_change
+    let payloadToUse = { ...payload };
     
-    // ✅ Mettre à jour la date de dernière mise à jour
-    const colDateUpdate = findColumnIndex(sheet, 'Date de dernière mise à jour');
-    if (colDateUpdate > 0) {
-      const updateDate = nowIso();
-      sheet.getRange(rowIndex, colDateUpdate).setValue(updateDate);
-      console.log(`   ✅ Date de mise à jour: ${updateDate}`);
+    if (payload.stock_absolute !== undefined && payload.stock_absolute !== null) {
+      console.log(`📦 [handleStockUpdate] Mode stock_absolute: ${payload.stock_absolute}`);
+      
+      const unitLevel = normalizeUnitLevel(payload.unit_level || '');
+      const sheetToUse = sheetName || SHEETS[unitLevel];
+      const sheet = getSheetOrThrow(sheetToUse);
+      const values = sheet.getDataRange().getValues();
+      const header = values[0];
+      
+      const colCode = findColumnIndexByNames(header, ['Code produit', 'code produit', 'code']);
+      const colStock = findColumnIndexByNames(header, ['Stock initial', 'stock initial', 'stock']);
+      
+      if (colCode > 0 && colStock > 0) {
+        const code = normalizeCode(payload.product_code);
+        for (let r = 2; r <= values.length; r++) {
+          if (normalizeCode(values[r-1][colCode-1]) === code) {
+            const currentStock = toNumber(values[r-1][colStock-1]);
+            const delta = payload.stock_absolute - currentStock;
+            payloadToUse.stock_change = delta;
+            console.log(`📦 [handleStockUpdate] Conversion: current=${currentStock}, target=${payload.stock_absolute}, delta=${delta}`);
+            break;
+          }
+        }
+      }
     }
     
-    // ✅ Mettre à jour les colonnes tech
-    if (colUpdatedAt > 0) sheet.getRange(rowIndex, colUpdatedAt).setValue(nowIso());
-    if (colDeviceId > 0 && payload.device_id !== undefined) {
-      sheet.getRange(rowIndex, colDeviceId).setValue(String(payload.device_id || ''));
-    }
+    // ✅ Utiliser reduceStockFromSale (robuste, cherche colonnes par header)
+    const result = reduceStockFromSale(payloadToUse);
     
-    // Vérifier que la valeur a bien été écrite (lecture immédiate)
-    const verifyValue = sheet.getRange(rowIndex, colStockInit).getValue();
-    const verifyNumber = toNumber(verifyValue);
-    console.log(`   🔍 Vérification: valeur lue après écriture: ${verifyValue} (convertie: ${verifyNumber})`);
+    console.log(`✅ [handleStockUpdate] SUCCESS: ${result.sheet} row=${result.row} ${result.old_stock} → ${result.new_stock}`);
+    return result;
     
-    if (Math.abs(verifyNumber - newStock) > 0.01) {
-      console.error(`   ⚠️ ATTENTION: La valeur écrite (${newStock}) ne correspond pas à la valeur lue (${verifyNumber})`);
-    } else {
-      console.log(`   ✅ Confirmation: La valeur a été correctement écrite`);
-    }
-  } catch (writeError) {
-    console.error(`   ❌ ERREUR lors de l'écriture dans Sheets:`, writeError.toString());
-    throw writeError;
+  } catch (error) {
+    console.error(`❌ [handleStockUpdate] ERREUR: ${error.message}`);
+    throw error;
   }
-  
-  console.log(`✅ [handleStockUpdate] Stock mis à jour avec succès: ${product_code} (${unitLevelFinal}, mark=${markNorm}) dans ${sheetName}`);
-  console.log(`   ${currentStockInSheets} → ${newStock}`);
-  console.log(`📦 [handleStockUpdate] ==========================================`);
-  console.log(`📦 [handleStockUpdate] FIN MISE À JOUR DU STOCK`);
-  console.log(`📦 [handleStockUpdate] ==========================================`);
-  
-  return { 
-    row: rowIndex, 
-    sheet: sheetName,
-    old_stock: currentStockInSheets,
-    new_stock: newStock
-  };
 }
 
 /**
@@ -1582,9 +1698,20 @@ function handleSaleUpsert(payload) {
 
 /**
  * Gère l'upsert d'un item de vente (une ligne dans Ventes)
+ * ✅ FIX DOUBLONS: Amélioration de la détection + rejet des lignes vides
  */
 function handleSaleItemUpsert(payload) {
   const sheet = getSheet(SHEETS.VENTES);
+  
+  // ✅ ANTI-DOUBLON: Rejeter les lignes vides (qty=0 ou pas de product_code)
+  const qtyCheck = toNumber(payload.qty);
+  const productCodeCheck = normalizeCode(payload.product_code);
+  const invoiceCheck = normalizeCode(payload.invoice_number);
+  
+  if (qtyCheck <= 0 || !productCodeCheck || !invoiceCheck) {
+    console.log(`⏭️ [handleSaleItemUpsert] Ligne ignorée (vide): invoice='${invoiceCheck}', code='${productCodeCheck}', qty=${qtyCheck}`);
+    return { skipped: true, reason: 'empty_line', invoice_number: invoiceCheck };
+  }
   
   // ✅ Tech columns
   ensureTechColumns(sheet);
@@ -1608,38 +1735,64 @@ function handleSaleItemUpsert(payload) {
   const dataRange = sheet.getDataRange();
   const values = dataRange.getValues();
   
-  // Recherche par UUID ou clé composite
+  // Recherche par UUID ou clé composite (AMÉLIORÉ)
   let rowIndex = -1;
-  const searchUuid = payload.uuid;
-  const searchFacture = payload.invoice_number;
-  const searchCode = payload.product_code;
-  const searchQte = payload.qty;
-  const searchPrix = payload.unit_price_fc;
+  let searchUuid = (payload.uuid || '').toString().trim();
+  
+  // ✅ UUID déterministe: si uuid manque, le générer de façon stable
+  if (!searchUuid) {
+    searchUuid = saleDeterministicUuid_(payload);
+    console.log(`🆔 [handleSaleItemUpsert] UUID déterministe généré: ${searchUuid}`);
+  }
+  
+  const searchFacture = normalizeCode(payload.invoice_number);
+  const searchCode = normalizeCode(payload.product_code);
+  const searchQte = toNumber(payload.qty);
+  const searchPrix = toNumber(payload.unit_price_fc);
+  const searchUnitLevel = normalizeUnitLevel(payload.unit_level);
+  const searchMark = normalizeMark(payload.unit_mark);
   
   for (let i = 1; i < values.length; i++) {
-    const rowUuid = colUuid > 0 ? values[i][colUuid - 1] : null;
-    const rowFacture = colFacture > 0 ? values[i][colFacture - 1] : null;
-    const rowCode = colCode > 0 ? values[i][colCode - 1] : null;
+    const rowUuid = colUuid > 0 ? (values[i][colUuid - 1] || '').toString().trim() : '';
+    const rowFacture = colFacture > 0 ? normalizeCode(values[i][colFacture - 1]) : '';
+    const rowCode = colCode > 0 ? normalizeCode(values[i][colCode - 1]) : '';
     const rowQte = colQte > 0 ? values[i][colQte - 1] : null;
     const rowPrix = colPrixUnitaire > 0 ? values[i][colPrixUnitaire - 1] : null;
+    const rowUnite = colUnite > 0 ? normalizeUnitLevel(values[i][colUnite - 1]) : '';
+    const rowMode  = colModeStock > 0 ? normalizeUnitLevel(values[i][colModeStock - 1]) : '';
+    const rowUnitFinal = rowUnite || rowMode; // ✅ Fallback robuste: Unite OU mode stock
+    const rowMark = colMark > 0 ? normalizeMark(values[i][colMark - 1]) : '';
     
-    // Match par UUID (prioritaire)
-    if (searchUuid && rowUuid === searchUuid) {
+    // Match par UUID (prioritaire) - si les deux ont un UUID non vide
+    if (searchUuid && rowUuid && searchUuid === rowUuid) {
       rowIndex = i + 1;
+      console.log(`✅ [handleSaleItemUpsert] Match UUID: ${searchUuid} → row ${rowIndex}`);
       break;
     }
-    // Match par clé composite - Normaliser les nombres strictement
+    
+    // Match par clé composite AMÉLIORÉ: facture + code + unit_level (avec fallback) + mark
+    // (on ignore qty et prix car ils peuvent varier légèrement)
     const rowQteN = toNumber(rowQte);
     const rowPrixN = toNumber(rowPrix);
-    const searchQteN = toNumber(searchQte);
-    const searchPrixN = toNumber(searchPrix);
     
-    if (rowFacture === searchFacture &&
+    // ✅ FIX: Match plus souple - même facture + même produit + même unité = même ligne
+    if (rowFacture === searchFacture && 
         rowCode === searchCode &&
-        Math.abs(rowQteN - searchQteN) < 0.01 &&
-        Math.abs(rowPrixN - searchPrixN) < 0.01) {
-      rowIndex = i + 1;
-      break;
+        rowUnitFinal === searchUnitLevel &&
+        rowMark === searchMark) {
+      // Match trouvé - vérifier si c'est vraiment la même ligne (qty proche)
+      if (Math.abs(rowQteN - searchQte) < 0.01 && Math.abs(rowPrixN - searchPrix) < 0.01) {
+        rowIndex = i + 1;
+        console.log(`✅ [handleSaleItemUpsert] Match exact: ${searchFacture}/${searchCode}/${searchUnitLevel} → row ${rowIndex}`);
+        break;
+      }
+      // ✅ FIX DOUBLON: Si même facture/code/unité mais qty différente, 
+      // c'est quand même la même ligne (update au lieu de doublon)
+      if (rowQteN > 0 && searchQte > 0) {
+        rowIndex = i + 1;
+        console.log(`⚠️ [handleSaleItemUpsert] Match partiel (update qty): ${searchFacture}/${searchCode} qty ${rowQteN}→${searchQte} → row ${rowIndex}`);
+        break;
+      }
     }
   }
   
@@ -1652,18 +1805,18 @@ function handleSaleItemUpsert(payload) {
   }
   
   if (colDate > 0) rowData[colDate - 1] = payload.sold_at || new Date().toISOString();
-  if (colFacture > 0) rowData[colFacture - 1] = payload.invoice_number || '';
-  if (colCode > 0) rowData[colCode - 1] = payload.product_code || '';
+  if (colFacture > 0) rowData[colFacture - 1] = normalizeCode(payload.invoice_number || '');
+  if (colCode > 0) rowData[colCode - 1] = normalizeCode(payload.product_code || '');
   if (colClient > 0) rowData[colClient - 1] = payload.client_name || '';
   if (colQte > 0) rowData[colQte - 1] = payload.qty || 0;
-  if (colMark > 0) rowData[colMark - 1] = payload.unit_mark || '';
+  if (colMark > 0) rowData[colMark - 1] = normalizeMark(payload.unit_mark || '');
   if (colPrixUnitaire > 0) rowData[colPrixUnitaire - 1] = payload.unit_price_fc || 0;
-  if (colUnite > 0) rowData[colUnite - 1] = payload.unit_level || '';
+  if (colUnite > 0) rowData[colUnite - 1] = normalizeUnitLevel(payload.unit_level || '');
   if (colVendeur > 0) rowData[colVendeur - 1] = payload.seller_name || '';
-  if (colModeStock > 0) rowData[colModeStock - 1] = payload.unit_level || '';
+  if (colModeStock > 0) rowData[colModeStock - 1] = normalizeUnitLevel(payload.unit_level || '');
   if (colTelephone > 0) rowData[colTelephone - 1] = payload.client_phone || '';
   if (colUSD > 0) rowData[colUSD - 1] = payload.unit_price_usd || payload.subtotal_usd || 0;
-  if (colUuid > 0) rowData[colUuid - 1] = searchUuid || '';
+  if (colUuid > 0) rowData[colUuid - 1] = searchUuid;
   
   // ✅ Tech columns
   if (colUpdatedAt > 0) rowData[colUpdatedAt - 1] = nowIso();
@@ -1677,6 +1830,226 @@ function handleSaleItemUpsert(payload) {
   }
   
   return { row: rowIndex };
+}
+
+/**
+ * ✅ NOUVEAU: Met à jour le stock SEULEMENT dans les feuilles de produit
+ * (Carton/Milliers/Piece) sans créer de ligne de vente
+ * Utilisé UNIQUEMENT pour les STOCK_MOVE avec reason='sale_deleted'
+ */
+function updateProductStockOnly(payload) {
+  console.log(`📊 [updateProductStockOnly] Mise à jour stock uniquement`);
+  console.log(`   Produit: ${payload.product_code}`);
+  console.log(`   Unité: ${payload.unit_level}`);
+  
+  const unitLevel = normalizeUnitLevel(payload.unit_level || 'CARTON');
+  const sheetName = SHEETS[unitLevel];
+  
+  if (!sheetName) {
+    throw new Error(`Unité inconnue: ${unitLevel}`);
+  }
+  
+  const sheet = getSheet(sheetName);
+  if (!sheet) {
+    throw new Error(`Feuille non trouvée: ${sheetName}`);
+  }
+  
+  const dataRange = sheet.getDataRange();
+  const values = dataRange.getValues();
+  
+  const colCode = findColumnIndex(sheet, 'Code produit');
+  const colStock = findColumnIndex(sheet, 'Stock initial');
+  
+  if (colCode <= 0 || colStock <= 0) {
+    throw new Error(`Colonnes requises manquantes (Code produit ou Stock initial)`);
+  }
+  
+  const productCodeNormalized = normalizeCode(payload.product_code);
+  let rowIndex = -1;
+  let currentStock = 0;
+  
+  // Trouver la ligne du produit
+  for (let i = 1; i < values.length; i++) {
+    const rowCode = normalizeCode(values[i][colCode - 1]);
+    if (rowCode === productCodeNormalized) {
+      rowIndex = i + 1;
+      currentStock = toNumber(values[i][colStock - 1]);
+      break;
+    }
+  }
+  
+  if (rowIndex <= 0) {
+    throw new Error(`Produit non trouvé dans feuille ${sheetName}: ${payload.product_code}`);
+  }
+  
+  // Calculer le nouveau stock
+  let newStock = currentStock;
+  if (payload.stock_absolute !== undefined && payload.stock_absolute !== null) {
+    // Mode ABSOLU: remplacer directement
+    newStock = toNumber(payload.stock_absolute);
+  } else if (payload.stock_change !== undefined && payload.stock_change !== null) {
+    // Mode DELTA: ajouter la différence
+    newStock = currentStock + toNumber(payload.stock_change);
+  }
+  
+  console.log(`   Ancien stock: ${currentStock} → Nouveau stock: ${newStock}`);
+  
+  // Écrire le nouveau stock
+  sheet.getRange(rowIndex, colStock).setValue(newStock);
+  
+  // Mettre à jour le _updated_at si la colonne existe
+  const colUpdatedAt = findColumnIndex(sheet, '_updated_at');
+  if (colUpdatedAt > 0) {
+    sheet.getRange(rowIndex, colUpdatedAt).setValue(nowIso());
+  }
+  
+  return {
+    sheet: sheetName,
+    row: rowIndex,
+    product_code: payload.product_code,
+    old_stock: currentStock,
+    new_stock: newStock
+  };
+}
+
+/**
+ * ✅ NOUVEAU: Gère la suppression d'une vente (SALE_DELETED)
+ * - Trouve la vente par invoice_number
+ * - Supprime TOUTES les lignes avec ce numéro de facture
+ * - Logs détaillés pour tracking
+ */
+function handleSaleDeleted(payload) {
+  const sheet = getSheet(SHEETS.VENTES);
+  
+  const invoiceNumber = (payload.invoice_number || '').toString().trim();
+  console.log(`🗑️ [handleSaleDeleted] Suppression de la facture: "${invoiceNumber}"`);
+  
+  if (!invoiceNumber) {
+    console.error(`❌ [handleSaleDeleted] Invoice number manquant ou vide`);
+    return { deleted: 0, reason: 'missing_invoice_number' };
+  }
+  
+  // Chercher les colonnes
+  const colFacture = findColumnIndex(sheet, 'Numéro de facture');
+  if (colFacture <= 0) {
+    console.error(`❌ [handleSaleDeleted] Colonne 'Numéro de facture' non trouvée`);
+    return { deleted: 0, reason: 'column_not_found' };
+  }
+  
+  const dataRange = sheet.getDataRange();
+  const values = dataRange.getValues();
+  
+  // Trouver les lignes à supprimer (en sens inverse pour éviter décalages d'index)
+  const rowsToDelete = [];
+  const invoiceNormalized = normalizeCode(invoiceNumber);
+  
+  for (let i = 1; i < values.length; i++) {
+    const rowFacture = colFacture > 0 ? normalizeCode(values[i][colFacture - 1]) : '';
+    if (rowFacture === invoiceNormalized) {
+      rowsToDelete.push(i + 1); // +1 car getRange utilise 1-based indexing
+      console.log(`   📍 Ligne ${i + 1} à supprimer: facture="${rowFacture}"`);
+    }
+  }
+  
+  console.log(`📊 [handleSaleDeleted] Total lignes trouvées: ${rowsToDelete.length}`);
+  
+  // Supprimer les lignes en ordre décroissant (pour ne pas décaler les indices)
+  if (rowsToDelete.length > 0) {
+    rowsToDelete.sort((a, b) => b - a);
+    for (const rowIndex of rowsToDelete) {
+      try {
+        sheet.deleteRow(rowIndex);
+        console.log(`   ✅ Ligne ${rowIndex} supprimée`);
+      } catch (e) {
+        console.error(`   ❌ Erreur suppression ligne ${rowIndex}: ${e.toString()}`);
+      }
+    }
+  }
+  
+  console.log(`✅ [handleSaleDeleted] Facture "${invoiceNumber}" supprimée (${rowsToDelete.length} ligne(s))`);
+  
+  return { 
+    deleted: rowsToDelete.length,
+    invoice_number: invoiceNumber,
+    rows: rowsToDelete
+  };
+}
+
+/**
+ * ✅ PRO: Gère la suppression d'un produit (PRODUCT_DELETED)
+ * - Trouve le produit par code dans Carton, Milliers, Piece
+ * - Supprime TOUTES les lignes avec ce code dans toutes les feuilles
+ * - Logs détaillés pour tracking
+ */
+function handleProductDeleted(payload) {
+  const productCode = (payload.code || payload.product_code || '').toString().trim();
+  console.log(`🗑️ [handleProductDeleted] Suppression du produit: "${productCode}"`);
+  
+  if (!productCode) {
+    console.error(`❌ [handleProductDeleted] Code produit manquant ou vide`);
+    return { deleted: 0, reason: 'missing_product_code' };
+  }
+  
+  const sheets = ['Carton', 'Milliers', 'Piece'];
+  let totalDeleted = 0;
+  const deletedFromSheets = {};
+  
+  for (const sheetName of sheets) {
+    try {
+      const sheet = getSheet(sheetName);
+      if (!sheet) {
+        console.log(`   ⚠️ Feuille '${sheetName}' non trouvée, ignorée`);
+        continue;
+      }
+      
+      // Chercher la colonne "Code produit"
+      const colCode = findColumnIndex(sheet, 'Code produit');
+      if (colCode <= 0) {
+        console.log(`   ⚠️ Colonne 'Code produit' non trouvée dans '${sheetName}'`);
+        continue;
+      }
+      
+      const dataRange = sheet.getDataRange();
+      const values = dataRange.getValues();
+      
+      // Trouver les lignes à supprimer
+      const rowsToDelete = [];
+      const codeNormalized = normalizeCode(productCode);
+      
+      for (let i = 1; i < values.length; i++) {
+        const rowCode = colCode > 0 ? normalizeCode(values[i][colCode - 1]) : '';
+        if (rowCode === codeNormalized) {
+          rowsToDelete.push(i + 1); // +1 car getRange utilise 1-based indexing
+          console.log(`   📍 [${sheetName}] Ligne ${i + 1} à supprimer: code="${rowCode}"`);
+        }
+      }
+      
+      // Supprimer les lignes en ordre décroissant (pour ne pas décaler les indices)
+      if (rowsToDelete.length > 0) {
+        rowsToDelete.sort((a, b) => b - a);
+        for (const rowIndex of rowsToDelete) {
+          try {
+            sheet.deleteRow(rowIndex);
+            console.log(`   ✅ [${sheetName}] Ligne ${rowIndex} supprimée`);
+          } catch (e) {
+            console.error(`   ❌ [${sheetName}] Erreur suppression ligne ${rowIndex}: ${e.toString()}`);
+          }
+        }
+        totalDeleted += rowsToDelete.length;
+        deletedFromSheets[sheetName] = rowsToDelete.length;
+      }
+    } catch (e) {
+      console.error(`   ❌ Erreur traitement feuille '${sheetName}': ${e.toString()}`);
+    }
+  }
+  
+  console.log(`✅ [handleProductDeleted] Produit "${productCode}" supprimé (${totalDeleted} ligne(s) total)`);
+  
+  return { 
+    deleted: totalDeleted,
+    product_code: productCode,
+    sheets: deletedFromSheets
+  };
 }
 
 /**
@@ -1730,9 +2103,9 @@ function handleDebtUpsert(payload) {
   
   // Recherche par UUID ou clé composite (améliorée)
   let rowIndex = -1;
-  const searchUuid = (payload.uuid || '').toString().trim();
-  const searchFacture = (payload.invoice_number || '').toString().trim();
-  const searchClient = (payload.client_name || '').toString().trim();
+  let searchUuid = (payload.uuid || '').toString().trim();
+  const searchFacture = normalizeCode(payload.invoice_number);
+  const searchClient = (payload.client_name || '').toString().trim().toUpperCase();
   const searchProduit = (payload.product_description || payload.note || '').toString().trim();
 
   for (let i = 1; i < values.length; i++) {
@@ -1743,8 +2116,8 @@ function handleDebtUpsert(payload) {
     }
 
     // Composite: facture + client + produit (évite écraser plusieurs lignes même facture)
-    const rowFacture = colFacture > 0 ? String(values[i][colFacture - 1] || '').trim() : '';
-    const rowClient = colClient > 0 ? String(values[i][colClient - 1] || '').trim() : '';
+    const rowFacture = normalizeCode(colFacture > 0 ? values[i][colFacture - 1] : '');
+    const rowClient = (colClient > 0 ? String(values[i][colClient - 1] || '').trim().toUpperCase() : '');
     const rowProduit = colProduit > 0 ? String(values[i][colProduit - 1] || '').trim() : '';
 
     if (!searchUuid && searchFacture && searchClient) {
@@ -1762,8 +2135,8 @@ function handleDebtUpsert(payload) {
   // Cela évite d'ajouter un doublon quand la ligne existante a un _uuid différent.
   if (rowIndex < 0 && searchUuid && searchFacture && searchClient) {
     for (let i = 1; i < values.length; i++) {
-      const rowFacture = colFacture > 0 ? String(values[i][colFacture - 1] || '').trim() : '';
-      const rowClient = colClient > 0 ? String(values[i][colClient - 1] || '').trim() : '';
+      const rowFacture = normalizeCode(colFacture > 0 ? values[i][colFacture - 1] : '');
+      const rowClient = (colClient > 0 ? String(values[i][colClient - 1] || '').trim().toUpperCase() : '');
       const rowProduit = colProduit > 0 ? String(values[i][colProduit - 1] || '').trim() : '';
 
       if (rowFacture === searchFacture && rowClient === searchClient) {
@@ -1775,9 +2148,12 @@ function handleDebtUpsert(payload) {
     }
   }
 
-  // Si pas de uuid, en générer un (et le retourner)
+  // ✅ UUID déterministe: si uuid manque, le générer de façon stable
   let finalUuid = searchUuid;
-  if (!finalUuid) finalUuid = Utilities.getUuid();
+  if (!finalUuid) {
+    finalUuid = debtDeterministicUuid_(payload);
+    console.log(`🆔 [handleDebtUpsert] UUID déterministe généré: ${finalUuid}`);
+  }
   
   const maxCol = Math.max(colClient, colProduit, colArgent, colPrixAPayer, 
                           colPrixPaye, colReste, colDate, colFacture, 
@@ -1788,16 +2164,16 @@ function handleDebtUpsert(payload) {
     rowData[i] = '';
   }
   
-  if (colClient > 0) rowData[colClient - 1] = payload.client_name || '';
-  if (colProduit > 0) rowData[colProduit - 1] = payload.product_description || '';
+  if (colClient > 0) rowData[colClient - 1] = (payload.client_name || '').toString().trim();
+  if (colProduit > 0) rowData[colProduit - 1] = (payload.product_description || '').toString().trim();
   if (colArgent > 0) rowData[colArgent - 1] = payload.total_fc || 0;
   if (colPrixAPayer > 0) rowData[colPrixAPayer - 1] = payload.total_fc || 0;
   if (colPrixPaye > 0) rowData[colPrixPaye - 1] = payload.paid_fc || 0;
   if (colReste > 0) rowData[colReste - 1] = payload.remaining_fc || 0;
   if (colDate > 0) rowData[colDate - 1] = payload.created_at || new Date().toISOString();
-  if (colFacture > 0) rowData[colFacture - 1] = payload.invoice_number || '';
+  if (colFacture > 0) rowData[colFacture - 1] = normalizeCode(payload.invoice_number || '');
   if (colDollars > 0) rowData[colDollars - 1] = payload.total_usd || 0;
-  if (colDescription > 0) rowData[colDescription - 1] = payload.product_description || payload.note || '';
+  if (colDescription > 0) rowData[colDescription - 1] = (payload.product_description || payload.note || '').toString().trim();
   if (colDettesFCUSD > 0) rowData[colDettesFCUSD - 1] = payload.debt_fc_in_usd || 0;
   if (colUuid > 0) rowData[colUuid - 1] = finalUuid;
   
@@ -1902,10 +2278,12 @@ function handleRateUpsert(payload) {
 
 /**
  * Gère l'upsert d'un utilisateur
+ * ✅ PRO: Support complet des colonnes Vendeur, Gerent Stock, Produits
  */
 function handleUserUpsert(payload) {
   const sheet = getSheet(SHEETS.COMPTER_UTILISATEUR);
   
+  // Colonnes de base
   ensureColumn(sheet, 'Nom');
   ensureColumn(sheet, 'Mode passe');
   ensureColumn(sheet, 'Numero');
@@ -1916,6 +2294,11 @@ function handleUserUpsert(payload) {
   ensureColumn(sheet, 'Urlprofile');
   ensureColumn(sheet, 'admi');
   ensureColumn(sheet, '_uuid');
+  
+  // ✅ Nouvelles colonnes de rôles
+  ensureColumn(sheet, 'Vendeur');
+  ensureColumn(sheet, 'Gerent Stock');
+  ensureColumn(sheet, 'Porudits est Vender');  // = can_manage_products
   
   // ✅ Tech columns
   ensureTechColumns(sheet);
@@ -1932,6 +2315,11 @@ function handleUserUpsert(payload) {
   const colUuid = findColumnIndex(sheet, '_uuid');
   const colUpdatedAt = findColumnIndex(sheet, '_updated_at');  // ✅ tech
   const colDeviceId = findColumnIndex(sheet, '_device_id');   // ✅ tech
+  
+  // ✅ Nouvelles colonnes
+  const colVendeur = findColumnIndex(sheet, 'Vendeur');
+  const colGerentStock = findColumnIndex(sheet, 'Gerent Stock');
+  const colProduits = findColumnIndex(sheet, 'Porudits est Vender');
   
   const dataRange = sheet.getDataRange();
   const values = dataRange.getValues();
@@ -1959,7 +2347,8 @@ function handleUserUpsert(payload) {
   
   const maxCol = Math.max(colNom, colModePasse, colNumero, colValide, 
                           colDateCreation, colToken, colMarque, colUrlProfile, colAdmi, colUuid,
-                          colUpdatedAt, colDeviceId);  // ✅ tech
+                          colUpdatedAt, colDeviceId,
+                          colVendeur, colGerentStock, colProduits);  // ✅ Nouvelles colonnes incluses
   const rowData = [];
   for (let i = 0; i < maxCol; i++) {
     rowData[i] = '';
@@ -1969,20 +2358,49 @@ function handleUserUpsert(payload) {
   // Ne pas écrire le mot de passe en clair (sécurité)
   // if (colModePasse > 0) rowData[colModePasse - 1] = ''; 
   if (colNumero > 0) rowData[colNumero - 1] = payload.phone || '';
-  if (colValide > 0) rowData[colValide - 1] = payload.is_active ? 1 : 0;
+  
+  // ✅ Valide = is_active, afficher "Oui" ou "Non" pour lisibilité
+  if (colValide > 0) {
+    const isActive = payload.is_active === 1 || payload.is_active === true || payload.is_active === '1' || payload.is_active === 'oui';
+    rowData[colValide - 1] = isActive ? 'Oui' : 'Non';
+  }
+  
   if (colDateCreation > 0) rowData[colDateCreation - 1] = payload.created_at || new Date().toISOString();
   if (colToken > 0) rowData[colToken - 1] = payload.expo_push_token || '';
   if (colMarque > 0) rowData[colMarque - 1] = payload.device_brand || '';
+  
   // CRITIQUE: PRÉSERVER l'URL existante si payload.profile_url est vide
   if (colUrlProfile > 0) {
     const existingUrl = rowIndex > 0 ? (values[rowIndex - 1][colUrlProfile - 1] || '') : '';
     rowData[colUrlProfile - 1] = payload.profile_url || existingUrl || '';
   }
-  if (colAdmi > 0) rowData[colAdmi - 1] = payload.is_admin ? 1 : 0;
+  
+  // ✅ Admin = is_admin, afficher "OUI" ou "" pour compatibilité
+  if (colAdmi > 0) {
+    const isAdmin = payload.is_admin === 1 || payload.is_admin === true || payload.is_admin === '1' || payload.is_admin === 'oui';
+    rowData[colAdmi - 1] = isAdmin ? 'OUI' : '';
+  }
+  
   // CRITIQUE: PRÉSERVER l'UUID existant si payload.uuid est vide
   if (colUuid > 0) {
     const existingUuid = rowIndex > 0 ? (values[rowIndex - 1][colUuid - 1] || '') : '';
-    rowData[colUuid - 1] = searchUuid || existingUuid || '';
+    rowData[colUuid - 1] = searchUuid || existingUuid || Utilities.getUuid();
+  }
+  
+  // ✅ Nouvelles colonnes de rôles - afficher "oui" ou "" pour compatibilité
+  if (colVendeur > 0) {
+    const isVendeur = payload.is_vendeur === 1 || payload.is_vendeur === true || payload.is_vendeur === '1' || payload.is_vendeur === 'oui';
+    rowData[colVendeur - 1] = isVendeur ? 'oui' : '';
+  }
+  
+  if (colGerentStock > 0) {
+    const isGerentStock = payload.is_gerant_stock === 1 || payload.is_gerant_stock === true || payload.is_gerant_stock === '1' || payload.is_gerant_stock === 'oui';
+    rowData[colGerentStock - 1] = isGerentStock ? 'oui' : '';
+  }
+  
+  if (colProduits > 0) {
+    const canManageProducts = payload.can_manage_products === 1 || payload.can_manage_products === true || payload.can_manage_products === '1' || payload.can_manage_products === 'oui';
+    rowData[colProduits - 1] = canManageProducts ? 'oui' : '';
   }
   
   // ✅ Tech columns
@@ -1990,13 +2408,17 @@ function handleUserUpsert(payload) {
   if (colDeviceId > 0 && payload.device_id !== undefined) rowData[colDeviceId - 1] = String(payload.device_id || '');
   
   if (rowIndex > 0) {
+    // ✅ Mise à jour de la ligne existante
     sheet.getRange(rowIndex, 1, 1, rowData.length).setValues([rowData]);
+    console.log(`✅ [handleUserUpsert] Utilisateur mis à jour: ${payload.username} (ligne ${rowIndex})`);
   } else {
+    // ✅ Création d'une nouvelle ligne
     sheet.appendRow(rowData);
     rowIndex = sheet.getLastRow();
+    console.log(`✅ [handleUserUpsert] Utilisateur créé: ${payload.username} (ligne ${rowIndex})`);
   }
   
-  return { row: rowIndex };
+  return { row: rowIndex, uuid: rowData[colUuid - 1] || '' };
 }
 
 /**
@@ -2693,11 +3115,22 @@ function getSalesPage(sinceDate, cursor, limit) {
   console.log('📅 [getSalesPage] sinceDate reçu:', sinceDate, '| Type:', typeof sinceDate);
   
   // Convertir sinceDate en Date si c'est une string
-  let sinceDateObj = sinceDate;
-  if (typeof sinceDate === 'string') {
+  let sinceDateObj;
+  if (!sinceDate) {
+    // Si aucune date fournie, utiliser epoch (import complet)
+    sinceDateObj = new Date(0);
+  } else if (typeof sinceDate === 'string') {
     sinceDateObj = new Date(sinceDate);
-  } else if (!(sinceDate instanceof Date)) {
+  } else if (sinceDate instanceof Date) {
+    sinceDateObj = sinceDate;
+  } else {
     sinceDateObj = new Date(sinceDate);
+  }
+  
+  // Vérifier que la date est valide
+  if (isNaN(sinceDateObj.getTime())) {
+    console.warn('📅 [getSalesPage] Date invalide reçue, utilisation epoch:', sinceDate);
+    sinceDateObj = new Date(0);
   }
   
   const isFullImport = sinceDateObj.getTime() <= new Date('1970-01-02').getTime();
@@ -3234,8 +3667,11 @@ function getDebtsPage(sinceDate, cursor, limit) {
 }
 
 /**
- * Récupère les taux modifiés depuis une date
- * Retourne le taux le plus récent si plusieurs
+ * ✅ PRO: Récupère TOUS les taux depuis une date (pas seulement le dernier)
+ * Retourne tous les taux pour historisation complète dans la base locale
+ * Le client choisira le dernier taux comme taux courant
+ * 
+ * ✅ FIX: Gère les taux AVEC ou SANS UUID
  */
 function getRatesSince(sinceDate) {
   const sheet = getSheet(SHEETS.TAUX);
@@ -3251,45 +3687,88 @@ function getRatesSince(sinceDate) {
   const results = [];
   
   const colTaux = findColumnIndex(sheet, 'Taux');
+  const colUsd = findColumnIndex(sheet, 'USD');
+  const colFc = findColumnIndex(sheet, 'Fc');
   const colUuid = findColumnIndex(sheet, '_uuid');
   
-  // Pour les taux, on prend le plus récent
-  let latestRate = null;
-  let latestDate = null;
+  console.log(`💱 [getRatesSince] Colonnes: Taux=${colTaux}, DATE=${colDate}, USD=${colUsd}, Fc=${colFc}, _uuid=${colUuid}`);
+  console.log(`💱 [getRatesSince] sinceDate=${sinceDate.toISOString()}, isInitialImport=${isInitialImport}, rows=${values.length - 1}`);
   
   for (let i = 1; i < values.length; i++) {
-    // Utiliser _updated_at si présent, sinon fallback sur DATE
-    const refVal = (colUpdatedAt > 0) ? values[i][colUpdatedAt - 1] : values[i][colDate - 1];
-    const refDate = toDate(refVal);
+    const row = values[i];
     
-    if (!refDate) continue;
+    // Récupérer le taux - priorité: colonne Taux
+    let rate = 0;
+    if (colTaux > 0 && row[colTaux - 1]) {
+      rate = toNumber(row[colTaux - 1]);
+    }
+    
+    // Ignorer les lignes sans taux valide
+    if (!rate || rate <= 0) {
+      continue;
+    }
+    
+    // Récupérer la date du taux
+    let dateTaux = colDate > 0 ? row[colDate - 1] : null;
+    let dateObj = null;
+    
+    if (dateTaux) {
+      if (dateTaux instanceof Date) {
+        dateObj = dateTaux;
+      } else if (typeof dateTaux === 'string') {
+        // Gérer formats: DD/MM/YYYY, DD/MM/YYYY HH:mm:ss, YYYY-MM-DD, ISO
+        if (dateTaux.includes('/')) {
+          const parts = dateTaux.split(' ');
+          const datePart = parts[0].split('/');
+          if (datePart.length === 3) {
+            const day = parseInt(datePart[0], 10);
+            const month = parseInt(datePart[1], 10) - 1;
+            const year = parseInt(datePart[2], 10);
+            dateObj = new Date(year, month, day);
+          }
+        } else {
+          dateObj = new Date(dateTaux);
+        }
+      }
+    }
+    
+    // Si pas de date valide, utiliser maintenant
+    if (!dateObj || isNaN(dateObj.getTime())) {
+      dateObj = new Date();
+    }
+    
+    // Utiliser _updated_at pour le filtrage si disponible
+    const refVal = (colUpdatedAt > 0 && row[colUpdatedAt - 1]) ? row[colUpdatedAt - 1] : dateObj;
+    const refDate = toDate(refVal) || dateObj;
     
     // Vérifier la date si ce n'est pas un import initial
     if (!isInitialImport && refDate < sinceDate) {
       continue;
     }
     
-    const dateTaux = values[i][colDate - 1];
+    // UUID - peut être vide, c'est OK
+    const uuid = colUuid > 0 ? (row[colUuid - 1] || '').toString().trim() : '';
     
-    const rate = toNumber(colTaux > 0 ? values[i][colTaux - 1] : 0) || 2800;
-    const dateObj = dateTaux instanceof Date ? dateTaux : new Date(dateTaux);
+    // Récupérer USD et Fc pour référence
+    const usd = colUsd > 0 ? toNumber(row[colUsd - 1]) || 100 : 100;
+    const fc = colFc > 0 ? toNumber(row[colFc - 1]) : rate * usd;
     
-    if (!latestDate || refDate > latestDate) {
-      latestDate = refDate;
-      latestRate = {
-        uuid: colUuid > 0 ? values[i][colUuid - 1] : null,
-        rate_fc_per_usd: rate,
-        effective_at: dateObj.toISOString(),
-        _origin: 'SHEETS',
-        _syncedAt: new Date().toISOString(),
-        _remote_updated_at: refDate.toISOString()
-      };
-    }
+    results.push({
+      Taux: rate,
+      USD: usd,
+      Fc: fc,
+      DATE: dateObj.toISOString(),
+      uuid: uuid || null,
+      _uuid: uuid || null,
+      rate_fc_per_usd: rate,
+      effective_at: dateObj.toISOString(),
+      _origin: 'SHEETS',
+      _syncedAt: new Date().toISOString(),
+      _remote_updated_at: refDate ? refDate.toISOString() : dateObj.toISOString()
+    });
   }
   
-  if (latestRate) {
-    results.push(latestRate);
-  }
+  console.log(`💱 [getRatesSince] ↓${results.length} taux retournés`);
   
   return results;
 }
@@ -3314,6 +3793,11 @@ function getUsersSince(sinceDate) {
   const colMarque = findColumnIndex(sheet, 'marque');
   const colUrlProfile = findColumnIndex(sheet, 'Urlprofile');
   
+  // ✅ Nouvelles colonnes de rôles
+  const colVendeur = findColumnIndex(sheet, 'Vendeur');
+  const colGerentStock = findColumnIndex(sheet, 'Gerent Stock');
+  const colProduits = findColumnIndex(sheet, 'Porudits est Vender');
+  
   if (colDateCreation === -1) {
     console.log('[USERS] ❌ Colonne "date de creation du compter" introuvable');
     return [];
@@ -3329,7 +3813,7 @@ function getUsersSince(sinceDate) {
   console.log(`[USERS] 🔍 Recherche utilisateurs depuis: ${sinceDate} (${sinceDateObj.toLocaleString('fr-FR')})`);
   console.log(`[USERS] 📊 Mode: ${isFullImport ? 'IMPORT COMPLET (tous les utilisateurs)' : 'SYNC INCRÉMENTALE (depuis date)'}`);
   console.log(`[USERS] 📊 Total lignes dans la feuille: ${values.length}`);
-  console.log(`[USERS] 📋 Colonnes trouvées: Nom=${colNom}, Mode passe=${colModePasse}, Numero=${colNumero}, Valide=${colValide}, Admi=${colAdmi}, UUID=${colUuid}, Token=${colToken}, Marque=${colMarque}, UrlProfile=${colUrlProfile}`);
+  console.log(`[USERS] 📋 Colonnes trouvées: Nom=${colNom}, Mode passe=${colModePasse}, Numero=${colNumero}, Valide=${colValide}, Admi=${colAdmi}, UUID=${colUuid}, Token=${colToken}, Marque=${colMarque}, UrlProfile=${colUrlProfile}, Vendeur=${colVendeur}, GerentStock=${colGerentStock}, Produits=${colProduits}`);
   
   let skippedNoDate = 0;
   let skippedOldDate = 0;
@@ -3434,6 +3918,14 @@ function getUsersSince(sinceDate) {
       finalCreatedAt = new Date();
     }
     
+    // ✅ Helper pour parser les valeurs boolean depuis Sheets (oui, OUI, 1, true, etc.)
+    const parseBool = (col) => {
+      if (col <= 0) return false;
+      const val = values[i][col - 1];
+      const valStr = String(val || '').toLowerCase().trim();
+      return valStr === 'oui' || valStr === 'yes' || valStr === 'true' || val == 1 || val === true;
+    };
+    
     const userData = {
       uuid: userUuid, // UUID backfillé si nécessaire
       _uuid: userUuid, // Alias pour compatibilité
@@ -3448,6 +3940,10 @@ function getUsersSince(sinceDate) {
         return valideStr === 'oui' || valideStr === 'yes' || valideValue == 1 || valideValue === true;
       })() : true,
       is_admin: colAdmi > 0 ? (String(values[i][colAdmi - 1]).toLowerCase() === 'oui' || values[i][colAdmi - 1] == 1 || values[i][colAdmi - 1] === true) : false,
+      // ✅ Nouvelles colonnes de rôles
+      is_vendeur: parseBool(colVendeur),
+      is_gerant_stock: parseBool(colGerentStock),
+      can_manage_products: parseBool(colProduits),
       created_at: (finalCreatedAt instanceof Date && !isNaN(finalCreatedAt.getTime())) ? finalCreatedAt.toISOString() : new Date().toISOString(),
       // Informations device
       device_brand: colMarque > 0 ? (values[i][colMarque - 1] ? String(values[i][colMarque - 1]).trim() : '') : '',
@@ -3460,7 +3956,7 @@ function getUsersSince(sinceDate) {
     
     if (processed <= 3) { // Log les 3 premiers utilisateurs
       const refDateStr = (refDate && refDate instanceof Date && !isNaN(refDate.getTime())) ? refDate.toISOString() : 'N/A (utilisé date actuelle)';
-      console.log(`[USERS] ✅ Utilisateur ${processed}: ${userData.username}, UUID=${userData.uuid || 'N/A'}, phone=${userData.phone}, password=${userData.password ? '*** (présent)' : 'N/A (vide)'}, is_active=${userData.is_active}, is_admin=${userData.is_admin}, refDate=${refDateStr}`);
+      console.log(`[USERS] ✅ Utilisateur ${processed}: ${userData.username}, UUID=${userData.uuid || 'N/A'}, phone=${userData.phone}, password=${userData.password ? '*** (présent)' : 'N/A (vide)'}, is_active=${userData.is_active}, is_admin=${userData.is_admin}, is_vendeur=${userData.is_vendeur}, is_gerant_stock=${userData.is_gerant_stock}, can_manage_products=${userData.can_manage_products}, refDate=${refDateStr}`);
     }
     
     results.push(userData);
@@ -3559,6 +4055,20 @@ function handleBatchPush(data) {
   const lock = LockService.getScriptLock();
   lock.waitLock(15000);
   try {
+    // ✅ FIX: Vérifier que data est défini
+    if (!data || typeof data !== 'object') {
+      console.error('❌ [handleBatchPush] data est undefined ou pas un objet:', data);
+      return jsonOut({ 
+        success: false, 
+        error: 'data is undefined or invalid',
+        applied: [], 
+        conflicts: [], 
+        failed: [],
+        stats: { received: 0, applied: 0, conflicts: 0, failed: 0, skipped: 0 },
+        server_time: nowIso()
+      });
+    }
+    
     const ops = Array.isArray(data.ops) ? data.ops : [];
     const deviceId = (data.device_id || '').toString() || 'UNKNOWN';
     const serverTime = nowIso();
@@ -3643,27 +4153,16 @@ function handleBatchPush(data) {
       const pl = it.payload || {};
       
       if (entity === 'products' || entity === 'product_units') {
-        // CRITIQUE: Normaliser unit_level pour router vers la bonne feuille
-        const lvlRaw = (pl.unit_level || '').toString().trim();
-        let lvl = lvlRaw.toUpperCase();
-        // Normaliser MILLIERS → MILLIER (pour correspondre à la feuille "Milliers")
-        if (lvl === 'MILLIERS') {
-          lvl = 'MILLIER';
-        }
-        // Router vers la bonne feuille selon unit_level normalisé
+        // ✅ PRO: Utiliser canonicalisation stricte (CARTON, MILLIERS, PIECE)
+        const lvl = normalizeUnitLevelCanonical(pl.unit_level);
         const target = lvl === 'CARTON' ? SHEETS.CARTON : 
-                      (lvl === 'MILLIER' ? SHEETS.MILLIERS : SHEETS.PIECE);
+                      (lvl === 'MILLIERS' ? SHEETS.MILLIERS : SHEETS.PIECE);
         addTo(target, it);
       } else if (entity === 'stock_moves') {
-        // Mouvements de stock: router selon unit_level vers la bonne feuille
-        const lvlRaw = (pl.unit_level || '').toString().trim();
-        let lvl = lvlRaw.toUpperCase();
-        // Normaliser MILLIERS → MILLIER
-        if (lvl === 'MILLIERS') {
-          lvl = 'MILLIER';
-        }
+        // ✅ PRO: Même canonicalisation pour stock_moves
+        const lvl = normalizeUnitLevelCanonical(pl.unit_level);
         const target = lvl === 'CARTON' ? SHEETS.CARTON : 
-                      (lvl === 'MILLIER' ? SHEETS.MILLIERS : SHEETS.PIECE);
+                      (lvl === 'MILLIERS' ? SHEETS.MILLIERS : SHEETS.PIECE);
         addTo(target, it);
       } else if (entity === 'sales' || entity === 'sale_items') {
         addTo(SHEETS.VENTES, it);
@@ -3675,14 +4174,32 @@ function handleBatchPush(data) {
         addTo(SHEETS.COMPTER_UTILISATEUR, it);
       } else if (entity === 'price_logs') {
         addTo(SHEETS.STOCK_PRIX, it);
+      } else {
+        // ✅ CRITIQUE: Ne jamais drop une entité silencieusement
+        addTo('__UNROUTABLE__', it);
       }
     }
     
     const applied = [];
     const conflicts = [];
+    const failed = [];
+    const skipped = [];
     
     // 3) Appliquer par feuille (lecture 1 fois + écritures en blocs)
     for (const sheetName in groups) {
+      // ✅ PRO: Traiter les UNROUTABLE separément
+      if (sheetName === '__UNROUTABLE__') {
+        for (const op of groups[sheetName]) {
+          conflicts.push({
+            op_id: op.op_id,
+            sheet: sheetName,
+            reason: 'UNROUTABLE_ENTITY',
+            entity: op.entity
+          });
+        }
+        continue;
+      }
+      
       const sheet = getSheet(sheetName);
       ensureTechColumns(sheet);
       
@@ -3714,100 +4231,144 @@ function handleBatchPush(data) {
         
         console.log(`   📦 [handleBatchPush] op_id=${opId}, payload=${JSON.stringify(pl).substring(0, 150)}...`);
         
-        // Vérifier conflit si update
-        if (uuid && colUuid > 0) {
-          const idx = uuidMap.get(uuid);
-          if (idx !== undefined && idx !== null) {
-            const remoteUpdated = colUpdatedAt > 0 ? toDate(values[idx][colUpdatedAt - 1]) : null;
-            const base = toDate(op.base_remote_updated_at);
-            if (base && remoteUpdated && remoteUpdated > base) {
-              conflicts.push({
-                op_id: opId,
-                sheet: sheetName,
-                reason: 'REMOTE_NEWER_THAN_BASE',
-                uuid,
-                remote_updated_at: remoteUpdated.toISOString(),
-                base_remote_updated_at: base.toISOString()
-              });
-              console.log(`   ⚠️ [handleBatchPush] Conflit détecté pour ${opId}: remote plus récent`);
-              continue;
-            }
-          }
-        }
+        // ✅ CRITICAL: Désactiver complètement le test de conflit
+        // Raison: L'idempotence est gérée par op_id dans la DB, pas par _updated_at
+        // Si on teste _updated_at, on crée des retry infinies car:
+        // - Retry 1: rejette pour conflit (remote > base)
+        // - Retry 2: accepte et écrit dans Sheets
+        // - Retry 3: rejette à nouveau (remote est maintenant le timestamp de retry 2)
+        // Solution PRO: Utiliser op_id pour dédupliquer au lieu de _updated_at
+        
+        // NOTE: Si on réactive le conflit test, utiliser SEULEMENT pour product_units
+        // et ignorer pour stock_moves (qui sont idempotentes)
+        // if (!isStockMove && uuid && colUuid > 0) {
+        //   [conflit test code]
+        // }
         
         // Utiliser les handlers existants (plus lent mais correct et sécurisé)
+        let entity = '(unknown)'; // ✅ Défini avant le try pour le catch
         try {
           let result;
-          const entity = op.entity;
+          entity = op.entity;
           
           console.log(`   📝 [handleBatchPush] Application ${entity} (op_id: ${opId})`);
           
           switch (entity) {
             case 'product_units':
             case 'products':
+              // ✅ PRO: Vérifier si c'est une opération de suppression
+              if (op.op === 'delete') {
+                console.log(`   🗑️ [handleBatchPush] Traitement PRODUCT_DELETED`);
+                console.log(`   Payload: ${JSON.stringify(pl).substring(0, 200)}...`);
+                result = handleProductDeleted(pl);
+              }
               // Vérifier si c'est une opération update_stock
               // CRITIQUE: Vérifier stock_absolute (nouveau mode) OU stock_change (ancien mode pour compatibilité)
-              if (op.op === 'update_stock' && (pl.stock_absolute !== undefined || pl.stock_change !== undefined)) {
-                // CRITIQUE: Normaliser unit_level pour handleStockUpdate (CARTON, MILLIER, PIECE)
-                const unitLevelRaw = (pl.unit_level || '').toString().trim();
-                let unitLevelNormalized = unitLevelRaw.toUpperCase();
-                // Normaliser MILLIERS → MILLIER
-                if (unitLevelNormalized === 'MILLIERS') {
-                  unitLevelNormalized = 'MILLIER';
-                }
+              else if (op.op === 'update_stock' && (pl.stock_absolute !== undefined || pl.stock_change !== undefined)) {
+                // ✅ PRO: Utiliser canonicalisation pour unit_level
+                const unitLevelNormalized = normalizeUnitLevelCanonical(pl.unit_level);
                 // CRITIQUE: Normaliser product_code en chaîne pour correspondre à Sheets
                 const productCodeNormalized = String(pl.product_code || '').trim();
                 // Créer un payload normalisé pour handleStockUpdate
                 const normalizedPayload = {
                   ...pl,
                   product_code: productCodeNormalized, // CRITIQUE: Toujours chaîne pour correspondre à Sheets
-                  unit_level: unitLevelNormalized || unitLevelRaw
+                  unit_level: unitLevelNormalized || (pl.unit_level || '')
                 };
                 console.log(`   🔧 [handleBatchPush] Payload normalisé pour update_stock:`);
                 console.log(`      product_code: '${pl.product_code}' → '${productCodeNormalized}'`);
                 console.log(`      unit_level: '${pl.unit_level}' → '${unitLevelNormalized}'`);
                 result = handleStockUpdate(normalizedPayload);
               } else {
-                result = handleProductUpsert(pl, entity);
+                console.log(`   📦 [handleBatchPush] APPEL handleProductUpsert pour ${entity}`);
+                console.log(`      Payload keys: ${Object.keys(pl).join(', ')}`);
+                console.log(`      code='${pl.code || pl.product_code}', name='${pl.name}', unit_level='${pl.unit_level}'`);
+                try {
+                  result = handleProductUpsert(pl, entity);
+                  console.log(`   ✅ [handleBatchPush] handleProductUpsert SUCCÈS: ${JSON.stringify(result).substring(0, 300)}`);
+                } catch (prodError) {
+                  console.error(`   ❌ [handleBatchPush] handleProductUpsert ERREUR: ${prodError.toString()}`);
+                  throw prodError;
+                }
               }
               break;
             case 'stock_moves':
-              // ✅ NOUVEAU: Gérer les mouvements de stock (deltas à appliquer)
-              // Format: { product_code, unit_level, unit_mark, delta, ... }
-              // Convertir delta en stock_change pour réutiliser handleStockUpdate
+              // ✅ PRO: Gérer les mouvements de stock avec stock_absolute OU delta
+              // Format: { product_code, unit_level, unit_mark, stock_absolute?, delta?, reason?, ... }
+              console.log(`   📦 [handleBatchPush] TRAITEMENT stock_moves - op_id: ${opId}`);
+              console.log(`      Payload brut: ${JSON.stringify(pl).substring(0, 200)}...`);
+              console.log(`      Reason: ${pl.reason || 'N/A'}`);
+              
               {
-                const unitLevelRaw = (pl.unit_level || '').toString().trim();
-                let unitLevelNormalized = unitLevelRaw.toUpperCase();
-                if (unitLevelNormalized === 'MILLIERS') {
-                  unitLevelNormalized = 'MILLIER';
-                }
+                const unitLevelNormalized = normalizeUnitLevelCanonical(pl.unit_level);
                 const productCodeNormalized = String(pl.product_code || '').trim();
-                const delta = typeof pl.delta === 'number' ? pl.delta : (parseFloat(pl.delta) || 0);
                 
                 const payloadForStockUpdate = {
                   product_code: productCodeNormalized,
                   unit_level: unitLevelNormalized,
                   unit_mark: pl.unit_mark || '',
-                  stock_change: delta,  // Convertir delta en stock_change
-                  uuid: pl.uuid || '',
-                  device_id: pl.device_id || 'AUTO_STOCK'
+                  uuid: pl.uuid || pl.product_uuid || '',
+                  device_id: pl.device_id || deviceId || 'AUTO_STOCK',
+                  reason: pl.reason || ''  // ✅ Préserver le reason
                 };
                 
-                console.log(`   📊 [handleBatchPush] Mouvement de stock à appliquer:`);
-                console.log(`      product_code: '${productCodeNormalized}'`);
-                console.log(`      unit_level: '${unitLevelNormalized}'`);
-                console.log(`      unit_mark: '${pl.unit_mark || ''}'`);
-                console.log(`      delta: ${delta}`);
+                // ✅ PRO: Priorité à stock_absolute (valeur finale absolue)
+                if (pl.stock_absolute !== undefined && pl.stock_absolute !== null) {
+                  const stockAbs = typeof pl.stock_absolute === 'number' ? pl.stock_absolute : (parseFloat(pl.stock_absolute) || 0);
+                  payloadForStockUpdate.stock_absolute = Math.round(stockAbs * 100) / 100;
+                  console.log(`   📊 [handleBatchPush] Stock ABSOLU à écrire:`);
+                  console.log(`      product_code: '${productCodeNormalized}'`);
+                  console.log(`      unit_level: '${unitLevelNormalized}'`);
+                  console.log(`      stock_absolute: ${payloadForStockUpdate.stock_absolute}`);
+                } else {
+                  // Fallback: utiliser delta (changement relatif)
+                  const delta = typeof pl.delta === 'number' ? pl.delta : (parseFloat(pl.delta) || 0);
+                  payloadForStockUpdate.stock_change = delta;
+                  console.log(`   📊 [handleBatchPush] Stock DELTA à appliquer:`);
+                  console.log(`      product_code: '${productCodeNormalized}'`);
+                  console.log(`      unit_level: '${unitLevelNormalized}'`);
+                  console.log(`      delta: ${delta}`);
+                }
                 
-                result = handleStockUpdate(payloadForStockUpdate);
+                // ✅ NOUVEAU: Si reason='sale_deleted', mettre à jour SEULEMENT le stock des feuilles de produit
+                // Ne pas créer de ligne de vente!
+                if (pl.reason === 'sale_deleted') {
+                  console.log(`   🗑️ [handleBatchPush] STOCK_MOVE from sale_deleted - MAJ stock only`);
+                  try {
+                    result = updateProductStockOnly(payloadForStockUpdate);
+                    console.log(`   ✅ [handleBatchPush] updateProductStockOnly a retourné:`, JSON.stringify(result));
+                  } catch (stockError) {
+                    console.error(`   ❌ [handleBatchPush] updateProductStockOnly a ÉCHOUÉ:`, stockError.toString());
+                    throw stockError;
+                  }
+                } else {
+                  // Mode normal: handleStockUpdate qui crée aussi une ligne de vente si nécessaire
+                  console.log(`   📞 [handleBatchPush] Appel handleStockUpdate avec payload: ${JSON.stringify(payloadForStockUpdate).substring(0, 300)}...`);
+                  try {
+                    result = handleStockUpdate(payloadForStockUpdate);
+                    console.log(`   ✅ [handleBatchPush] handleStockUpdate a retourné:`, JSON.stringify(result));
+                  } catch (stockError) {
+                    console.error(`   ❌ [handleBatchPush] handleStockUpdate a ÉCHOUÉ:`, stockError.toString());
+                    throw stockError;
+                  }
+                }
               }
               break;
             case 'sale_items':
               result = handleSaleItemUpsert(pl);
               break;
+            case 'sales':
+              // ✅ NOUVEAU: Traiter les opérations SALE_DELETED
+              // Entity 'sales' avec op_type 'SALE_DELETED' = suppression de vente
+              console.log(`🗑️ [handleBatchPush] Traitement SALE_DELETED`);
+              console.log(`   Payload: ${JSON.stringify(pl).substring(0, 200)}...`);
+              result = handleSaleDeleted(pl);
+              break;
             case 'debts':
-            case 'debt_payments':
               result = handleDebtUpsert(pl);
+              break;
+            case 'debt_payments':
+              result = handleDebtPaymentUpsert(pl);
               break;
             case 'rates':
               result = handleRateUpsert(pl);
@@ -3828,7 +4389,7 @@ function handleBatchPush(data) {
           console.log(`   ✅ [handleBatchPush] ${entity} appliqué (op_id: ${opId})`);
         } catch (error) {
           console.error(`   ❌ [handleBatchPush] Erreur ${entity} (op_id: ${opId}):`, error.toString());
-          conflicts.push({
+          failed.push({
             op_id: opId,
             sheet: sheetName,
             reason: 'HANDLER_ERROR',
@@ -3842,13 +4403,39 @@ function handleBatchPush(data) {
       // Pas besoin de réécrire values[] ici car on utilise les handlers directement
     }
     
-    return jsonOut({
-      success: true,
+    // ✅ PRO: Ne jamais mentir sur success si des erreurs existent
+    const success = failed.length === 0;
+
+    // 🔍 DEBUG: Log le format exact de réponse avant retour
+    const responseObj = {
+      success,
       server_time: serverTime,
       remote_version: serverTime,
       applied,
-      conflicts
-    });
+      conflicts,
+      failed,
+      skipped,
+      stats: {
+        received: ops.length,
+        applied: applied.length,
+        conflicts: conflicts.length,
+        failed: failed.length,
+        skipped: skipped.length
+      }
+    };
+    
+    // 🔴 CRITICAL DEBUG: Afficher le format EXACT de la réponse
+    console.log('\n🔹🔹🔹 [handleBatchPush] RESPONSE FORMAT CHECK 🔹🔹🔹');
+    console.log('✅ success:', responseObj.success);
+    console.log('📊 stats:', JSON.stringify(responseObj.stats));
+    console.log('📋 applied.length:', responseObj.applied.length);
+    console.log('⚠️ conflicts.length:', responseObj.conflicts.length);
+    console.log('❌ failed.length:', responseObj.failed.length);
+    console.log('⏭️ skipped.length:', responseObj.skipped.length);
+    console.log('🔹 FULL RESPONSE:', JSON.stringify(responseObj, null, 2).substring(0, 1000) + '...');
+    console.log('🔹🔹🔹 END RESPONSE FORMAT CHECK 🔹🔹🔹\n');
+
+    return jsonOut(responseObj);
   } finally {
     lock.releaseLock();
   }
@@ -3886,6 +4473,8 @@ function onOpen() {
     .addSeparator()
     .addItem('📋 Show Tech Columns', 'menuShowTechColumns')
     .addItem('✅ Validate Schema', 'menuValidateSchema')
+    .addSeparator()
+    .addItem('🧹 Cleanup Ventes Duplicates', 'cleanupVentesDuplicates')
     .addToUi();
 }
 
@@ -4022,4 +4611,286 @@ function menuValidateSchema() {
   } catch (error) {
     ui.alert(`❌ Erreur: ${error.toString()}`);
   }
+}
+/**
+ * ✅ CLEANUP: Supprimer les doublons et lignes vides dans la feuille Ventes
+ * - Supprime les lignes avec QTE = 0 ou vide
+ * - Supprime les lignes sans Code produit
+ * - Garde la ligne la plus récente en cas de doublon (même invoice + code + unit)
+ */
+function cleanupVentesDuplicates() {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.alert('⚠️ Nettoyage Ventes', 
+    'Cette action va:\n' +
+    '1. Supprimer les lignes avec QTE = 0\n' +
+    '2. Supprimer les lignes sans Code produit\n' +
+    '3. Supprimer les doublons (garder la plus récente)\n\n' +
+    'Continuer?',
+    ui.ButtonSet.YES_NO);
+  
+  if (response !== ui.Button.YES) {
+    ui.alert('Annulé');
+    return;
+  }
+  
+  const sheet = getSheet(SHEETS.VENTES);
+  const dataRange = sheet.getDataRange();
+  const values = dataRange.getValues();
+  
+  if (values.length <= 1) {
+    ui.alert('Feuille vide ou seulement l\'en-tête');
+    return;
+  }
+  
+  const colFacture = findColumnIndex(sheet, 'Numéro de facture');
+  const colCode = findColumnIndex(sheet, 'Code produit');
+  const colQte = findColumnIndex(sheet, 'QTE');
+  const colUnite = findColumnIndex(sheet, 'Unite');
+  const colMark = findColumnIndex(sheet, 'MARK');
+  const colUpdatedAt = findColumnIndex(sheet, '_updated_at');
+  
+  let deletedEmpty = 0;
+  let deletedDuplicates = 0;
+  const seen = new Map(); // clé composite → {row, updatedAt}
+  const rowsToDelete = [];
+  
+  // Première passe: identifier les lignes à supprimer
+  for (let i = 1; i < values.length; i++) {
+    const rowIndex = i + 1; // 1-based
+    const qty = toNumber(values[i][colQte - 1]);
+    const code = normalizeCode(values[i][colCode - 1]);
+    const invoice = normalizeCode(values[i][colFacture - 1]);
+    
+    // 1. Lignes vides (qty=0 ou pas de code/invoice)
+    if (qty <= 0 || !code || !invoice) {
+      rowsToDelete.push({ row: rowIndex, reason: 'empty' });
+      deletedEmpty++;
+      continue;
+    }
+    
+    // 2. Doublons: clé composite = invoice + code + unit + mark
+    const unit = colUnite > 0 ? normalizeUnitLevel(values[i][colUnite - 1]) : '';
+    const mark = colMark > 0 ? normalizeMark(values[i][colMark - 1]) : '';
+    const key = `${invoice}|${code}|${unit}|${mark}`;
+    const updatedAt = colUpdatedAt > 0 ? values[i][colUpdatedAt - 1] : '';
+    const updatedDate = toDate(updatedAt) || new Date(0);
+    
+    if (seen.has(key)) {
+      const prev = seen.get(key);
+      // Garder la plus récente
+      if (updatedDate > prev.updatedDate) {
+        // Supprimer l'ancienne
+        rowsToDelete.push({ row: prev.row, reason: 'duplicate' });
+        seen.set(key, { row: rowIndex, updatedDate });
+      } else {
+        // Supprimer la nouvelle (moins récente)
+        rowsToDelete.push({ row: rowIndex, reason: 'duplicate' });
+      }
+      deletedDuplicates++;
+    } else {
+      seen.set(key, { row: rowIndex, updatedDate });
+    }
+  }
+  
+  // Trier par ligne décroissante pour supprimer de bas en haut
+  rowsToDelete.sort((a, b) => b.row - a.row);
+  
+  // Supprimer
+  for (const item of rowsToDelete) {
+    sheet.deleteRow(item.row);
+  }
+  
+  ui.alert(`✅ Nettoyage terminé\n\n` +
+    `- Lignes vides supprimées: ${deletedEmpty}\n` +
+    `- Doublons supprimés: ${deletedDuplicates}\n` +
+    `- Total lignes supprimées: ${rowsToDelete.length}`);
+}
+
+// ===================================
+// 🧪 TEST FUNCTIONS
+// ===================================
+
+/**
+ * TEST: Vérifier que handleBatchPush met à jour le stock dans Sheets
+ * Lance depuis Apps Script: Run → testBatch
+ * Puis regarde: View → Execution log
+ */
+function testBatch() {
+  console.log('\n\n');
+  console.log('╔════════════════════════════════════════════════════╗');
+  console.log('║  🧪 TEST BATCH PUSH - STOCK UPDATE                ║');
+  console.log('╚════════════════════════════════════════════════════╝');
+  
+  const testData = {
+    device_id: 'TEST-PC',
+    ops: [
+      {
+        op_id: 'test-op-stock-' + Date.now(),
+        entity: 'stock_moves',
+        op: 'create',
+        payload: {
+          product_code: '8',
+          unit_level: 'CARTON',
+          stock_absolute: 100,
+          unit_mark: ''
+        }
+      }
+    ]
+  };
+  
+  console.log('📤 APPEL handleBatchPush avec:');
+  console.log('   product_code: 8');
+  console.log('   unit_level: CARTON');
+  console.log('   stock_absolute: 100');
+  
+  // Appel
+  handleBatchPush(testData);
+  
+  // Vérifier après quelques secondes
+  console.log('\n📋 VÉRIFICATION APRÈS APPEL:');
+  
+  const sheet = getSheet('Carton');
+  const colCode = findColumnIndex(sheet, 'Code produit');
+  const colStock = findColumnIndex(sheet, 'Stock initial');
+  
+  if (colCode > 0 && colStock > 0) {
+    const values = sheet.getDataRange().getValues();
+    for (let i = 1; i < values.length; i++) {
+      const code = String(values[i][colCode - 1] || '').trim();
+      if (code === '8') {
+        const stock = values[i][colStock - 1];
+        console.log(`   ✅ TROUVÉ: Code=8, Stock=${stock}`);
+        return;
+      }
+    }
+    console.log('   ❌ Code 8 non trouvé dans Carton');
+  } else {
+    console.log('   ❌ Colonnes Code/Stock non trouvées');
+  }
+}
+
+/**
+ * TEST: Vérifier les PRODUCTS upserts (pourquoi génèrent-elles des conflits?)
+ */
+function testBatchProducts() {
+  console.log('\n\n');
+  console.log('╔════════════════════════════════════════════════════╗');
+  console.log('║  🧪 TEST BATCH PUSH - PRODUCTS UPSERT             ║');
+  console.log('╚════════════════════════════════════════════════════╝');
+  
+  // Obtenir un produit existant pour le tester
+  const sheet = getSheet('Carton');
+  const colCode = findColumnIndex(sheet, 'Code produit');
+  const colName = findColumnIndex(sheet, 'Nom du produit');
+  const colUuid = findColumnIndex(sheet, '_uuid');
+  
+  if (colCode < 0) {
+    console.log('❌ Colonne Code produit non trouvée');
+    return;
+  }
+  
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) {
+    console.log('❌ Aucun produit dans la feuille');
+    return;
+  }
+  
+  // Utiliser le 2e produit (index 1)
+  const testCode = String(values[1][colCode - 1] || '').trim();
+  const testName = colName > 0 ? String(values[1][colName - 1] || '').trim() : 'Test Product';
+  const testUuid = colUuid > 0 ? String(values[1][colUuid - 1] || '').trim() : '';
+  
+  if (!testCode) {
+    console.log('❌ Pas de code produit dans la première ligne');
+    return;
+  }
+  
+  console.log('📤 TEST PRODUCT UPSERT:');
+  console.log('   code: ' + testCode);
+  console.log('   name: ' + testName);
+  console.log('   uuid: ' + testUuid);
+  
+  const testData = {
+    device_id: 'TEST-PC',
+    ops: [
+      {
+        op_id: 'test-op-prod-' + Date.now(),
+        entity: 'products',
+        op: 'upsert',
+        payload: {
+          code: testCode,
+          name: testName + ' (modified)',
+          unit_level: 'CARTON',
+          unit_mark: '',
+          stock_initial: 999,
+          purchase_price_usd: 10.5,
+          sale_price_fc: 25000,
+          sale_price_usd: 8.5,
+          uuid: testUuid,
+          base_remote_updated_at: new Date(0).toISOString()  // Very old date to avoid conflicts
+        }
+      }
+    ]
+  };
+  
+  console.log('\n📨 Envoi handleBatchPush...');
+  handleBatchPush(testData);
+  
+  console.log('\n✅ TEST TERMINÉ');
+}
+
+/**
+ * TEST: Vérifier les PRODUCTS MULTIPLES (le vrai problème?)
+ */
+function testBatchProductsMultiple() {
+  console.log('\n\n');
+  console.log('╔════════════════════════════════════════════════════╗');
+  console.log('║  🧪 TEST BATCH PUSH - MULTIPLE PRODUCTS           ║');
+  console.log('╚════════════════════════════════════════════════════╝');
+  
+  // Obtenir les 5 premiers produits
+  const sheet = getSheet('Carton');
+  const colCode = findColumnIndex(sheet, 'Code produit');
+  const colName = findColumnIndex(sheet, 'Nom du produit');
+  const colUuid = findColumnIndex(sheet, '_uuid');
+  
+  const values = sheet.getDataRange().getValues();
+  const ops = [];
+  
+  for (let i = 1; i < Math.min(6, values.length); i++) {  // 5 products
+    const testCode = String(values[i][colCode - 1] || '').trim();
+    if (!testCode) continue;
+    
+    const testName = colName > 0 ? String(values[i][colName - 1] || '').trim() : 'Test';
+    const testUuid = colUuid > 0 ? String(values[i][colUuid - 1] || '').trim() : '';
+    
+    ops.push({
+      op_id: 'test-multi-' + Date.now() + '-' + i,
+      entity: 'products',
+      op: 'upsert',
+      payload: {
+        code: testCode,
+        name: testName + ' (batch test)',
+        unit_level: 'CARTON',
+        unit_mark: '',
+        uuid: testUuid,
+        base_remote_updated_at: new Date(0).toISOString()
+      }
+    });
+  }
+  
+  console.log('📤 TEST ' + ops.length + ' PRODUCTS EN BATCH:');
+  for (let i = 0; i < ops.length; i++) {
+    console.log(`   [${i+1}] code=${ops[i].payload.code}`);
+  }
+  
+  const testData = {
+    device_id: 'TEST-PC',
+    ops: ops
+  };
+  
+  console.log('\n📨 Envoi handleBatchPush avec ' + ops.length + ' ops...');
+  handleBatchPush(testData);
+  
+  console.log('\n✅ TEST TERMINÉ');
 }

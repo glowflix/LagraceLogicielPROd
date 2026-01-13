@@ -2,6 +2,7 @@ import { getDb } from '../sqlite.js';
 import { logger } from '../../core/logger.js';
 import { generateUUID } from '../../core/crypto.js';
 import { normalizeUnit } from '../../core/qty-rules.js';
+import { outboxRepo } from './outbox.repo.js';
 
 /**
  * Repository pour la gestion des ventes
@@ -172,6 +173,46 @@ export class SalesRepository {
 
         const createdSale = this.findById(saleId);
         
+        // ✅ PRO: Créer des opérations STOCK_MOVE pour chaque item vendu
+        // Cela permet de synchroniser la réduction de stock vers Sheets
+        if (createdSale && createdSale.items && createdSale.items.length > 0) {
+          try {
+            const deviceId = saleData.source_device || process.env.DEVICE_ID || 'POS-SALE';
+            
+            for (const item of createdSale.items) {
+              // Récupérer le stock final de ce produit/unité
+              const finalUnit = db.prepare(`
+                SELECT uuid, stock_current FROM product_units
+                WHERE product_id = ? AND unit_level = ?
+                LIMIT 1
+              `).get(item.product_id, item.unit_level);
+              
+              if (!finalUnit) continue;
+              
+              // Créer une opération STOCK_MOVE avec stock_absolute
+              // stock_absolute = valeur finale du stock (idempotent!)
+              const movePayload = {
+                product_code: item.product_code,
+                unit_level: item.unit_level,
+                unit_mark: item.unit_mark || '',
+                stock_absolute: Math.round(finalUnit.stock_current * 100) / 100,
+                invoice_number: saleData.invoice_number,
+                device_id: deviceId,
+                reason: 'SALE'
+              };
+              
+              try {
+                outboxRepo.createSyncOperation('STOCK_MOVE', item.product_code, movePayload, deviceId);
+              } catch (syncErr) {
+                logger.warn(`[SALES] Impossible de créer opération sync pour ${item.product_code}: ${syncErr.message}`);
+              }
+            }
+          } catch (err) {
+            logger.warn(`[SALES] Erreur lors de la création des opérations stock: ${err.message}`);
+            // Non-bloquant: continuer même si sync échoue
+          }
+        }
+        
         return createdSale;
       } catch (error) {
         logger.error('Erreur create sale:', error);
@@ -235,31 +276,36 @@ export class SalesRepository {
   findAll(filters = {}) {
     const db = getDb();
     try {
-      let query = 'SELECT * FROM sales WHERE 1=1';
+      // ✅ IMPORTANT: Exclure les ventes marquées comme supprimées
+      let query = `
+        SELECT s.* FROM sales s
+        LEFT JOIN deleted_sales ds ON s.invoice_number = ds.invoice_number
+        WHERE 1=1 AND ds.id IS NULL
+      `;
       const params = [];
 
       if (filters.from) {
-        query += ' AND sold_at >= ?';
+        query += ' AND s.sold_at >= ?';
         params.push(filters.from);
       }
 
       if (filters.to) {
-        query += ' AND sold_at <= ?';
+        query += ' AND s.sold_at <= ?';
         params.push(filters.to);
       }
 
       if (filters.status) {
-        query += ' AND status = ?';
+        query += ' AND s.status = ?';
         params.push(filters.status);
       }
 
       // IMPORTANT: Exclure les ventes avec un statut spécifique (ex: 'pending')
       if (filters.exclude_status) {
-        query += ' AND status != ?';
+        query += ' AND s.status != ?';
         params.push(filters.exclude_status);
       }
 
-      query += ' ORDER BY sold_at DESC LIMIT 1000';
+      query += ' ORDER BY s.sold_at DESC LIMIT 1000';
 
       const sales = db.prepare(query).all(...params);
       
@@ -286,6 +332,10 @@ export class SalesRepository {
     
     const transaction = db.transaction(() => {
       try {
+        // ✅ CRITIQUE: Forcer origin = 'SHEETS' pour les ventes de synchronisation
+        // Cela empêche le trigger de réduire le stock (le trigger vérifie origin != 'SHEETS')
+        const origin = saleData.origin || 'SHEETS';
+        
         // Vérifier si la vente existe déjà
         const existing = this.findByInvoice(saleData.invoice_number);
         
@@ -331,7 +381,7 @@ export class SalesRepository {
             saleData.paid_fc !== undefined ? saleData.paid_fc : existing.paid_fc,
             saleData.paid_usd !== undefined ? saleData.paid_usd : existing.paid_usd,
             saleData.status !== undefined ? saleData.status : existing.status,
-            saleData.origin !== undefined ? saleData.origin : existing.origin,
+            origin,                          // ✅ Utiliser origin forcé
             saleData.source_device !== undefined ? saleData.source_device : existing.source_device,
             saleData.invoice_number
           );
@@ -364,7 +414,7 @@ export class SalesRepository {
             saleData.paid_fc || 0,
             saleData.paid_usd || 0,
             saleData.status || 'paid',
-            saleData.origin || 'SHEETS',
+            origin,                          // ✅ Utiliser origin forcé à 'SHEETS'
             saleData.source_device || null
           );
           
@@ -503,7 +553,16 @@ export class SalesRepository {
                     unitPriceFC,
                     unitPriceUSD
                   );
-                  // Unité créée, réessai de l'insertion
+                  
+                  // ✅ Récupérer l'UUID de l'unité créée
+                  const createdUnit = db.prepare(`
+                    SELECT uuid FROM product_units
+                    WHERE product_id = ? AND unit_level = ? AND unit_mark = ?
+                    LIMIT 1
+                  `).get(productId, unitLevel, (item.unit_mark || '').trim());
+                  const productUnitUuid2 = createdUnit?.uuid || unitUuid;
+                  
+                  // ✅ Réessai de l'insertion avec tous les 14 paramètres dans le bon ordre
                   itemStmt.run(
                     itemUuid,
                     saleId,
@@ -512,6 +571,7 @@ export class SalesRepository {
                     item.product_name || '',
                     unitLevel,
                     (item.unit_mark || '').trim(),
+                    productUnitUuid2,                 // ✅ product_unit_uuid au bon endroit (8e paramètre)
                     qty,
                     item.qty_label || (qty ? qty.toString() : '0'),
                     item.unit_price_fc || 0,

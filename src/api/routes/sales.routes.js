@@ -5,7 +5,7 @@ import { salesRepo } from '../../db/repositories/sales.repo.js';
 import { productsRepo } from '../../db/repositories/products.repo.js';
 import { debtsRepo } from '../../db/repositories/debts.repo.new.js';
 import { getDb } from '../../db/sqlite.js';
-import { syncRepo } from '../../db/repositories/sync.repo.js';
+// syncRepo supprimé - utilise maintenant outboxRepo pour toutes les opérations de sync
 import { outboxRepo } from '../../db/repositories/outbox.repo.js';
 import { auditRepo } from '../../db/repositories/audit.repo.js';
 import { printJobsRepo } from '../../db/repositories/print-jobs.repo.js';
@@ -409,7 +409,18 @@ router.post('/', optionalAuth, (req, res) => {
         };
         
         const syncOpId = outboxRepo.enqueueDebt(debtSyncData);
-        logger.info(`   ✅ [3/5] Sync Sheets queued: op_id=${syncOpId || 'skipped'}`);
+        logger.info(`   ✅ [3/5] Sync Sheets queued (dette): op_id=${syncOpId || 'skipped'}`);
+        
+        // ══════════════════════════════════════════════════════════════════
+        // ÉTAPE 3.5: SYNC vente + mouvements de stock vers Sheets
+        // ✅ FIX: enqueueSale() crée les STOCK_MOVE pour synchroniser le stock vers Sheets
+        // ══════════════════════════════════════════════════════════════════
+        try {
+          outboxRepo.enqueueSale(sale, sale.items || saleData.items || []);
+          logger.info(`   ✅ [3.5/5] Sync Sheets queued (vente + stock): OK`);
+        } catch (outboxErr) {
+          logger.warn(`   ⚠️ [3.5/5] Erreur enqueue vente: ${outboxErr.message}`);
+        }
         
         // ══════════════════════════════════════════════════════════════════
         // ÉTAPE 4: CRÉER JOB D'IMPRESSION (même format que vente normale)
@@ -575,150 +586,14 @@ router.post('/', optionalAuth, (req, res) => {
     // 4. Créer la vente en SQL local (transaction)
     const sale = salesRepo.create(finalSaleData);
 
-    // 4.1 Enqueue la vente dans l'outbox pour sync vers Sheets
+    // ✅ PRO: Système unifié - enqueueSale gère tout:
+    // - Opération SALE pour sync vente vers Sheets
+    // - Opérations STOCK_MOVE avec stock_absolute pour sync stock
     try {
       outboxRepo.enqueueSale(sale, sale.items || saleData.items || []);
-      logger.info(`📤 [SALE] Vente ${sale.invoice_number} enqueued pour sync Sheets`);
+      logger.info(`📤 [SALE] ${sale.invoice_number} enqueued (vente + stock)`);
     } catch (outboxErr) {
-      logger.warn(`⚠️ [SALE] Erreur enqueue vente (non-bloquant): ${outboxErr.message}`);
-    }
-
-    // 5. Créer les jobs de synchronisation (arrière-plan)
-    // 5.1 Sync ventes → feuille "Ventes"
-    syncRepo.addToOutbox('sales', sale.invoice_number, 'upsert', {
-      invoice_number: sale.invoice_number,
-      date_iso: dateISO,
-      ...sale,
-    });
-
-    // 5.2 Sync stock → feuilles Carton/Milliers/Piece
-    // CRITIQUE: Envoyer la valeur ABSOLUE du stock local pour écraser la colonne C dans Sheets
-    // Au lieu d'un changement relatif, on envoie le stock exact après réduction (ex: 6.5 au lieu de -1)
-    if (sale.items && Array.isArray(sale.items)) {
-      for (const item of sale.items) {
-        // CRITIQUE: Normaliser unit_level pour correspondre au format attendu par Sheets (CARTON, MILLIER, PIECE)
-        const unitNorm = normalizeUnit(item.unit_level);
-        let unitLevelForSync;
-        if (unitNorm === 'carton') {
-          unitLevelForSync = 'CARTON';
-        } else if (unitNorm === 'milliers') {
-          unitLevelForSync = 'MILLIER'; // Sheets utilise MILLIER (singulier) pour la feuille Milliers
-        } else if (unitNorm === 'piece') {
-          unitLevelForSync = 'PIECE';
-        } else {
-          // Fallback: utiliser tel quel si déjà en majuscules
-          unitLevelForSync = (item.unit_level || '').toString().toUpperCase();
-          // Normaliser MILLIERS → MILLIER
-          if (unitLevelForSync === 'MILLIERS') {
-            unitLevelForSync = 'MILLIER';
-          }
-        }
-        
-        const sheetName = unitNorm === 'carton' ? 'Carton' 
-                        : unitNorm === 'milliers' ? 'Milliers'
-                        : unitNorm === 'piece' ? 'Piece' : null;
-        
-        if (sheetName && unitLevelForSync) {
-          // CRITIQUE: Récupérer le stock ABSOLU après la réduction depuis la base de données
-          // Le stock a déjà été réduit dans sales.repo.js, on récupère la valeur finale
-          logger.info(`📦 [sales.routes] Récupération du stock ABSOLU pour synchronisation:`);
-          logger.info(`   Produit: ${item.product_code} (${item.product_name})`);
-          logger.info(`   Product ID dans item: ${item.product_id || '(non fourni)'}`);
-          logger.info(`   Unité normalisée: ${unitLevelForSync}, Mark: '${item.unit_mark || ''}'`);
-          logger.info(`   Quantité vendue: ${item.qty}`);
-          
-          const db = getDb();
-          
-          // CRITIQUE: Récupérer product_id depuis la base si non fourni dans item
-          let productId = item.product_id;
-          if (!productId && item.product_code) {
-            logger.info(`   🔍 Product ID manquant, recherche depuis product_code: ${item.product_code}`);
-            const product = db.prepare('SELECT id FROM products WHERE code = ? AND is_active = 1 LIMIT 1').get(item.product_code);
-            if (product) {
-              productId = product.id;
-              logger.info(`   ✅ Product ID trouvé: ${productId}`);
-            } else {
-              logger.error(`❌ [sales.routes] ERREUR: Produit non trouvé pour code: ${item.product_code}`);
-              logger.error(`   ⚠️ Impossible d'ajouter update_stock à l'outbox pour ce produit`);
-              continue; // Passer au produit suivant
-            }
-          }
-          
-          if (!productId) {
-            logger.error(`❌ [sales.routes] ERREUR: Product ID non disponible pour ${item.product_code}`);
-            logger.error(`   ⚠️ Impossible d'ajouter update_stock à l'outbox pour ce produit`);
-            continue; // Passer au produit suivant
-          }
-          
-          logger.info(`   🔍 Requête SQL: SELECT stock_initial FROM product_units WHERE product_id = ${productId} AND unit_level = '${unitLevelForSync}' AND unit_mark = '${item.unit_mark || ''}'`);
-          
-          const unitStock = db.prepare(`
-            SELECT stock_initial, stock_current FROM product_units
-            WHERE product_id = ? AND unit_level = ? AND unit_mark = ?
-          `).get(productId, unitLevelForSync, item.unit_mark || '');
-          
-          if (!unitStock) {
-            logger.error(`❌ [sales.routes] ERREUR: Unité non trouvée dans product_units!`);
-            logger.error(`   Product ID: ${productId}, Code produit: ${item.product_code}, Unité: ${unitLevelForSync}, Mark: '${item.unit_mark || ''}'`);
-            logger.error(`   ⚠️ Impossible d'ajouter update_stock à l'outbox pour ce produit`);
-            continue; // Passer au produit suivant
-          }
-          
-          // ✅ CORRECTION: Utiliser stock_current (APRÈS la vente) et non stock_initial
-          // Le stock a été réduit par le trigger SQL, stock_current = valeur finale
-          const stockAfterSale = unitStock.stock_current || 0;
-          const stockAbsoluteRounded = Math.round(stockAfterSale * 100) / 100; // Arrondir à 2 décimales
-          
-          logger.info(`   ✅ Stock trouvé:`);
-          logger.info(`      stock_initial (avant): ${unitStock.stock_initial || 0}`);
-          logger.info(`      stock_current (après vente): ${stockAfterSale} → arrondi: ${stockAbsoluteRounded}`);
-          
-          // CRITIQUE: Convertir product_code en chaîne pour correspondre à Sheets (gérer nombre vs chaîne)
-          const productCodeForSync = String(item.product_code || '').trim();
-          
-          const stockUpdatePayload = {
-            product_code: productCodeForSync, // CRITIQUE: Toujours envoyer comme chaîne pour correspondre à Sheets
-            unit_level: unitLevelForSync, // CRITIQUE: Utiliser la version normalisée (CARTON, MILLIER, PIECE)
-            unit_mark: item.unit_mark || '',
-            stock_absolute: stockAbsoluteRounded, // CRITIQUE: Valeur ABSOLUE du stock local (ex: 6.5)
-            invoice_number: sale.invoice_number,
-          };
-          
-          logger.info(`   Code produit pour sync: '${productCodeForSync}' (type: ${typeof productCodeForSync})`);
-          
-          // LOG: Ajout à l'outbox pour synchronisation
-          logger.info(`📦 [sales.routes] Ajout update_stock à l'outbox:`);
-          logger.info(`   Produit: ${item.product_code} (${item.product_name})`);
-          logger.info(`   Unité: ${unitLevelForSync}, Mark: ${item.unit_mark || '(vide)'}`);
-          logger.info(`   Feuille Sheets: ${sheetName}`);
-          logger.info(`   Stock ABSOLU local: ${stockAbsoluteRounded} (sera écrit dans colonne C)`);
-          logger.info(`   Invoice: ${sale.invoice_number}`);
-          logger.info(`   ⚠️ Cette valeur ABSOLUE écrasera la colonne C dans Sheets`);
-          
-          syncRepo.addToOutbox('product_units', `${item.product_code}_${unitLevelForSync}_${item.unit_mark || ''}`, 'update_stock', stockUpdatePayload);
-          
-          logger.info(`   ✅ Opération ajoutée à l'outbox (sera synchronisée dans les 10 secondes)`);
-        } else {
-          logger.warn(`⚠️ [sales.routes] Impossible d'ajouter update_stock à l'outbox:`);
-          logger.warn(`   Produit: ${item.product_code}, Unité: ${item.unit_level}`);
-          logger.warn(`   sheetName: ${sheetName}, unitLevelForSync: ${unitLevelForSync}`);
-        }
-      }
-    }
-
-    // 5.3 Sync prix effectué → feuille "Stock de prix effectué"
-    if (sale.items && Array.isArray(sale.items)) {
-      for (const item of sale.items) {
-        syncRepo.addToOutbox('price_logs', `${sale.invoice_number}_${item.product_code}`, 'append', {
-          at: dateISO,
-          product_code: item.product_code,
-          unit_level: item.unit_level,
-          unit_mark: item.unit_mark,
-          unit_price_fc: item.unit_price_fc,
-          line_total_fc: item.subtotal_fc,
-          invoice_number: sale.invoice_number,
-        });
-      }
+      logger.warn(`⚠️ [SALE] Erreur enqueue: ${outboxErr.message}`);
     }
 
     // 6. Créer le job d'impression (pending)
@@ -987,17 +862,31 @@ router.get('/:invoice', optionalAuth, (req, res) => {
 /**
  * POST /api/sales/:invoice/void
  * Annule une vente
+ * ✅ Supprime également les lignes dans la feuille "Ventes" de Sheets
  */
 router.post('/:invoice/void', authenticate, (req, res) => {
   try {
     const { reason } = req.body;
-    const sale = salesRepo.voidSale(req.params.invoice, reason, req.user.id);
+    const invoiceNumber = req.params.invoice;
+    
+    // Récupérer les items AVANT l'annulation pour restaurer le stock dans Sheets
+    const db = getDb();
+    const saleItems = db.prepare(`
+      SELECT si.product_code, si.qty, si.unit_level, si.unit_mark
+      FROM sale_items si
+      JOIN sales s ON s.id = si.sale_id
+      WHERE s.invoice_number = ?
+    `).all(invoiceNumber);
+    
+    const sale = salesRepo.voidSale(invoiceNumber, reason, req.user.id);
 
-    // Ajouter à l'outbox
-    syncRepo.addToOutbox('sales', sale.invoice_number, 'void', {
-      invoice_number: sale.invoice_number,
-      reason,
-    });
+    // ✅ PRO: Supprimer les lignes dans Sheets ET restaurer le stock
+    try {
+      outboxRepo.enqueueSaleDeleted(sale.invoice_number, saleItems);
+      logger.info(`📤 [VOID] SALE_DELETED enqueued pour facture ${sale.invoice_number}`);
+    } catch (syncErr) {
+      logger.warn(`⚠️ [VOID] Erreur sync Sheets: ${syncErr.message}`);
+    }
 
     // Audit log
     auditRepo.log(req.user.id, 'sale_void', {
@@ -1009,9 +898,10 @@ router.post('/:invoice/void', authenticate, (req, res) => {
     const io = getSocketIO();
     if (io) {
       io.emit('sale:updated', sale);
+      io.emit('sale:deleted', { invoice_number: sale.invoice_number });
     }
 
-    res.json({ success: true, sale });
+    res.json({ success: true, sale, sync: 'sheets_queued' });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -1227,12 +1117,15 @@ router.delete('/:invoiceNumber', optionalAuth, async (req, res) => {
       SELECT si.*, p.id as product_id_lookup, p.uuid as product_uuid
       FROM sale_items si
       LEFT JOIN products p ON p.code = si.product_code
-      WHERE si.invoice_number = ?
-    `).all(invoiceNumber);
+      WHERE si.sale_id = ?
+    `).all(sale.id);
     
-    logger.info(`   📦 ${saleItems.length} item(s) à restaurer`);
+    logger.info(`   📦 ${saleItems.length} item(s) trouvé(s) en base de données`);
+    if (saleItems.length === 0) {
+      logger.warn(`   ⚠️ Aucun item trouvé pour cette vente - vérifier si déjà supprimée ou sans items`);
+    }
     
-    // ✅ PRO: Fonction pour normaliser l'unité
+    // ✅ PRO: Fonction pour normaliser l'unité (utile pour restauration locale du stock)
     const normalizeUnitLevel = (unitLevel) => {
       if (!unitLevel) return 'CARTON';
       const ul = String(unitLevel).toUpperCase().trim();
@@ -1257,142 +1150,271 @@ router.delete('/:invoiceNumber', optionalAuth, async (req, res) => {
       return unitMap[ul] || ul;
     };
     
-    // ✅ PRO: Mapping unité → feuille Sheets
-    const getSheetName = (unitLevel) => {
-      const normalized = normalizeUnitLevel(unitLevel);
-      const sheetMap = {
-        'CARTON': 'Carton',
-        'MILLIER': 'Milliers',
-        'PIECE': 'Piece'
+    // 3. Préparer les items pour restauration de stock
+    const items = saleItems.map(item => {
+      const qty = parseFloat(item.qty) || 0;
+      if (qty <= 0) {
+        logger.warn(`      ⚠️ Item ${item.product_code}: quantité invalide (${item.qty}), ignorée`);
+        return null;
+      }
+      const unitLevel = normalizeUnitLevel(item.unit_level);
+      const unitMark = item.unit_mark || '';
+      
+      // Obtenir le product_id si absent
+      let productId = item.product_id || item.product_id_lookup;
+      if (!productId && item.product_code) {
+        const prod = db.prepare('SELECT id, uuid FROM products WHERE code = ? LIMIT 1').get(item.product_code);
+        if (prod) productId = prod.id;
+      }
+      
+      logger.info(`      ✓ Item: ${item.product_code} x${qty} ${unitLevel}/${unitMark} → product_id=${productId}`);
+      
+      return {
+        product_code: item.product_code,
+        product_uuid: item.product_uuid,
+        product_id: productId,
+        qty: qty,
+        unit_level: unitLevel,
+        unit_mark: unitMark
       };
-      return sheetMap[normalized] || 'Carton';
-    };
+    }).filter(item => item !== null);
     
-    // 3. Restaurer le stock pour chaque item
+    logger.info(`   📋 Items valides à restaurer: ${items.length}/${saleItems.length}`);
+    
+    // 3. Restaurer le stock via l'API (même logique que ProductsPage.jsx)
+    // Cela déclenche la synchro vers Sheets automatiquement
     const stockRestored = [];
     
-    for (const item of saleItems) {
+    logger.info(`   🔄 [STOCK-RESTORE] Début restauration pour ${items.length} item(s)`);
+    
+    // Grouper les items par produit pour éviter les appels API en double
+    for (const item of items) {
+      const { product_code: productCode, product_id: productId, qty, unit_level: unitLevel, unit_mark: unitMark } = item;
+      
+      if (!productId) {
+        logger.warn(`   ⚠️ Produit non trouvé: ${productCode}`);
+        continue;
+      }
+      
+      logger.info(`   🔄 Restauration: ${productCode} x${qty} (${unitLevel})`);
+      
       try {
-        const qty = parseFloat(item.qty) || 0;
-        if (qty <= 0) continue;
-        
-        // Obtenir le product_id
-        let productId = item.product_id || item.product_id_lookup;
-        if (!productId && item.product_code) {
-          const prod = db.prepare('SELECT id, uuid FROM products WHERE code = ? LIMIT 1').get(item.product_code);
-          if (prod) {
-            productId = prod.id;
-            item.product_uuid = item.product_uuid || prod.uuid;
-          }
-        }
-        
-        if (!productId) {
-          logger.warn(`   ⚠️ Produit non trouvé: ${item.product_code}`);
+        // Récupérer le produit complet (comme ProductsPage fait avec axios.get)
+        const product = productsRepo.findByCode(productCode);
+        if (!product) {
+          logger.warn(`   ⚠️ Produit non trouvé en repo: ${productCode}`);
           continue;
         }
         
-        // ✅ PRO: Normaliser unit_level proprement
-        const unitLevel = normalizeUnitLevel(item.unit_level);
-        const unitMark = item.unit_mark || '';
+        // Trouver l'unité à mettre à jour
+        const unitToUpdate = product.units?.find(u => 
+          u.unit_level === unitLevel && 
+          (unitMark ? u.unit_mark === unitMark : true)
+        );
+        if (!unitToUpdate) {
+          logger.warn(`   ⚠️ Unité non trouvée: ${productCode}/${unitLevel}`);
+          continue;
+        }
         
-        logger.info(`   🔄 Restauration: ${item.product_code} x${qty} (${unitLevel})`);
+        // Calculer le nouveau stock: stock_actuel + quantité_vendue
+        const oldStock = Math.round((unitToUpdate.stock_current || 0) * 100) / 100;
+        const newStock = Math.round((oldStock + qty) * 100) / 100;
         
-        // Restaurer stock_initial et stock_current
-        const updateResult = db.prepare(`
-          UPDATE product_units 
-          SET stock_initial = COALESCE(stock_initial, 0) + ?,
-              stock_current = COALESCE(stock_current, 0) + ?,
-              updated_at = datetime('now')
-          WHERE product_id = ? AND unit_level = ?
-        `).run(qty, qty, productId, unitLevel);
+        logger.info(`      📊 Calcul: ${oldStock} + ${qty} = ${newStock}`);
         
-        if (updateResult.changes > 0) {
-          // Récupérer le nouveau stock après restauration
-          const newStock = db.prepare(`
-            SELECT stock_current FROM product_units
-            WHERE product_id = ? AND unit_level = ?
-          `).get(productId, unitLevel);
+        // Construire le payload exactement comme ProductsPage.jsx le fait
+        // (avec buildUnitPayload qui normalise les champs)
+        const updatedUnits = product.units.map(u => {
+          const isTargetUnit = u.unit_level === unitLevel && 
+            (unitMark ? u.unit_mark === unitMark : true);
           
-          const stockAfter = Math.round((newStock?.stock_current || qty) * 100) / 100;
-          
-          stockRestored.push({
-            product_code: item.product_code,
-            product_uuid: item.product_uuid,
-            qty: qty,
-            unit_level: unitLevel,
-            unit_mark: unitMark,
-            stock_after: stockAfter
-          });
-          logger.info(`      ✅ Stock restauré: +${qty} → ${stockAfter}`);
-          
-          // ✅ PRO: Ajouter à l'outbox pour sync vers Sheets
-          const sheetName = getSheetName(unitLevel);
-          const stockUpdatePayload = {
-            product_code: String(item.product_code),
-            unit_level: unitLevel,
-            unit_mark: unitMark,
-            stock_absolute: stockAfter, // Valeur ABSOLUE après restauration
-            invoice_number: invoiceNumber,
-            reason: 'sale_deleted' // Pour traçabilité
-          };
-          
-          try {
-            const { syncRepo } = await import('../../db/repositories/sync.repo.js');
-            syncRepo.addToOutbox(
-              'product_units', 
-              `${item.product_code}_${unitLevel}_${unitMark}`, 
-              'update_stock', 
-              stockUpdatePayload
-            );
-            logger.info(`      📤 Sync pending: stock=${stockAfter} → Sheets (${sheetName})`);
-          } catch (syncError) {
-            logger.warn(`      ⚠️ Sync error: ${syncError.message}`);
+          if (isTargetUnit) {
+            // ✅ Mettre à jour le stock (matching buildUnitPayload logic)
+            return {
+              id: u.id,
+              uuid: u.uuid,
+              unit_level: u.unit_level,
+              unit_mark: u.unit_mark || '',
+              stock_initial: newStock,  // ✅ CRITICAL: Les deux doivent être identiques
+              stock_current: newStock,
+              purchase_price_usd: u.purchase_price_usd || 0,
+              sale_price_usd: u.sale_price_usd || 0,
+              auto_stock_factor: u.auto_stock_factor || 1,
+              qty_step: u.qty_step || 1,
+              extra1: u.extra1 || null,
+              extra2: u.extra2 || null,
+              last_update: new Date().toISOString(),
+              synced_at: null
+            };
           }
           
-        } else {
-          logger.warn(`      ⚠️ Unité non trouvée: product_id=${productId}, unit_level=${unitLevel}`);
+          // Autres unités: garder inchangées
+          return {
+            id: u.id,
+            uuid: u.uuid,
+            unit_level: u.unit_level,
+            unit_mark: u.unit_mark || '',
+            stock_initial: u.stock_initial || 0,
+            stock_current: u.stock_current || 0,
+            purchase_price_usd: u.purchase_price_usd || 0,
+            sale_price_usd: u.sale_price_usd || 0,
+            auto_stock_factor: u.auto_stock_factor || 1,
+            qty_step: u.qty_step || 1,
+            extra1: u.extra1 || null,
+            extra2: u.extra2 || null,
+            last_update: u.last_update,
+            synced_at: u.synced_at
+          };
+        });
+        
+        // Construire le payload final (comme axios.put dans ProductsPage)
+        const updatePayload = {
+          code: productCode,  // ✅ CRITICAL: code est needed pour upsert()
+          name: product.name,
+          units: updatedUnits
+        };
+        
+        logger.info(`      📤 Payload pour upsert: code=${updatePayload.code}, name=${updatePayload.name}, units=${updatedUnits.length}`);
+        logger.info(`         Unit cible: ${updatedUnits.find(u => u.unit_level === unitLevel)?.stock_current} stock`);
+        
+        // Appeler productsRepo.upsert qui va mettre à jour le produit
+        try {
+          const updatedProduct = productsRepo.upsert(updatePayload);
+          logger.info(`      ✅ upsert() complété pour ${productCode}`);
+          logger.info(`      📊 upsert() returned:`, updatedProduct ? 'définition' : 'undefined');
+        } catch (upsertError) {
+          logger.error(`      ❌ upsert() ERROR: ${upsertError.message}`);
+          throw upsertError;
         }
+        
+        // ✅ Récupérer le produit pour vérifier que le stock a été mis à jour
+        const fullProduct = productsRepo.findByCode(productCode);
+        logger.info(`      🔍 findByCode() returned:`, fullProduct ? 'found' : 'NULL');
+        
+        if (!fullProduct) {
+          logger.error(`      ❌ Produit NOT FOUND après upsert: ${productCode}`);
+          continue;
+        }
+        
+        if (!fullProduct.units || !Array.isArray(fullProduct.units)) {
+          logger.error(`      ❌ Units NOT FOUND ou pas array: ${productCode}`);
+          logger.error(`         fullProduct.units =`, fullProduct.units);
+          continue;
+        }
+        
+        logger.info(`      ✅ Produit trouvé avec ${fullProduct.units.length} unité(s)`);
+        
+        const updatedUnit = fullProduct.units.find(u => u.unit_level === unitLevel && (unitMark ? u.unit_mark === unitMark : true));
+        if (updatedUnit) {
+          logger.info(`      ✅ Vérification: stock mis à jour à ${updatedUnit.stock_current} (nouvelle valeur)`);
+        } else {
+          logger.warn(`      ⚠️ Unité NOT FOUND dans fullProduct: ${unitLevel}/${unitMark}`);
+          logger.warn(`         Units disponibles:`, fullProduct.units.map(u => `${u.unit_level}/${u.unit_mark || 'N/A'}`));
+        }
+        
+        // Enqueue les patches pour synchro Sheets
+        for (const unit of fullProduct.units) {
+          // Enqueue le patch unité pour synchro Sheets
+          outboxRepo.enqueueUnitPatch(
+            fullProduct.uuid,
+            fullProduct.code,
+            unit.unit_level,
+            unit.unit_mark || '',
+            {
+              purchase_price_usd: unit.purchase_price_usd || 0,
+              sale_price_usd: unit.sale_price_usd || 0,
+              sale_price_fc: unit.sale_price_fc || 0,
+              stock_current: unit.stock_current || unit.stock_initial || 0,
+              stock_initial: unit.stock_initial || unit.stock_current || 0,
+              auto_stock_factor: unit.auto_stock_factor || 1,
+              qty_step: unit.qty_step || 1
+            }
+          );
+        }
+        
+        stockRestored.push({
+          product_code: productCode,
+          product_uuid: product.uuid,
+          qty: qty,
+          unit_level: unitLevel,
+          unit_mark: unitMark,
+          stock_before: oldStock,
+          stock_after: newStock
+        });
+        
+        logger.info(`      ✅ Stock restauré: ${oldStock} → ${newStock}`);
+        
       } catch (itemError) {
-        logger.error(`      ❌ Erreur restauration: ${itemError.message}`);
+        logger.error(`      ❌ Erreur restauration ${productCode}: ${itemError.message}`);
+        logger.error(`         Stack: ${itemError.stack}`);
+        // Continue anyway - local deletion still succeeds
       }
     }
     
     // 4. Supprimer les items de vente
-    const itemsDeleted = db.prepare(`DELETE FROM sale_items WHERE invoice_number = ?`).run(invoiceNumber);
-    logger.info(`   🗑️ ${itemsDeleted.changes} sale_items supprimés`);
+    let itemsDeleted = 0;
+    try {
+      const result = db.prepare(`DELETE FROM sale_items WHERE sale_id = ?`).run(sale.id);
+      itemsDeleted = result.changes;
+      logger.info(`   🗑️ ${itemsDeleted} sale_items supprimés`);
+    } catch (e) {
+      logger.error(`   ❌ Erreur suppression sale_items: ${e.message}`);
+      throw e;
+    }
     
-    // 5. Supprimer la vente
-    const saleDeleted = db.prepare(`DELETE FROM sales WHERE invoice_number = ?`).run(invoiceNumber);
-    logger.info(`   🗑️ Vente supprimée (${saleDeleted.changes})`);
+    // 5. Supprimer les voids associés AVANT la vente (contrainte FK)
+    let voidsDeleted = 0;
+    try {
+      const result = db.prepare(`DELETE FROM sale_voids WHERE sale_id = ?`).run(sale.id);
+      voidsDeleted = result.changes;
+      if (voidsDeleted > 0) {
+        logger.info(`   🗑️ ${voidsDeleted} sale_voids supprimés`);
+      }
+    } catch (e) {
+      logger.warn(`   ⚠️ Erreur suppression voids: ${e.message}`);
+    }
     
     // 6. Supprimer la dette associée si elle existe
+    let debtDeleted = 0;
     try {
-      const debtDeleted = db.prepare(`DELETE FROM debts WHERE invoice_number = ?`).run(invoiceNumber);
-      if (debtDeleted.changes > 0) {
+      const result = db.prepare(`DELETE FROM debts WHERE invoice_number = ?`).run(invoiceNumber);
+      debtDeleted = result.changes;
+      if (debtDeleted > 0) {
         logger.info(`   🗑️ Dette associée supprimée`);
       }
     } catch (e) {
-      // Pas de dette associée
+      logger.warn(`   ⚠️ Erreur suppression dette: ${e.message}`);
     }
     
-    // 7. Supprimer les voids associés
+    // ✅ 7. MARQUER COMME SUPPRIMÉE (soft delete via deleted_sales)
+    // Cela évite que la vente réapparaisse si elle revient de Sheets lors du sync
+    // On NE supprime PAS physiquement la vente pour éviter les FK constraint violations
+    let marked = 0;
     try {
-      db.prepare(`DELETE FROM sale_voids WHERE invoice_number = ?`).run(invoiceNumber);
+      const result = db.prepare(`
+        INSERT INTO deleted_sales (invoice_number, sale_id, reason, deleted_by)
+        VALUES (?, ?, 'manual_deletion', NULL)
+      `).run(invoiceNumber, sale.id);
+      marked = result.changes;
+      logger.info(`   ✅ Vente marquée comme supprimée dans deleted_sales (soft-delete)`);
     } catch (e) {
-      // Pas critique
+      logger.error(`   ❌ Erreur insertion deleted_sales: ${e.message}`);
+      throw e;
     }
     
-    // 8. Notifier via WebSocket
+    // 8. Notifier via WebSocket pour rafraîchir UI localement + AI LaGrace
     try {
       const io = getSocketIO();
       if (io) {
         io.emit('sale:deleted', { 
           invoice_number: invoiceNumber,
+          client_name: sale.client_name || '',  // ✅ Pour l'IA vocale
           stock_restored: stockRestored.length 
         });
         io.emit('stock:updated', { 
           products: stockRestored.map(s => s.product_code),
-          reason: 'sale_deleted'
+          reason: 'sale_deleted',
+          ts: new Date().toISOString()
         });
         io.emit('products:updated', {
           ts: new Date().toISOString(),
@@ -1401,25 +1423,57 @@ router.delete('/:invoiceNumber', optionalAuth, async (req, res) => {
         });
       }
     } catch (e) {
-      // Pas critique
+      logger.warn(`   ⚠️ WebSocket notification failed: ${e.message}`);
+    }
+    
+    // ✅ 9. SYNC SHEETS: Enqueue suppression pour supprimer les lignes dans la feuille "Ventes"
+    // Note: Le stock est restauré localement, la sync vers Sheets supprime juste les lignes de vente
+    try {
+      outboxRepo.enqueueSaleDeleted(invoiceNumber, items.filter(i => i !== null));
+      logger.info(`   📤 SYNC Sheets: SALE_DELETED enqueued pour facture ${invoiceNumber}`);
+    } catch (syncErr) {
+      logger.warn(`   ⚠️ Erreur enqueue SALE_DELETED (sync continuera en background): ${syncErr.message}`);
     }
     
     logger.info(`${'═'.repeat(60)}`);
     logger.info(`✅ [DELETE SALE] Facture ${invoiceNumber} supprimée`);
-    logger.info(`   Stock restauré: ${stockRestored.length} produit(s)`);
-    logger.info(`   Sync pending: ${stockRestored.length} update_stock`);
+    logger.info(`   Stock restauré localement: ${stockRestored.length} produit(s)`);
+    logger.info(`   Sync Sheets: Suppression des lignes en cours...`);
     logger.info(`${'═'.repeat(60)}\n`);
+    
+    // ✅ Notifier les clients pour invalider le cache analytics (totaux d'argent)
+    // Cela force le frontend à recharger les totaux du jour (Dashboard)
+    try {
+      const io = getSocketIO();
+      if (io) {
+        io.emit('analytics:invalidate', {
+          scope: 'today',
+          reason: 'sale_deleted',
+          invoice_number: invoiceNumber
+        });
+        logger.info(`   📊 WebSocket: analytics:invalidate émis`);
+      }
+    } catch (e) {
+      logger.warn(`   ⚠️ WebSocket analytics:invalidate failed: ${e.message}`);
+    }
     
     res.json({
       success: true,
-      message: `Facture ${invoiceNumber} supprimée`,
+      message: `Facture ${invoiceNumber} supprimée et stock restauré`,
       stockRestored: stockRestored,
-      syncPending: stockRestored.length
+      sync: 'sheets_queued'
     });
     
   } catch (error) {
     logger.error(`❌ [DELETE SALE] Erreur:`, error);
-    res.status(500).json({ success: false, error: error.message });
+    logger.error(`   Message: ${error.message}`);
+    logger.error(`   Stack: ${error.stack}`);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message,
+      message: `Erreur lors de la suppression: ${error.message}`,
+      details: error.stack
+    });
   }
 });
 

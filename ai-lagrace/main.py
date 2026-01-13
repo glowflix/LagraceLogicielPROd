@@ -103,17 +103,8 @@ def check_vosk_model():
     
     model_path = Path(settings.vosk_model_path)
     
-    if not model_path.exists():
-        print(f"{Fore.RED}❌ Modèle Vosk non trouvé{Style.RESET_ALL}")
-        print(f"{Fore.YELLOW}📁 Chemin attendu: {model_path}{Style.RESET_ALL}")
-        print(f"\n{Fore.CYAN}📥 Pour télécharger le modèle:{Style.RESET_ALL}")
-        print(f"   1. Allez sur: {Fore.BLUE}https://alphacephei.com/vosk/models{Style.RESET_ALL}")
-        print(f"   2. Téléchargez: {Fore.GREEN}vosk-model-small-fr-0.22{Style.RESET_ALL} (~40 MB)")
-        print(f"   3. Extrayez dans: {Fore.YELLOW}{model_path.parent}{Style.RESET_ALL}")
-        return False
-    
-    print(f"{Fore.GREEN}✅ Modèle Vosk trouvé{Style.RESET_ALL}")
-    return True
+    # Vosk est optionnel - ne pas afficher d'erreur
+    return model_path.exists()
 
 
 def run_test_mode():
@@ -196,9 +187,9 @@ Exemples:
     
     # Log de démarrage
     print(f"\n{Fore.CYAN}{'='*60}{Style.RESET_ALL}")
-    print(f"{Fore.WHITE}   Démarrage: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{Style.RESET_ALL}")
-    print(f"{Fore.WHITE}   Python: {sys.version.split()[0]}{Style.RESET_ALL}")
-    print(f"{Fore.WHITE}   Plateforme: {sys.platform}{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}   Démarrage: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}   Python: {sys.version.split()[0]}{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}   Plateforme: {sys.platform}{Style.RESET_ALL}")
     print(f"{Fore.CYAN}{'='*60}{Style.RESET_ALL}\n")
     
     # Mode vérification
@@ -212,12 +203,9 @@ Exemples:
     if not check_dependencies():
         sys.exit(1)
     
-    # Vérifier le modèle Vosk
+    # Vérifier le modèle Vosk (silencieusement - c'est optionnel)
     print(f"{Fore.CYAN}[2/3] Vérification du modèle Vosk...{Style.RESET_ALL}")
-    if not check_vosk_model():
-        print(f"\n{Fore.YELLOW}⚠️  Modèle Vosk non trouvé{Style.RESET_ALL}")
-        print(f"{Fore.YELLOW}   L'assistant fonctionnera SANS reconnaissance vocale{Style.RESET_ALL}")
-        print(f"{Fore.YELLOW}   (les annonces de ventes/impressions fonctionneront){Style.RESET_ALL}")
+    check_vosk_model()  # Juste vérifier, pas besoin d'afficher les warnings
     
     # Mode test
     if args.test:

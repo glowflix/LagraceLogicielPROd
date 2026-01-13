@@ -155,7 +155,7 @@ function App() {
   if (publicPaths.includes(location.pathname)) {
     return (
       <AnimatePresence 
-        mode="wait" 
+        mode="sync" 
         initial={false}
         // ✅ Optimisations pour fluidité maximale
         presenceAffectsLayout={false}
@@ -194,7 +194,7 @@ function App() {
 
   return (
     <Layout>
-      <AnimatePresence mode="wait" initial={false}>
+      <AnimatePresence mode="sync" initial={false}>
         <PageTransition key={location.pathname}>
           <Routes location={location}>
             <Route path="/" element={<Navigate to="/dashboard" replace />} />

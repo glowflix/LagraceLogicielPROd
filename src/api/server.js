@@ -8,6 +8,7 @@ import { resolve } from 'path';
 import os from 'os';
 import { spawn } from 'child_process';
 import { pathToFileURL } from 'url';
+import { createProxyMiddleware } from 'http-proxy-middleware';
 import { ensureDirs, getDbPath, getProjectRoot, getResourcesRoot, getPrintDir } from '../core/paths.js';
 import { logger } from '../core/logger.js';
 import { initSchema, getDb } from '../db/sqlite.js';
@@ -28,6 +29,7 @@ import syncRoutes from './routes/sync.routes.js';
 import licenseRoutes from './routes/license.routes.js';
 import autosyncRoutes from './routes/autosync.routes.js';
 import autoStockRouter, { startAutoCheck, stopAutoCheck } from './routes/router.autostock.js';
+import systemRoutes from './routes/system.routes.js';
 import { autoSyncService } from './services/autoSync.service.js';
 
 // Middlewares
@@ -67,11 +69,11 @@ const found = candidates.find(p => existsSync(p));
 
 if (found) {
   dotenv.config({ path: found });
-  console.log(`✅ Variables d'environnement chargées depuis: ${found}`);
+  // ✅ PRO: Log minimal au démarrage
+  logger.info(`[ENV] Config: ${found}`);
 } else {
   dotenv.config();
-  console.warn(`⚠️  Aucun config.env/.env trouvé aux emplacements: ${candidates.join(' | ')}`);
-  console.warn(`⚠️  Utilisation des variables d'environnement système`);
+  logger.warn(`[ENV] Aucun config.env trouvé`);
 }
 
 // ✅ Expanser les variables Windows (%APPDATA%, etc.)
@@ -79,27 +81,13 @@ for (const key of Object.keys(process.env)) {
   process.env[key] = expandWinVars(process.env[key]);
 }
 
-// Log des variables importantes pour le debug
-console.log(`[INIT] APP_ROOT=${getAppRoot()}`);
-console.log(`[INIT] RESOURCES_ROOT=${getResourcesRoot()}`);
-console.log(`[INIT] process.cwd()=${process.cwd()}`);
-
 
 // === AI LaGrace - Configuration automatique ===
 const AI_ENABLED = process.env.AI_LAGRACE_ENABLED !== 'false';
-let AI_AUTOSTART = process.env.AI_LAGRACE_AUTOSTART !== 'false';
-// ✅ EN PRODUCTION: l'IA est lancée par Electron via startAI() → AI_AUTOSTART = false ici
-// ✅ EN DÉVELOPPEMENT (web): l'IA peut être lancée via API /api/ai/start → AI_AUTOSTART = false aussi
-// ✅ JAMAIS d'autostart dans server.js, car:
-//    - En EXE Electron: Electron lance l'IA seul
-//    - En web: l'utilisateur démarre l'IA via le UI/API
-if (isElectronRuntime()) {
-  // Electron gère l'IA seul
-  AI_AUTOSTART = false;
-} else {
-  // Navigateur web: l'IA démarre à la demande (via API /api/ai/start)
-  AI_AUTOSTART = false;
-}
+// ✅ EN PRODUCTION: l'IA est lancée par Electron via startAI() → JAMAIS autostart ici
+// ✅ EN DÉVELOPPEMENT: l'IA démarre à la demande via API /api/ai/start
+// ✅ JAMAIS d'autostart dans server.js (bloque le démarrage du serveur)
+let AI_AUTOSTART = false; // ✅ ALWAYS false - pas de blocage au démarrage
 
 logger.info(`[AI] Détection: isElectron=${isElectronRuntime()}, AI_ENABLED=${AI_ENABLED}, AI_AUTOSTART=${AI_AUTOSTART}`);
 
@@ -398,6 +386,7 @@ app.use('/api/sync', syncRoutes);
 app.use('/api/license', licenseRoutes);
 app.use('/api/autosync', autosyncRoutes);
 app.use('/api/autostock', autoStockRouter);
+app.use('/api/system', systemRoutes);
 
 // ⚠️ app.locals.db sera assignée dans startBackend() APRÈS initSchema()
 // (pour éviter que la DB ne s'ouvre au mauvais chemin en production EXE)
@@ -572,84 +561,63 @@ export async function startBackend({
   }
 
   // ✅ DÉTECTION: Vérifie si on est en production (packaged) ou développement
-  // Cela définit aussi DIST_DIR pour startAI()
   isPackaged = resourcesPath && resourcesPath.includes('resources');
-  DIST_DIR = resourcesPath || process.cwd();  // ressources path en prod, cwd en dev
-  
-  logger.info(`[APP] Mode: ${isPackaged ? 'PRODUCTION (packaged)' : 'DÉVELOPPEMENT'}`);
-  logger.info(`[APP] DIST_DIR=${DIST_DIR}`);
-  logger.info(`[APP] AI_DIR=${isPackaged ? resolve(DIST_DIR, 'ai') : resolve(getProjectRoot(), 'ai-lagrace')}`);
+  DIST_DIR = resourcesPath || process.cwd();
 
-  // ✅ IMPORTANT: Créer les dossiers et initialiser la DB APRÈS avoir posé les env vars
-  // Cela garantit que les chemins sont corrects en production (EXE)
+  // ✅ OPTIMISATION: Créer les dossiers, puis démarrer le serveur rapidement
   ensureDirs();
-  initSchema();
   
-  // ✅ Assigner la DB à app.locals APRÈS initSchema() pour éviter les problèmes de chemin en prod
-  app.locals.db = getDb();
-
-  // ✅ DIAGNOSTIC: Vérifier que les chemins sont corrects
-  console.log('[PATHS] DATA_ROOT=', getProjectRoot());
-  console.log('[PATHS] RESOURCES_ROOT=', getResourcesRoot());
-  console.log('[PATHS] DB_PATH=', getDbPath());
-  console.log('[PATHS] PRINT_DIR=', getPrintDir());
-  if (getProjectRoot() === process.env.APPDATA || getProjectRoot().includes('Program Files')) {
-    console.warn('⚠️  ALERTE: getProjectRoot() pointe vers Program Files - check LAGRACE_DATA_DIR!');
-  }
-
-  // ✅ OPTIMISATION: Le module d'impression sera chargé EN ARRIÈRE-PLAN après le démarrage du serveur
-  // Cela permet au health check de répondre rapidement pour Electron
-  logger.info('🖨️  [PRINT] Module d\'impression: chargement différé (après serveur HTTP)');
+  // ⏳ Initialiser la DB en arrière-plan (non-blocking)
+  let dbReady = false;
+  const initDbAsync = async () => {
+    try {
+      initSchema();
+      const dbInstance = getDb();
+      app.locals.db = dbInstance;
+      dbReady = true;
+      logger.info('✅ [DB] Prête');
+    } catch (error) {
+      logger.error('❌ [DB] Erreur:', error.message);
+      try {
+        app.locals.db = getDb();
+      } catch (e) {}
+      dbReady = false;
+    }
+  };
+  
+  // Lancer l'initialisation DB sans attendre
+  initDbAsync();
   
   // ✅ Fonction pour charger le module d'impression en arrière-plan
   const loadPrintModuleAsync = async () => {
     try {
       const resourcesRoot = getResourcesRoot();
       
-      // ✅✅✅ RECHERCHE EXHAUSTIVE DU MODULE PRINT (DEV + EXE) ✅✅✅
+      // ✅ RECHERCHE OPTIMISÉE: Premier chemin trouvé = utilisé (rapide)
       const candidatePaths = [
         // Mode EXE - Electron resourcesPath
         resourcesPath ? path.join(resourcesPath, 'print', 'module.js') : null,
         // Mode EXE - resources root
         path.join(resourcesRoot, 'print', 'module.js'),
-        // Mode EXE - app.asar.unpacked
-        resourcesPath ? path.join(resourcesPath, 'app.asar.unpacked', 'print', 'module.js') : null,
-        // Mode EXE - dossier parent de resources
-        resourcesPath ? path.join(path.dirname(resourcesPath), 'print', 'module.js') : null,
         // Mode DEV - process.cwd()
         path.join(process.cwd(), 'print', 'module.js'),
         // Mode DEV - __dirname relatif
         path.resolve('print', 'module.js'),
       ].filter(Boolean);
       
-      console.log('\n');
-      console.log('╔══════════════════════════════════════════════════════════════════════╗');
-      console.log('║  🖨️  RECHERCHE DU MODULE D\'IMPRESSION                                 ║');
-      console.log('╠══════════════════════════════════════════════════════════════════════╣');
-      console.log(`║  📁 resourcesPath: ${(resourcesPath || '(non défini)').slice(0,48).padEnd(48)} ║`);
-      console.log(`║  📁 resourcesRoot: ${resourcesRoot.slice(0,48).padEnd(48)} ║`);
-      console.log(`║  📁 cwd(): ${process.cwd().slice(0,56).padEnd(56)} ║`);
-      console.log('╠══════════════════════════════════════════════════════════════════════╣');
-      
       let printModuleFile = null;
       for (const p of candidatePaths) {
-        const exists = existsSync(p);
-        console.log(`║  ${exists ? '✅' : '❌'} ${p.slice(0,64).padEnd(64)} ║`);
-        if (exists && !printModuleFile) {
+        if (existsSync(p)) {
           printModuleFile = p;
+          break; // ✅ Premier trouvé = utilisé
         }
       }
-      console.log('╚══════════════════════════════════════════════════════════════════════╝');
-      console.log('\n');
 
       if (!printModuleFile) {
-        throw new Error(`print/module.js introuvable dans tous les chemins candidats`);
+        throw new Error(`print/module.js introuvable. Cherché dans: ${candidatePaths.join(' | ')}`);
       }
 
-      console.log(`🖨️  [PRINT] Module trouvé: ${printModuleFile}`);
-      console.log(`📁 [PRINT] PrintDir: ${getPrintDir()}`);
-      
-      logger.info(`[PRINT] Chargement du module: ${printModuleFile}`);
+      logger.info(`[PRINT] Module: ${printModuleFile}`);
 
       const mod = await import(pathToFileURL(printModuleFile).href);
       // ✅ Tolérer export default si la structure change
@@ -669,16 +637,10 @@ export async function startBackend({
       
       if (!existsSync(templatesDir)) {
         templatesDir = path.join(getProjectRoot(), 'print', 'templates');
-        logger.info(`[PRINT] Templates non trouvés en prod, fallback dev: ${templatesDir}`);
       }
       if (!existsSync(assetsDir)) {
         assetsDir = path.join(getProjectRoot(), 'print', 'assets');
-        logger.info(`[PRINT] Assets non trouvés en prod, fallback dev: ${assetsDir}`);
       }
-
-      // ✅ Vérifier l'existence des dossiers templates/assets
-      if (!existsSync(templatesDir)) logger.warn(`[PRINT] templatesDir manquant: ${templatesDir}`);
-      if (!existsSync(assetsDir)) logger.warn(`[PRINT] assetsDir manquant: ${assetsDir}`);
 
       printerModule = createPrinterModule({
         io,
@@ -686,54 +648,22 @@ export async function startBackend({
         printDir,        // writable
         templatesDir,    // read-only packagé
         assetsDir,       // read-only packagé
+        express,         // ✅ injecté (évite import depuis app.asar.unpacked)
       });
 
       // ✅ IMPORTANT: Démarrer le watcher pour l'impression automatique
       if (printerModule && typeof printerModule.start === 'function') {
         printerModule.start();
-        
-        // 🖨️  LOGS TRÈS VISIBLES DANS LE TERMINAL
-        console.log('\n' + '='.repeat(70));
-        console.log('✅ [PRINT] WATCHER D\'IMPRESSION DÉMARRÉ (OFFLINE-FIRST)');
-        console.log('='.repeat(70));
-        console.log(`📁 Dossier surveillé: ${printDir}`);
-        console.log(`🖨️  L'impression est ACTIVE et INDÉPENDANTE de Google Sheets`);
-        console.log(`📋 Les jobs seront traités dès qu'ils apparaissent dans le dossier`);
-        console.log('='.repeat(70) + '\n');
-        
-        logger.info('✅ Watcher d\'impression démarré (OFFLINE-FIRST)');
-        logger.info(`📁 Dossier impression: ${printDir}`);
+        logger.info(`✅ [PRINT] Prêt - ${printDir}`);
       } else {
-        console.log('\n' + '!'.repeat(70));
-        console.log('❌ [PRINT] ERREUR CRITIQUE: printerModule.start() NON DISPONIBLE');
-        console.log('!'.repeat(70) + '\n');
-        logger.error('❌ CRITIQUE: printerModule.start() non disponible - impression NON fonctionnelle');
+        logger.error('❌ [PRINT] Module non disponible');
       }
 
       printerModuleReady = true;
-      console.log('✅ [PRINT] Module d\'impression chargé avec succès!\n');
-      logger.info('✅ Printer module chargé avec succès');
     } catch (error) {
       printerModuleReady = false;
       printerModule = null;
-      
-      // 🔴 ERREUR TRÈS VISIBLE DANS LE TERMINAL
-      console.log('\n');
-      console.log('╔══════════════════════════════════════════════════════════════════════╗');
-      console.log('║  ❌ ERREUR CHARGEMENT MODULE D\'IMPRESSION                             ║');
-      console.log('╠══════════════════════════════════════════════════════════════════════╣');
-      console.log(`║  Message: ${error.message.slice(0,58).padEnd(58)} ║`);
-      console.log('╠══════════════════════════════════════════════════════════════════════╣');
-      console.log('║  🔧 SOLUTIONS POSSIBLES:                                              ║');
-      console.log('║     1. Vérifier que print/module.js est inclus dans l\'EXE            ║');
-      console.log('║     2. Vérifier les logs ci-dessus pour les chemins testés           ║');
-      console.log('║     3. Rebuild avec: npm run build                                    ║');
-      console.log('╚══════════════════════════════════════════════════════════════════════╝');
-      console.log('\n');
-      
-      logger.error('❌ Erreur chargement printer module:', error.message);
-      if (error.stack) logger.error('   Stack:', error.stack);
-      logger.warn('⚠️  IMPRESSION INDISPONIBLE - Le backend continue sans impression');
+      logger.error('❌ [PRINT] Erreur:', error.message);
     }
   };
 
@@ -750,70 +680,284 @@ export async function startBackend({
   logger.info(`[PATHS] DIST_DIR=${DIST_DIR}`);
   logger.info(`[PATHS] UI existant: ${existsSync(DIST_DIR)}`);
 
-  // ✅ Servir l'UI statique (priorité à staticDir, sinon DIST_DIR en fallback)
-  const uiDir = (staticDir && existsSync(staticDir)) ? staticDir : DIST_DIR;
-
-  if (uiDir && existsSync(uiDir)) {
-    // ✅ VÉRIFIER QUE LES ASSETS EXISTENT
-    const assetsDir = resolve(uiDir, 'assets');
-    const indexHtml = resolve(uiDir, 'index.html');
-    const hasAssets = existsSync(assetsDir);
-    const hasIndex = existsSync(indexHtml);
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MODE DÉVELOPPEMENT PRO: Port 3030 sert l'UI exactement comme Vite (5173)
+  // ═══════════════════════════════════════════════════════════════════════════
+  const isDev = process.env.NODE_ENV !== 'production';
+  const VITE_DEV_SERVER = 'http://localhost:5173';
+  
+  // Variable pour tracker si Vite est disponible
+  let viteAvailable = false;
+  let viteCheckAttempts = 0;
+  
+  // ✅ Fonction pour vérifier si Vite est prêt (utilise http natif Node.js)
+  const checkViteReady = () => {
+    return new Promise((resolve) => {
+      const http = require('http');
+      const req = http.get(VITE_DEV_SERVER, { timeout: 1000 }, (res) => {
+        viteAvailable = res.statusCode >= 200 && res.statusCode < 400;
+        res.resume(); // Consommer la réponse
+        resolve(viteAvailable);
+      });
+      req.on('error', () => {
+        viteAvailable = false;
+        resolve(false);
+      });
+      req.on('timeout', () => {
+        req.destroy();
+        viteAvailable = false;
+        resolve(false);
+      });
+    });
+  };
+  
+  if (isDev && !staticDir) {
+    logger.info(`[DEV-MODE] 🔄 Mode DEV PRO: Port 3030 = Port 5173 (même interface)`);
     
-    logger.info(`[STATIC] 🎨 Assets dir: ${assetsDir} (existe: ${hasAssets})`);
-    logger.info(`[STATIC] 📄 index.html: ${indexHtml} (existe: ${hasIndex})`);
+    // ✅ Page d'attente élégante pendant que Vite démarre
+    const waitingPageHTML = `
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LA GRACE POS - Démarrage...</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      min-height: 100vh;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+      color: white;
+    }
+    .container {
+      text-align: center;
+      padding: 2rem;
+    }
+    .logo {
+      font-size: 3rem;
+      font-weight: bold;
+      background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom: 1rem;
+    }
+    .spinner {
+      width: 50px;
+      height: 50px;
+      border: 3px solid rgba(255,255,255,0.1);
+      border-top-color: #667eea;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      margin: 2rem auto;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .status {
+      color: rgba(255,255,255,0.7);
+      font-size: 0.9rem;
+      margin-top: 1rem;
+    }
+    .hint {
+      color: rgba(255,255,255,0.5);
+      font-size: 0.8rem;
+      margin-top: 2rem;
+    }
+    .port-info {
+      background: rgba(255,255,255,0.1);
+      border-radius: 8px;
+      padding: 1rem;
+      margin-top: 2rem;
+      font-size: 0.85rem;
+    }
+    .port-info code {
+      background: rgba(102, 126, 234, 0.3);
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-family: monospace;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="logo">LA GRACE POS</div>
+    <div class="spinner"></div>
+    <div class="status">Démarrage de l'interface...</div>
+    <div class="port-info">
+      <div>🖥️ Backend API: <code>:3030</code> ✅ Prêt</div>
+      <div style="margin-top: 0.5rem">🎨 Interface UI: <code>:5173</code> ⏳ Chargement...</div>
+    </div>
+    <div class="hint">
+      La page se rechargera automatiquement<br>
+      quand l'interface sera prête.
+    </div>
+  </div>
+  <script>
+    // Auto-refresh toutes les 2 secondes jusqu'à ce que Vite soit prêt
+    let attempts = 0;
+    const maxAttempts = 30;
     
-    // ✅ Lister les fichiers du répertoire UI pour diagnostic
-    if (existsSync(uiDir)) {
-      const files = fs.readdirSync(uiDir).slice(0, 20); // Les 20 premiers fichiers
-      logger.info(`[STATIC] Contenu de ${uiDir}: ${files.join(', ')}`);
+    async function checkAndReload() {
+      attempts++;
+      try {
+        const res = await fetch('/api/health');
+        if (res.ok) {
+          // Backend OK, vérifier si Vite est prêt via le proxy
+          const uiRes = await fetch('/', { method: 'HEAD' });
+          // Si on reçoit du HTML sans "Démarrage", Vite est prêt
+          if (uiRes.ok) {
+            const text = await (await fetch('/')).text();
+            if (!text.includes('Démarrage de l\\'interface')) {
+              location.reload();
+              return;
+            }
+          }
+        }
+      } catch (e) {}
+      
+      if (attempts < maxAttempts) {
+        setTimeout(checkAndReload, 2000);
+      } else {
+        document.querySelector('.status').textContent = 
+          'Temps d\\'attente dépassé. Rechargez la page manuellement.';
+      }
     }
     
-    if (!hasAssets) {
-      logger.warn(`⚠️  ALERTE: Le dossier assets manque! ${assetsDir}`);
-      logger.warn(`⚠️  Les fichiers JS/CSS (index-*.js) ne seront PAS trouvés`);
-      logger.warn(`⚠️  Vérifier: extraResources dans electron-builder.json`);
-    }
-    if (!hasIndex) {
-      logger.warn(`⚠️  ALERTE: index.html manque! ${indexHtml}`);
-    }
+    setTimeout(checkAndReload, 2000);
+  </script>
+</body>
+</html>`;
     
-    app.use(express.static(uiDir));
-    logger.info(`[STATIC] ✅ UI servie depuis: ${uiDir}`);
-  } else {
-    logger.error(`❌ ERREUR CRITIQUE: Aucun dossier UI valide trouvé`);
-    logger.error(`   staticDir=${staticDir} (existe: ${staticDir ? existsSync(staticDir) : 'N/A'})`);
-    logger.error(`   DIST_DIR=${DIST_DIR} (existe: ${existsSync(DIST_DIR)})`);
-    logger.warn(`⚠️  Les clients recevront index.html mais les assets JS/CSS seront manquants`);
-  }
-
-  // ✅ IMPORTANT: Route catch-all APRÈS express.static() pour SPA routing
-  // Cela permet à React Router de gérer les routes côté client
-  app.get('*', (req, res) => {
-    // Ne pas servir index.html pour les routes API et Socket.IO
-    if (req.path.startsWith('/api') || req.path.startsWith('/socket.io')) {
-      // Les routes API non trouvées passent au middleware notFound
-      return res.status(404).json({ success: false, error: 'Route non trouvée' });
-    }
-    
-    // Ne pas servir index.html pour les fichiers avec extension (.js, .css, .png, etc.)
-    if (/\.\w+$/.test(req.path)) {
-      // Les fichiers non trouvés (comme assets manquants) retournent 404
-      return res.status(404).send('Fichier non trouvé');
-    }
-    
-    // Servir index.html pour toutes les autres routes (SPA routing)
-    const indexPath = path.join(uiDir, 'index.html');
-    if (!existsSync(indexPath)) {
-      return res.status(404).send('index.html non trouvé');
-    }
-    
-    res.sendFile(indexPath, (err) => {
-      if (err) {
-        res.status(500).send('Erreur serveur');
+    // ✅ PROXY PRO vers Vite - Port 3030 = Port 5173 (même expérience!)
+    // ⚠️ IMPORTANT: ws: false ici - les WebSockets sont gérés manuellement plus bas
+    // pour éviter le conflit avec Socket.IO du backend
+    const viteProxy = createProxyMiddleware({
+      target: VITE_DEV_SERVER,
+      changeOrigin: true,
+      ws: false, // ⚠️ DÉSACTIVÉ - WebSockets gérés manuellement pour éviter conflit avec Socket.IO
+      logLevel: 'silent',
+      // ✅ Ne pas proxyer les routes API ni Socket.IO du backend
+      filter: (pathname) => {
+        // Exclure les routes du backend
+        if (pathname.startsWith('/api')) return false;
+        if (pathname.startsWith('/socket.io')) return false;
+        return true;
+      },
+      onProxyReq: (proxyReq, req) => {
+        proxyReq.setHeader('X-Proxied-From', '3030');
+      },
+      onError: (err, req, res) => {
+        if (!res.headersSent) {
+          viteCheckAttempts++;
+          if (viteCheckAttempts <= 3) {
+            res.setHeader('Content-Type', 'text/html; charset=utf-8');
+            res.status(200).send(waitingPageHTML);
+          } else {
+            const uiDir = DIST_DIR;
+            if (existsSync(uiDir)) {
+              const indexPath = path.join(uiDir, 'index.html');
+              if (existsSync(indexPath)) {
+                res.sendFile(indexPath);
+                return;
+              }
+            }
+            res.setHeader('Content-Type', 'text/html; charset=utf-8');
+            res.status(200).send(waitingPageHTML);
+          }
+        }
       }
     });
-  });
+    
+    // ✅ Appliquer le proxy pour toutes les routes non-API
+    app.use((req, res, next) => {
+      if (req.path.startsWith('/api') || req.path.startsWith('/socket.io')) {
+        return next();
+      }
+      return viteProxy(req, res, next);
+    });
+    
+    // ✅ NOTE: Socket.IO gère ses propres WebSockets sur /socket.io
+    // Le HMR Vite se connecte directement à ws://localhost:5173 (pas besoin de proxy)
+    // Donc pas de gestion 'upgrade' additionnelle nécessaire ici
+    
+    logger.info(`[DEV-MODE] ✅ Port 3030: API + Proxy UI (Socket.IO sur 3030, HMR sur 5173)`);
+    
+    // ✅ Vérifier périodiquement si Vite est prêt
+    const viteCheckInterval = setInterval(async () => {
+      if (await checkViteReady()) {
+        logger.info(`[DEV-MODE] ✅ Vite détecté et prêt!`);
+        clearInterval(viteCheckInterval);
+      }
+    }, 2000);
+    
+    logger.info(`[DEV-MODE] ✅ Proxy Vite activé - http://localhost:3030 ↔ ${VITE_DEV_SERVER}`);
+    logger.info(`[DEV-MODE] 🔌 Socket.IO sur port 3030 (pas de proxy)`);
+    
+  } else {
+    // ✅ MODE PRODUCTION ou staticDir fourni: Servir les fichiers statiques
+    const uiDir = (staticDir && existsSync(staticDir)) ? staticDir : DIST_DIR;
+
+    if (uiDir && existsSync(uiDir)) {
+      // ✅ VÉRIFIER QUE LES ASSETS EXISTENT
+      const assetsDir = resolve(uiDir, 'assets');
+      const indexHtml = resolve(uiDir, 'index.html');
+      const hasAssets = existsSync(assetsDir);
+      const hasIndex = existsSync(indexHtml);
+      
+      logger.info(`[STATIC] 🎨 Assets dir: ${assetsDir} (existe: ${hasAssets})`);
+      logger.info(`[STATIC] 📄 index.html: ${indexHtml} (existe: ${hasIndex})`);
+      
+      // ✅ Lister les fichiers du répertoire UI pour diagnostic
+      if (existsSync(uiDir)) {
+        const files = fs.readdirSync(uiDir).slice(0, 20); // Les 20 premiers fichiers
+        logger.info(`[STATIC] Contenu de ${uiDir}: ${files.join(', ')}`);
+      }
+      
+      if (!hasAssets) {
+        logger.warn(`⚠️  ALERTE: Le dossier assets manque! ${assetsDir}`);
+        logger.warn(`⚠️  Les fichiers JS/CSS (index-*.js) ne seront PAS trouvés`);
+        logger.warn(`⚠️  Vérifier: extraResources dans electron-builder.json`);
+      }
+      if (!hasIndex) {
+        logger.warn(`⚠️  ALERTE: index.html manque! ${indexHtml}`);
+      }
+      
+      app.use(express.static(uiDir));
+      logger.info(`[STATIC] ✅ UI servie depuis: ${uiDir}`);
+      
+      // ✅ IMPORTANT: Route catch-all APRÈS express.static() pour SPA routing
+      app.get('*', (req, res) => {
+        // Ne pas servir index.html pour les routes API et Socket.IO
+        if (req.path.startsWith('/api') || req.path.startsWith('/socket.io')) {
+          return res.status(404).json({ success: false, error: 'Route non trouvée' });
+        }
+        
+        // Ne pas servir index.html pour les fichiers avec extension (.js, .css, .png, etc.)
+        if (/\.\w+$/.test(req.path)) {
+          return res.status(404).send('Fichier non trouvé');
+        }
+        
+        // Servir index.html pour toutes les autres routes (SPA routing)
+        const indexPath = path.join(uiDir, 'index.html');
+        if (!existsSync(indexPath)) {
+          return res.status(404).send('index.html non trouvé');
+        }
+        
+        res.sendFile(indexPath, (err) => {
+          if (err) {
+            res.status(500).send('Erreur serveur');
+          }
+        });
+      });
+    } else {
+      logger.error(`❌ ERREUR CRITIQUE: Aucun dossier UI valide trouvé`);
+      logger.error(`   staticDir=${staticDir} (existe: ${staticDir ? existsSync(staticDir) : 'N/A'})`);
+      logger.error(`   DIST_DIR=${DIST_DIR} (existe: ${existsSync(DIST_DIR)})`);
+      logger.warn(`⚠️  Les clients recevront index.html mais les assets JS/CSS seront manquants`);
+    }
+  }
 
   // ✅ IMPORTANT: Middleware d'erreur APRÈS le catch-all SPA
   // Pour que le catch-all SPA s'exécute AVANT notFound
@@ -832,60 +976,42 @@ export async function startBackend({
       Object.keys(networkInterfaces).forEach((interfaceName) => {
         networkInterfaces[interfaceName].forEach((iface) => {
           if (iface.family === 'IPv4' && !iface.internal) {
-            addresses.push(`http://${iface.address}:${port}`);
+            addresses.push({ name: interfaceName, ip: iface.address });
           }
         });
       });
       
-      logger.info(`🚀 Serveur démarré sur http://${host === '0.0.0.0' ? 'localhost' : host}:${port}`);
-      if (addresses.length > 0) {
-        logger.info(`🌐 Accessible sur le réseau local:`);
-        addresses.forEach(addr => logger.info(`   - ${addr}`));
-      }
-      logger.info(`📁 Base de données: ${getDbPath()}`);
-      logger.info(`✅ API disponible sur http://localhost:${port}/api`);
-      logger.info(`🔌 WebSocket disponible pour synchronisation temps réel`);
+      // ═══════════════════════════════════════════════════════════════════════
+      // ✅ AFFICHAGE PRO COMPACT - Démarrage rapide
+      // ═══════════════════════════════════════════════════════════════════════
+      const networkIP = addresses.length > 0 ? addresses[0].ip : 'localhost';
+      console.log('');
+      console.log(`  🚀 LA GRACE POS - Backend prêt!`);
+      console.log(`     Local:   http://localhost:${port}/`);
+      console.log(`     Réseau:  http://${networkIP}:${port}/`);
+      console.log('');
       
-      // ✅✅✅ PRIORITÉ ABSOLUE: Charger le module d'impression IMMÉDIATEMENT ✅✅✅
-      // Chargement SYNCHRONE pour garantir le démarrage
-      console.log('\n🖨️  [PRINT] Chargement IMMÉDIAT du module d\'impression...\n');
-      
-      try {
-        await loadPrintModuleAsync();
-        console.log('✅ [PRINT] Module d\'impression ACTIF et PRÊT!\n');
-      } catch (err) {
-        console.error('❌ [PRINT] ERREUR CRITIQUE:', err.message);
-        logger.error('❌ Erreur chargement module impression:', err.message);
-      }
-      
-      // ✅ PRIORITÉ 2: Démarrer le worker de synchronisation en arrière-plan
-      if (process.env.GOOGLE_SHEETS_WEBAPP_URL) {
-        // Délai de 500ms pour laisser le reste se stabiliser
-        setTimeout(() => {
-          syncWorker.start().catch(err => {
-            logger.error('❌ Erreur démarrage worker sync:', err);
-          });
-          logger.info('🔄 Worker de synchronisation démarré (arrière-plan)');
-        }, 500);
-      } else {
-        logger.warn('⚠️  GOOGLE_SHEETS_WEBAPP_URL non configuré, synchronisation désactivée');
-      }
+      // ✅ PRO: Charger tous les services en parallèle après 200ms
+      setTimeout(() => {
+        // Module d'impression
+        loadPrintModuleAsync().catch(() => {});
+        
+        // Worker de synchronisation
+        if (process.env.GOOGLE_SHEETS_WEBAPP_URL) {
+          syncWorker.start().catch(() => {});
+        }
 
-      // Démarrer l'auto-check (vérification automatique du stock toutes les 2 secondes)
-      startAutoCheck(getDb());
-      logger.info('🔄 AutoCheck démarré (vérification stock toutes les 2 secondes)');
+        // Auto-check stock
+        startAutoCheck(getDb());
+        
+        // Auto-sync
+        autoSyncService.start();
+        
+        logger.info('✅ Tous les services démarrés');
+      }, 200);
 
-      // ✅ Démarrer la synchronisation automatique (toutes les 10 secondes)
-      autoSyncService.start();
-      logger.info('🔄 AutoSync démarré (synchronisation intelligente toutes les 10 secondes)');
-
-      // Démarrer l'AI (après le serveur pour que Socket.IO soit prêt)
-      // Sauf si c'est Electron (IA gérée par main.cjs)
-      if (!isElectron) {
-        setTimeout(() => {
-          startAI().catch((err) => logger.error('[AI] Erreur démarrage:', err));
-        }, 2000);
-      }
+      // ✅ AI: Gérée uniquement par Electron en EXE, ou API en dev
+      // Pas de démarrage auto ici (évite les blocages)
 
       // ✅ Retourner l'objet avec stop()
       resolve({

@@ -69,9 +69,9 @@ export class DebtsSyncManager {
       syncLogger.info(`      📦 [DEBTS-PUSH] Envoi batch de ${ops.length} opération(s)`);
       
       // Envoyer via batchPush
-      const result = await sheetsClient.pushBatch(ops, { timeout: 15000 });
+      const result = await sheetsClient.pushBatch(ops, { timeout: 60000 });
       
-      if (result.success || result.applied) {
+      if (result.success && result.applied && result.applied.length > 0) {
         ackedOpIds.push(...debtOps.map(op => op.op_id));
         syncLogger.info(`      ✅ [DEBTS-PUSH] ${debtOps.length} dette(s) envoyée(s) avec succès`);
       } else {
@@ -145,9 +145,9 @@ export class DebtsSyncManager {
       syncLogger.info(`      📦 [PAYMENTS-PUSH] Envoi batch de ${ops.length} paiement(s)`);
       
       // Envoyer
-      const result = await sheetsClient.pushBatch(ops, { timeout: 15000 });
+      const result = await sheetsClient.pushBatch(ops, { timeout: 60000 });
       
-      if (result.success || result.applied) {
+      if (result.success && result.applied && result.applied.length > 0) {
         ackedOpIds.push(...paymentOps.map(op => op.op_id));
         syncLogger.info(`      ✅ [PAYMENTS-PUSH] ${paymentOps.length} paiement(s) envoyé(s)`);
       } else {
@@ -211,9 +211,9 @@ export class DebtsSyncManager {
         };
       });
       
-      const result = await sheetsClient.pushBatch(ops, { timeout: 15000 });
+      const result = await sheetsClient.pushBatch(ops, { timeout: 60000 });
       
-      if (result.success || result.applied) {
+      if (result.success && result.applied && result.applied.length > 0) {
         ackedOpIds.push(...clientOps.map(op => op.op_id));
         syncLogger.info(`      ✅ [CLIENTS-PUSH] ${clientOps.length} client(s) envoyé(s)`);
       } else {

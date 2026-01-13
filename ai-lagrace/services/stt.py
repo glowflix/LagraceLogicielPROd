@@ -83,10 +83,7 @@ class STTService:
         model_path = Path(settings.vosk_model_path)
         
         if not model_path.exists():
-            print(f"{Fore.RED}❌ Modèle Vosk non trouvé: {model_path}{Style.RESET_ALL}")
-            print(f"{Fore.YELLOW}💡 Téléchargez le modèle depuis:{Style.RESET_ALL}")
-            print(f"{Fore.CYAN}   https://alphacephei.com/vosk/models{Style.RESET_ALL}")
-            print(f"{Fore.YELLOW}   Puis extrayez dans: {model_path.parent}{Style.RESET_ALL}")
+            # Vosk est optionnel - retourner False silencieusement
             return False
         
         try:

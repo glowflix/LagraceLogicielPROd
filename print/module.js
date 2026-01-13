@@ -98,10 +98,8 @@ function ensureWritableDir(preferredDir) {
     const testFile = path.join(preferredDir, `.__writable_test_${Date.now()}.tmp`);
     fs.writeFileSync(testFile, "ok", "utf-8");
     fs.unlinkSync(testFile);
-    console.log(`[PRINT] ✅ Dossier accessible en écriture: ${preferredDir}`);
     return preferredDir;
   } catch (e) {
-    console.warn(`[PRINT] ⚠️ Dossier non accessible: ${preferredDir} - ${e.message}`);
     // Fallback vers dossier user-writable
     const base = process.env.PROGRAMDATA
       ? path.join(process.env.PROGRAMDATA, "LA GRACE POS")
@@ -111,11 +109,9 @@ function ensureWritableDir(preferredDir) {
     const fallback = path.join(base, "printer");
     try {
       fs.mkdirSync(fallback, { recursive: true });
-      console.log(`[PRINT] ✅ Fallback dossier: ${fallback}`);
       return fallback;
     } catch (e2) {
-      console.error(`[PRINT] ❌ Impossible de créer dossier fallback: ${e2.message}`);
-      return preferredDir; // Retourner quand même le préféré
+      return preferredDir;
     }
   }
 }
@@ -193,9 +189,8 @@ const banner = (level, title, lines=[]) => {
 
 /* ========= Constantes ========= */
 const DEFAULT_TEMPLATE   = process.env.PRINT_DEFAULT_TEMPLATE || "receipt-80";
-const TOP_NUDGE_MM_ENV   = Number(process.env.PRINT_TOP_NUDGE_MM ?? 0.5);
-const SAFE_NUDGE_MAX_MM  = 0.9;
-const TOP_NUDGE_MM       = Math.min(Math.max(0, TOP_NUDGE_MM_ENV), SAFE_NUDGE_MAX_MM);
+// ✅ TOP_NUDGE désactivé - les marges sont gérées dans les templates CSS
+const TOP_NUDGE_MM       = 0;
 const ROTATE_180         = (process.env.PRINT_ROTATE_180 ?? "0") !== "0";
 
 /* ========= Front (deep-link dettes) ========= */
@@ -433,7 +428,20 @@ function ensureDefaultTemplates(dir) {
   try {
     fs.mkdirSync(dir, { recursive: true });
     const file = path.join(dir, "receipt-80.hbs");
-    if (!fs.existsSync(file)) fs.writeFileSync(file, DEFAULT_80MM_HBS, "utf-8");
+    // ✅ TOUJOURS écrire le template par défaut pour garantir les marges correctes
+    // Sauf si le fichier source (print/templates) est plus récent
+    const sourceFile = path.join(__dirname, "templates", "receipt-80.hbs");
+    if (fs.existsSync(sourceFile)) {
+      // Si le fichier source existe, ne pas écraser avec le défaut
+      if (!fs.existsSync(file)) {
+        fs.writeFileSync(file, DEFAULT_80MM_HBS, "utf-8");
+        console.log("[PRINT] Template par défaut créé: receipt-80.hbs");
+      }
+    } else {
+      // Pas de fichier source, utiliser le template par défaut intégré
+      fs.writeFileSync(file, DEFAULT_80MM_HBS, "utf-8");
+      console.log("[PRINT] Template par défaut (intégré) écrit: receipt-80.hbs");
+    }
   } catch (e) {
     console.warn("[PRINT] ensureDefaultTemplates error:", e?.message || e);
   }
@@ -445,6 +453,12 @@ function createTemplateEngine(templatesDir, assetsDir) {
   const cache = new Map();
   let initPromise = null;
   let ready = false;
+  
+  // ✅ Mode DEV: désactiver le cache pour que les modifications soient prises en compte immédiatement
+  const isDev = process.env.NODE_ENV !== "production";
+  if (isDev) {
+    console.log("[PRINT] 🔧 Mode DEV: cache templates désactivé (rechargement à chaque impression)");
+  }
 
   const exists = (name)=>fs.existsSync(path.join(templatesDir, `${name}.hbs`));
 
@@ -467,6 +481,12 @@ function createTemplateEngine(templatesDir, assetsDir) {
     await ensureReady();
     const use = exists(name) ? name : DEFAULT_TEMPLATE;
     if (!exists(name)) console.warn(`[PRINT] Template '${name}' introuvable → fallback '${DEFAULT_TEMPLATE}'`);
+    
+    // ✅ En mode DEV, toujours recharger le template (pas de cache)
+    if (isDev) {
+      return load(use);
+    }
+    
     if (!cache.has(use)) cache.set(use, load(use));
     return cache.get(use);
   };
@@ -480,12 +500,19 @@ function createTemplateEngine(templatesDir, assetsDir) {
     },
     preloadAll: async () => {
       await ensureReady();
+      // ✅ En mode DEV, ne pas précharger (inutile car pas de cache)
+      if (isDev) return;
       try {
         const all = fs.readdirSync(templatesDir).filter(f => f.endsWith(".hbs"));
         for (const tpl of all) await compileIntoCache(tpl.replace(/\.hbs$/,""));
       } catch (e) {
         console.warn("[PRINT] preload templates error:", e?.message || e);
       }
+    },
+    // ✅ Fonction pour vider le cache manuellement si besoin
+    clearCache: () => {
+      cache.clear();
+      console.log("[PRINT] Cache templates vidé");
     }
   };
 }
@@ -677,27 +704,33 @@ async function renderPDFfromHTML(html, { ticketWidthMM, templateName = "" } = {}
     const page = await browser.newPage();
     await page.emulateMediaType("screen");
     
-    // Déterminer si c'est un template de produit vertical
-    const isProductTicket = templateName?.includes('produit') || html?.includes('class="ticket"');
-    
-    // CSS de sécurité amélioré pour tickets produits
+    // ✅ CSS de sécurité pour forcer les marges à ZÉRO
     const safetyCSS = `
-      @page{margin:0}
-      html,body{margin:0;padding:0;background:#fff;color:#000}
-      .__ticket-root{position:fixed;left:0;top:0;width:100%;}
-      .__ticket-nudge{transform: translateY(-${TOP_NUDGE_MM}mm);}
+      @page{margin:0 !important;padding:0 !important}
+      html,body{margin:0 !important;padding:0 !important;background:#fff;color:#000}
       ${ROTATE_180 ? "body{transform:rotate(180deg)}" : ""}
-      /* Garantir que le texte ne soit jamais coupé */
-      .prix span, .nom span, .info-value { overflow: visible !important; }
     `;
-    const wrappedHTML = `
-      <!doctype html><html><head><meta charset="utf-8">
-        <style>${safetyCSS}</style>
-      </head><body>
-        <div class="__ticket-root __ticket-nudge">${html}</div>
-      </body></html>`;
+    
+    // ✅ Si le HTML est un document complet, injecter les styles dans le <head>
+    // au lieu de l'encapsuler dans un autre document (ce qui créait un HTML invalide)
+    let finalHTML;
+    const isFullDocument = html.includes('<!doctype') || html.includes('<!DOCTYPE') || html.includes('<html');
+    
+    if (isFullDocument) {
+      // Injecter les styles de sécurité dans le <head> existant
+      if (html.includes('</head>')) {
+        finalHTML = html.replace('</head>', `<style>${safetyCSS}</style></head>`);
+      } else if (html.includes('<body')) {
+        finalHTML = html.replace('<body', `<style>${safetyCSS}</style><body`);
+      } else {
+        finalHTML = `<style>${safetyCSS}</style>${html}`;
+      }
+    } else {
+      // Fragment HTML - encapsuler dans un document complet
+      finalHTML = `<!doctype html><html><head><meta charset="utf-8"><style>${safetyCSS}</style></head><body>${html}</body></html>`;
+    }
 
-    await page.setContent(wrappedHTML, { waitUntil: "networkidle0" });
+    await page.setContent(finalHTML, { waitUntil: "networkidle0" });
 
     // Attendre que le script d'ajustement automatique soit terminé (pour templates avec auto-fit)
     try {
@@ -724,8 +757,8 @@ async function renderPDFfromHTML(html, { ticketWidthMM, templateName = "" } = {}
         }).catch(() => {});
       });
       
-      // Attendre que les styles soient stabilisés après ajustement
-      await sleep(isProductTicket ? 400 : 300);
+      // ✅ OPTIMISÉ: Délai équilibré (rapide mais sûr pour le rendu CSS)
+      await sleep(isProductTicket ? 200 : 150);
       
       // Forcer un reflow complet + vérification finale pour texte non coupé
       await page.evaluate(() => {
@@ -761,25 +794,38 @@ async function renderPDFfromHTML(html, { ticketWidthMM, templateName = "" } = {}
         void document.body.offsetHeight;
       });
       
-      // Délai final pour stabilité
-      await sleep(isProductTicket ? 150 : 100);
+      // ✅ OPTIMISÉ: Délai final (sécurité pour reflow CSS)
+      await sleep(isProductTicket ? 80 : 50);
     } catch (e) {
       // Continuer même si l'attente échoue
       console.warn('[PRINT] Erreur attente ajustement:', e?.message);
     }
 
-    // Génération du PDF avec taille adaptée
+    // ✅ Génération du PDF avec hauteur EXACTE du contenu (pas de marge)
     if (ticketWidthMM) {
-      const pxHeight = await page.evaluate(() =>
-        Math.ceil(document.documentElement.scrollHeight || document.body.scrollHeight || 0)
-      );
+      // Mesurer la hauteur réelle du contenu (div .ticket)
+      const contentHeight = await page.evaluate(() => {
+        const ticket = document.querySelector('.ticket');
+        if (ticket) {
+          // Hauteur exacte du contenu + petite marge de sécurité
+          return Math.ceil(ticket.getBoundingClientRect().height);
+        }
+        // Fallback sur la hauteur du body
+        return Math.ceil(document.body.scrollHeight || document.documentElement.scrollHeight || 0);
+      });
+      
       // Pour tickets produits verticaux, hauteur fixe de 200mm
       const isVerticalTicket = await page.evaluate(() => {
         const ticket = document.querySelector('.ticket');
         return ticket && window.getComputedStyle(ticket).minHeight?.includes('200mm');
       });
       
-      const mmHeight = isVerticalTicket ? 200 : Math.max(40, Math.ceil(pxHeight * 0.264583));
+      // ✅ Conversion px -> mm (96 DPI standard)
+      // 1 inch = 25.4mm, 1 inch = 96px, donc 1px = 25.4/96 = 0.264583mm
+      // ✅ IMPORTANT: Pas de hauteur minimum artificielle - utiliser la hauteur exacte + 2mm de sécurité
+      const mmHeight = isVerticalTicket ? 200 : Math.ceil(contentHeight * 0.264583) + 2;
+      
+      console.log(`[PRINT] 📐 PDF: ${ticketWidthMM}mm x ${mmHeight}mm (contenu: ${contentHeight}px)`);
       
       return await page.pdf({
         printBackground: true,
@@ -792,7 +838,13 @@ async function renderPDFfromHTML(html, { ticketWidthMM, templateName = "" } = {}
         scale: 1
       });
     }
-    return await page.pdf({ printBackground: true, preferCSSPageSize: true, displayHeaderFooter: false });
+    // ✅ Toujours forcer les marges à 0 pour coller le texte en haut
+    return await page.pdf({ 
+      printBackground: true, 
+      preferCSSPageSize: true, 
+      displayHeaderFooter: false,
+      margin: { top: "0mm", right: "0mm", bottom: "0mm", left: "0mm" }
+    });
   } finally {
     try { await browser?.close(); } catch {}
   }
@@ -801,67 +853,60 @@ async function renderPDFfromHTML(html, { ticketWidthMM, templateName = "" } = {}
 /* ========= Fallback PowerShell pour impression ========= */
 function printWithPowerShell(pdfPath, printerName = null) {
   return new Promise((resolve, reject) => {
-    // Utiliser SumatraPDF via PowerShell si disponible
-    if (SUMATRA_PATH && fs.existsSync(SUMATRA_PATH)) {
-      const printerArg = printerName ? `-print-to "${printerName}"` : `-print-to-default`;
-      const cmd = `& "${SUMATRA_PATH}" ${printerArg} -silent "${pdfPath}"`;
-      
-      const ps = spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", cmd], {
-        windowsHide: true,
-        shell: false,
-      });
-      
-      ps.on("close", (code) => {
-        if (code === 0) {
-          console.log(`[PRINT] ✅ PowerShell+SumatraPDF terminé`);
-          resolve({ success: true, method: "powershell-sumatra" });
-        } else {
-          reject(new Error(`PowerShell exit ${code}`));
-        }
-      });
-      
-      ps.on("error", reject);
-      
-      // Timeout 30s
-      setTimeout(() => {
-        try { ps.kill(); } catch {}
-        resolve({ success: true, method: "powershell-timeout" }); // Ne pas bloquer
-      }, 30000);
-    } else {
-      // Pas de SumatraPDF, utiliser Start-Process avec le viewer PDF par défaut
-      const psCmd = `Start-Process -FilePath "${pdfPath.replace(/\\/g, "\\\\")}" -Verb Print -WindowStyle Hidden -Wait`;
-      
-      exec(`powershell -NoProfile -Command "${psCmd}"`, { timeout: 30000 }, (err) => {
-        if (err) {
-          console.warn(`[PRINT] PowerShell fallback warning:`, err.message);
-        }
-        resolve({ success: true, method: "powershell-default" });
-      });
-    }
+    // ✅ Utiliser directement l'impression Windows (sans SumatraPDF)
+    // Cela évite les problèmes de marges de SumatraPDF
+    const psCmd = `Start-Process -FilePath "${pdfPath.replace(/\\/g, "\\\\")}" -Verb Print -WindowStyle Hidden -Wait`;
+    
+    console.log(`[PRINT] 🖨️ Impression Windows directe: ${pdfPath}`);
+    
+    exec(`powershell -NoProfile -Command "${psCmd}"`, { timeout: 30000 }, (err) => {
+      if (err) {
+        console.warn(`[PRINT] PowerShell warning:`, err.message);
+      }
+      console.log(`[PRINT] ✅ Impression Windows terminée`);
+      resolve({ success: true, method: "powershell-windows" });
+    });
   });
 }
 
 /* ========= Impression ========= */
+// ✅ SumatraPDF activé avec paramètres optimisés pour éviter les marges
+const DISABLE_SUMATRA = (process.env.PRINT_DISABLE_SUMATRA ?? "0") !== "0";
+
 async function printPDFSilent(pdfPath, { printer, copies=1 } = {}) {
-  // ✅ Utiliser SumatraPDF embarqué si disponible
-  if (SUMATRA_PATH && fs.existsSync(SUMATRA_PATH)) {
+  // ✅ Utiliser SumatraPDF embarqué si disponible ET non désactivé
+  if (!DISABLE_SUMATRA && SUMATRA_PATH && fs.existsSync(SUMATRA_PATH)) {
     return new Promise((resolve, reject) => {
-      const args = [
-        "-print-to", printer || "-print-to-default",
-        "-silent",
-        "-print-settings", `${copies}x`,
-        pdfPath
-      ];
+      // ✅ PARAMÈTRES OPTIMISÉS pour imprimante thermique:
+      // - noscale: pas de mise à l'échelle (imprime à 100%)
+      // - shrink: réduit si trop grand pour la page
+      // - fit: s'ajuste à la zone imprimable
+      // On utilise 'noscale' pour éviter toute modification du PDF
+      const printSettings = `${copies}x,noscale`;
       
-      // Si pas d'imprimante spécifiée, utiliser -print-to-default
-      if (!printer) {
-        args[0] = "-print-to-default";
-        args.splice(1, 1); // Retirer le nom vide
+      let args;
+      if (printer) {
+        args = [
+          "-print-to", printer,
+          "-silent",
+          "-exit-when-done",
+          "-print-settings", printSettings,
+          pdfPath
+        ];
+      } else {
+        args = [
+          "-print-to-default",
+          "-silent",
+          "-exit-when-done",
+          "-print-settings", printSettings,
+          pdfPath
+        ];
       }
       
       console.log(`[PRINT] 🖨️ SumatraPDF: ${SUMATRA_PATH}`);
       console.log(`[PRINT] 📄 Fichier: ${pdfPath}`);
       console.log(`[PRINT] 🎯 Imprimante: ${printer || 'défaut'}`);
+      console.log(`[PRINT] ⚙️ Settings: ${printSettings} (noscale = pas de marges ajoutées)`);
       
       const proc = spawn(SUMATRA_PATH, args, { windowsHide: true });
       
@@ -887,13 +932,18 @@ async function printPDFSilent(pdfPath, { printer, copies=1 } = {}) {
     });
   }
   
+  // ✅ Fallback: pdf-to-printer ou PowerShell (sans SumatraPDF)
+  console.log(`[PRINT] 🖨️ Impression directe (sans SumatraPDF)`);
+  
   // Fallback sur pdf-to-printer (import dynamique)
   const ptpMod = await loadPdfToPrinter();
   if (ptpMod?.print) {
     const opts = { printer: printer || undefined, copies: Number(copies) || 1, scale: "noscale" };
+    console.log(`[PRINT] 📄 pdf-to-printer: ${pdfPath}`);
     await ptpMod.print(pdfPath, opts);
   } else {
     // Fallback PowerShell si pdf-to-printer non disponible
+    console.log(`[PRINT] 📄 PowerShell fallback: ${pdfPath}`);
     await printWithPowerShell(pdfPath, printer);
   }
 }
@@ -979,7 +1029,8 @@ function isDZMark(mark) {
   return String(mark||"").trim().toUpperCase() === DZ_LABEL;
 }
 
-// Parse quantité "en DZ" + conversion millier→DZ avec arrondi au 0,5
+// Parse quantité "en DZ" - la quantité est DIRECTEMENT en DZ (pas de conversion millier→DZ)
+// ✅ FIX: 1 = 1 DZ, 0.5 = DEMI DZ (pas 12 ou 6 comme avant)
 function parseQtyInDZ({ qteLabel, qty, mark, unite }) {
   const raw = String(qteLabel||"").trim();
   let dz = null;
@@ -997,63 +1048,92 @@ function parseQtyInDZ({ qteLabel, qty, mark, unite }) {
   }
 
   if (hasDZ) {
-    if (num != null && demi) dz = num + 0.5;
-    else if (demi) dz = 0.5;
+    if (num != null && demi) dz = num + 0.5;        // ex: "2 1/2 DZ" → 2.5 DZ
+    else if (demi) dz = 0.5;                         // ex: "DEMI DZ" → 0.5 DZ
     else if (num != null) {
-      if (num <= 1 + EPS) dz = roundToHalf(num / BASE_DZ_IN_MILLIER);
-      else dz = num; // déjà en DZ
-    } else dz = 1;
+      // ✅ FIX: Traiter num DIRECTEMENT comme des DZ (1 = 1 DZ, 0.5 = 0.5 DZ)
+      dz = roundToHalf(num);
+    } else dz = 1;                                   // ex: "DZ" seul → 1 DZ
     return dz > 0 ? dz : null;
   }
 
-  // Pas d'indication dans le label → si mark DZ + qty numérique → convertit "millier→DZ"
+  // Pas d'indication dans le label → si mark DZ + qty numérique
+  // ✅ FIX: Traiter qty DIRECTEMENT comme des DZ (pas de conversion millier→DZ)
   if (isDZMark(mark) && qty != null && qty > 0) {
-    if (isNear(qty, BASE_DZ_IN_MILLIER))        dz = 1;
-    else if (isNear(qty, BASE_DZ_IN_MILLIER/2)) dz = 0.5;
-    else                                        dz = roundToHalf(qty / BASE_DZ_IN_MILLIER);
+    dz = roundToHalf(qty);  // 1 → 1 DZ, 0.5 → 0.5 DZ (DEMI DZ)
     return dz > 0 ? dz : null;
   }
 
   return null;
 }
 
-/** Affichage DZ demandé
- * - 0.5 (±) → "DEMI DZ"
- * - n + 0.5 → "n 1/2 DZ" (1/2 plus petit)
+/** Affichage DZ demandé - ✅ FIX PRO: Supporte TOUTES les fractions en petit
+ * - 0.5 → "DEMI DZ" ou "1/2 DZ"
+ * - 0.25 → "1/4 DZ"
+ * - n + fraction → "n fraction DZ" (fraction en petit)
  * - entier → "n DZ"
- * - autre fraction → fallback SZN
  */
 function displayQtyDZ(dz) {
   const n = Number(dz || 0);
-  const isHalfOnly = isNear(n, 0.5, 0.12); // couvre 0.4–0.6
-  const frac = n - Math.trunc(n);
+  const int = Math.trunc(n);
+  const frac = Math.abs(n - int);
 
-  if (isHalfOnly) {
+  // Table des fractions courantes
+  const FRACTIONS = [
+    { decimal: 0.5,    fraction: "1/2",  name: "DEMI" },
+    { decimal: 0.25,   fraction: "1/4",  name: "QUART" },
+    { decimal: 0.75,   fraction: "3/4",  name: "3/4" },
+    { decimal: 0.333,  fraction: "1/3",  name: "TIERS" },
+    { decimal: 0.667,  fraction: "2/3",  name: "2/3" },
+    { decimal: 0.2,    fraction: "1/5",  name: "1/5" },
+    { decimal: 0.4,    fraction: "2/5",  name: "2/5" },
+    { decimal: 0.6,    fraction: "3/5",  name: "3/5" },
+    { decimal: 0.8,    fraction: "4/5",  name: "4/5" },
+    { decimal: 0.125,  fraction: "1/8",  name: "1/8" },
+    { decimal: 0.375,  fraction: "3/8",  name: "3/8" },
+    { decimal: 0.625,  fraction: "5/8",  name: "5/8" },
+    { decimal: 0.875,  fraction: "7/8",  name: "7/8" },
+    { decimal: 0.1,    fraction: "1/10", name: "1/10" },
+    { decimal: 0.166,  fraction: "1/6",  name: "1/6" },
+    { decimal: 0.833,  fraction: "5/6",  name: "5/6" },
+  ];
+
+  const TOL = 0.02;
+  let matchedFrac = null;
+  for (const f of FRACTIONS) {
+    if (Math.abs(frac - f.decimal) < TOL) {
+      matchedFrac = f;
+      break;
+    }
+  }
+
+  // Cas 1: Fraction seule (ex: 0.5 → "DEMI DZ", 0.25 → "1/4 DZ")
+  if (int === 0 && matchedFrac) {
+    const displayName = matchedFrac.decimal === 0.5 ? "DEMI" : matchedFrac.fraction;
     return {
-      text: `DEMI ${DZ_LABEL}`,
+      text: `${displayName} ${DZ_LABEL}`,
       html:
         `<span class="qty-badge">` +
-          `<span class="q">DEMI</span>` +
+          `<span class="q"><span class="q-frac">${matchedFrac.fraction}</span></span>` +
           `<span class="mk"><span class="mk-txt">${DZ_LABEL}</span></span>` +
         `</span>`
     };
   }
 
-  // n + 1/2
-  if (Math.abs(frac - 0.5) < 1e-9) {
-    const int = Math.trunc(n);
+  // Cas 2: Entier + fraction (ex: 2.5 → "2 1/2 DZ", 1.25 → "1 1/4 DZ")
+  if (matchedFrac) {
     const formattedInt = formatQuantityNumber(int);
     return {
-      text: `${formattedInt} 1/2 ${DZ_LABEL}`,
+      text: `${formattedInt} ${matchedFrac.fraction} ${DZ_LABEL}`,
       html:
         `<span class="qty-badge">` +
-          `<span class="q"><span class="q-int">${formattedInt}</span>&nbsp;<span class="q-frac">1/2</span></span>` +
+          `<span class="q"><span class="q-int">${formattedInt}</span>&nbsp;<span class="q-frac">${matchedFrac.fraction}</span></span>` +
           `<span class="mk"><span class="mk-txt">${DZ_LABEL}</span></span>` +
         `</span>`
     };
   }
 
-  // entier strict
+  // Cas 3: Entier strict
   if (Number.isInteger(n)) {
     const formatted = formatQuantityNumber(n);
     return {
@@ -1066,7 +1146,7 @@ function displayQtyDZ(dz) {
     };
   }
 
-  // autre fraction → valeur décimale DZ (compacte)
+  // Cas 4: Autre décimal non-standard → afficher tel quel
   const formatted = formatQuantityNumber(n);
   return {
     text: `${formatted} ${DZ_LABEL}`,
@@ -1148,18 +1228,82 @@ async function resolveLineMark({ nom, code, unite, mark }) {
   return String(mark || "").toUpperCase().trim();
 }
 
-/** Construit {text, html, mark} pour la colonne Qté (hors cas DZ) */
+/** Construit {text, html, mark} pour la colonne Qté (hors cas DZ)
+ * ✅ FIX: Applique le format "n 1/2" avec 1/2 en petit pour TOUTES les unités avec mark
+ */
 function buildDisplayQtyFromLabel({ qteLabel, qty, unite, mark }) {
   const base = String((qteLabel != null ? String(qteLabel).trim() : "") ||
                       (Number.isFinite(qty) ? qty : "")).trim();
   const hasBase = base !== "";
 
+  // ✅ FIX PRO: Formatter la quantité avec TOUTES les fractions en petit (1/2, 1/4, 3/4, 1/3, 2/3, 1/5, etc.)
+  const formatQtyWithFraction = (qtyStr) => {
+    const num = Number(String(qtyStr).replace(",", "."));
+    if (!Number.isFinite(num)) return { text: qtyStr, html: qtyStr };
+    
+    const int = Math.trunc(num);
+    const frac = Math.abs(num - int);
+    
+    // Table des fractions courantes (décimal → "numérateur/dénominateur")
+    const FRACTIONS = [
+      { decimal: 0.5,    fraction: "1/2",  name: "DEMI" },
+      { decimal: 0.25,   fraction: "1/4",  name: "QUART" },
+      { decimal: 0.75,   fraction: "3/4",  name: "3/4" },
+      { decimal: 0.333,  fraction: "1/3",  name: "TIERS" },
+      { decimal: 0.667,  fraction: "2/3",  name: "2/3" },
+      { decimal: 0.2,    fraction: "1/5",  name: "1/5" },
+      { decimal: 0.4,    fraction: "2/5",  name: "2/5" },
+      { decimal: 0.6,    fraction: "3/5",  name: "3/5" },
+      { decimal: 0.8,    fraction: "4/5",  name: "4/5" },
+      { decimal: 0.125,  fraction: "1/8",  name: "1/8" },
+      { decimal: 0.375,  fraction: "3/8",  name: "3/8" },
+      { decimal: 0.625,  fraction: "5/8",  name: "5/8" },
+      { decimal: 0.875,  fraction: "7/8",  name: "7/8" },
+      { decimal: 0.1,    fraction: "1/10", name: "1/10" },
+      { decimal: 0.166,  fraction: "1/6",  name: "1/6" },
+      { decimal: 0.833,  fraction: "5/6",  name: "5/6" },
+    ];
+    
+    // Tolérance pour matcher les fractions (±0.02)
+    const TOL = 0.02;
+    
+    // Chercher si la partie fractionnaire correspond à une fraction connue
+    let matchedFrac = null;
+    for (const f of FRACTIONS) {
+      if (Math.abs(frac - f.decimal) < TOL) {
+        matchedFrac = f;
+        break;
+      }
+    }
+    
+    // Cas 1: Fraction seule (ex: 0.5 → "DEMI", 0.25 → "1/4")
+    if (int === 0 && matchedFrac) {
+      return { 
+        text: matchedFrac.name, 
+        html: `<span class="q-frac">${matchedFrac.fraction}</span>` 
+      };
+    }
+    
+    // Cas 2: Entier + fraction (ex: 2.5 → "2 1/2", 1.25 → "1 1/4")
+    if (matchedFrac) {
+      const formattedInt = formatQuantityNumber(int);
+      return { 
+        text: `${formattedInt} ${matchedFrac.fraction}`, 
+        html: `<span class="q-int">${formattedInt}</span>&nbsp;<span class="q-frac">${matchedFrac.fraction}</span>` 
+      };
+    }
+    
+    // Cas 3: Entier pur ou décimal non-standard → afficher tel quel
+    const formatted = formatQuantityNumber(num);
+    return { text: formatted, html: formatted };
+  };
+
   // RÈGLE MILLIER : badge simple sans mark (DZ traité ailleurs)
   if (isUnitMillier(unite) && !isDZMark(mark) && !isDZToken(qteLabel)) {
-    const onlyHtml = hasBase
-      ? `<span class="qty-badge"><span class="q">${base}</span></span>`
-      : "";
-    return { text: hasBase ? base : "", html: onlyHtml, mark: "" };
+    if (!hasBase) return { text: "", html: "", mark: "" };
+    const formatted = formatQtyWithFraction(base);
+    const onlyHtml = `<span class="qty-badge"><span class="q">${formatted.html}</span></span>`;
+    return { text: formatted.text, html: onlyHtml, mark: "" };
   }
 
   let mk = String(mark || "").trim().toUpperCase();
@@ -1168,7 +1312,9 @@ function buildDisplayQtyFromLabel({ qteLabel, qty, unite, mark }) {
   else if (markLooksPiece(mk) || isUnitPiece(unite)) mk = PIECE_LABEL_ABBR;
   else if (!mk) mk = "";
 
-  const text = hasBase && mk ? `${base}${NBSP}${mk}` : (hasBase ? base : mk);
+  // ✅ FIX PRO: Formatter avec TOUTES les fractions en petit
+  const formatted = hasBase ? formatQtyWithFraction(base) : { text: "", html: "" };
+  const text = hasBase && mk ? `${formatted.text}${NBSP}${mk}` : (hasBase ? formatted.text : mk);
 
   let mkHtml = "";
   if (mk === CARTON_LABEL) {
@@ -1179,11 +1325,11 @@ function buildDisplayQtyFromLabel({ qteLabel, qty, unite, mark }) {
 
   const html = `
     <span class="qty-badge">
-      ${hasBase ? `<span class="q">${base}</span>` : ""}
+      ${hasBase ? `<span class="q">${formatted.html}</span>` : ""}
       ${mkHtml}
     </span>`.replace(/\s+/g,' ').trim();
 
-  return { text, html: mk ? html : (hasBase ? `<span class="qty-badge"><span class="q">${base}</span></span>` : ""), mark: mk };
+  return { text, html: mk ? html : (hasBase ? `<span class="qty-badge"><span class="q">${formatted.html}</span></span>` : ""), mark: mk };
 }
 
 /* ========= Parsing qteLabel (½, 1/2, DZ, etc.) ========= */
@@ -1649,10 +1795,11 @@ function guardianScript(printRoot, sumatraPath = null) {
   const rootEscaped = root.replace(/\\/g, "\\\\");
   const sumatraEscaped = sumatraExe.replace(/\\/g, "\\\\");
   
-  return `# PrintQueueGuardian.ps1 - LA GRACE POS v2.6
+  return `# PrintQueueGuardian.ps1 - LA GRACE POS v2.7
 # ✅ Généré automatiquement pour mode EXE
-# ✅ SumatraPDF: ${sumatraExe || 'Non configuré'}
+# ✅ SumatraPDF: ${sumatraExe || 'Non configuré'} (noscale = pas de marges)
 # ✅ Print Root: ${root}
+# ✅ Optimisation: PDF hauteur exacte + impression sans espace en haut
 
 $ErrorActionPreference = "SilentlyContinue"
 $Root = "${rootEscaped}"
@@ -1865,10 +2012,30 @@ async function installGuardian({ logger, printDir }) {
 }
 
 /* ========= File queue helpers ========= */
+// ✅ Fichiers système à ignorer (ne pas imprimer)
+const SYSTEM_FILES_TO_IGNORE = [
+  '.dedupe.json',      // Fichier de déduplication anti-réimpression
+  'config.json',       // Fichier de configuration
+  '.config.json',      // Fichier de configuration caché
+  'settings.json',     // Paramètres
+  '.settings.json',    // Paramètres cachés
+  'test.json',         // Fichiers de test
+  'debug.json',        // Fichiers de debug
+];
+
 function listRootJobs(PRINT_DIR) {
   try {
     return fs.readdirSync(PRINT_DIR)
-      .filter(f => f.toLowerCase().endsWith(".json") || f.toLowerCase().endsWith(".pdf"))
+      .filter(f => {
+        const lower = f.toLowerCase();
+        // Doit être .json ou .pdf
+        if (!lower.endsWith(".json") && !lower.endsWith(".pdf")) return false;
+        // ✅ Exclure les fichiers système (comme .dedupe.json)
+        if (SYSTEM_FILES_TO_IGNORE.includes(lower)) return false;
+        // ✅ Exclure les fichiers cachés (commencent par .)
+        if (lower.startsWith('.')) return false;
+        return true;
+      })
       .map(f => path.join(PRINT_DIR, f))
       .filter(full => !full.toLowerCase().includes(`${path.sep}ok${path.sep}`) &&
                       !full.toLowerCase().includes(`${path.sep}err${path.sep}`) &&
@@ -1892,7 +2059,7 @@ export function createPrinterModule({
   templatesDir = null, // Sera déterminé depuis project root
   assetsDir = null, // Sera déterminé depuis project root
   maxRetry = 3,
-  retryDelays = [2000, 5000, 10000],
+  retryDelays = [1000, 2500, 5000], // ✅ OPTIMISÉ: Retry équilibré (pas trop court pour laisser l'imprimante se libérer)
   forceDefault = true,
 } = {}) {
   // ✅✅✅ CORRECTION PROBLÈME n°1: Single source of truth ✅✅✅
@@ -1955,7 +2122,8 @@ export function createPrinterModule({
 
   // ✅ Dossiers déjà créés au début de createPrinterModule()
   
-  // Copier les templates depuis print/templates vers PRINT_DIR/templates si nécessaire
+  // ✅ TOUJOURS copier les templates depuis print/templates vers PRINT_DIR/templates
+  // (pour garantir que les mises à jour sont appliquées)
   const sourceTemplatesDir = path.join(__dirname, "templates");
   if (fs.existsSync(sourceTemplatesDir) && templatesDirFinal !== sourceTemplatesDir) {
     try {
@@ -1964,9 +2132,19 @@ export function createPrinterModule({
       for (const tpl of sourceTemplates) {
         const src = path.join(sourceTemplatesDir, tpl);
         const dst = path.join(templatesDirFinal, tpl);
-        if (!fs.existsSync(dst)) {
+        // ✅ TOUJOURS écraser pour appliquer les mises à jour
+        try {
+          const srcStat = fs.statSync(src);
+          const dstStat = fs.existsSync(dst) ? fs.statSync(dst) : null;
+          // Copier si le fichier n'existe pas OU si la source est plus récente
+          if (!dstStat || srcStat.mtimeMs > dstStat.mtimeMs) {
+            fs.copyFileSync(src, dst);
+            logger?.info?.(`[PRINT] Template ${dstStat ? 'mis à jour' : 'copié'}: ${tpl}`);
+          }
+        } catch (copyErr) {
+          // Forcer la copie en cas d'erreur de stat
           fs.copyFileSync(src, dst);
-          logger?.info?.(`[PRINT] Template copié: ${tpl}`);
+          logger?.info?.(`[PRINT] Template forcé: ${tpl}`);
         }
       }
     } catch (e) {
@@ -2029,11 +2207,13 @@ export function createPrinterModule({
     log.info(clr("cyan", msg));
     io?.emit?.("print:progress", { stage, ...meta });
     
-    // Émettre print:started pour AI LaGrace quand on commence
-    if (stage === "queue:start" || stage === "spool") {
+    // ✅ OPTIMISÉ: Émettre print:started pour AI LaGrace UNIQUEMENT au spool (pas au queue:start)
+    // Pour réduire les messages vocaux et accélérer le retour utilisateur
+    if (stage === "spool") {
       io?.emit?.("print:started", { 
         file: meta?.file || "", 
         factureNum: meta?.factureNum || null,
+        client_name: meta?.client_name || null,  // ✅ Ajout du nom client pour l'IA
         stage: stage,
         timestamp: new Date().toISOString()
       });
@@ -2188,7 +2368,17 @@ export function createPrinterModule({
 
       usePrinter = await resolvePrinter(typeof job.printer === "string" ? job.printer : undefined);
       const copies = Math.max(1, Number(job.copies || job?.data?.copies || 1));
-      logProgress("spool", { file: base, extra: `→ ${usePrinter || "Windows Default"} • copies=${copies}` });
+      
+      // ✅ OPTIMISÉ: Extraire le client_name pour l'IA vocale
+      const clientName = job?.data?.client || job?.data?.client_name || job?.client_name || job?.client || null;
+      const factureNum = job?.data?.factureNum || job?.factureNum || job?.data?.numero || null;
+      
+      logProgress("spool", { 
+        file: base, 
+        extra: `→ ${usePrinter || "Windows Default"} • copies=${copies}`,
+        client_name: clientName,
+        factureNum: factureNum
+      });
       await printPDFSilent(pdfPath, { printer: usePrinter, copies });
 
       const keepPdfOnOk = (process.env.PRINT_KEEP_PDF_ON_OK ?? "0") !== "0";
@@ -2373,18 +2563,18 @@ export function createPrinterModule({
     // Variable pour marquer le polling comme actif (remplace watcher)
     watcher = { active: true, type: "polling" };
     
-    console.log('\n✅ [PRINT] POLLING PRÊT - Surveillance active (500ms)!\n');
+    console.log('\n✅ [PRINT] POLLING PRÊT - Surveillance active (150ms ultra-rapide)!\n');
     log.info(`[PRINT] Polling prêt - ${PRINT_DIR}`);
-    
+
     // ✅ TRAITER LES FICHIERS EXISTANTS IMMÉDIATEMENT
     listRootAndEnqueue("startup");
     scheduleDrain();
-    
-    // ✅ Polling périodique toutes les 500ms (rapide et stable)
-    clearInterval(sweepTimer); 
+
+    // ✅ OPTIMISÉ: Polling périodique toutes les 150ms (ultra-rapide pour impression instantanée)
+    clearInterval(sweepTimer);
     sweepTimer = setInterval(() => {
       listRootAndEnqueue("polling");
-    }, 500);
+    }, 150);
 
     // ✅ AUTO-CRÉATION ET LANCEMENT DU PrintQueueGuardian (Windows uniquement)
     if (process.platform === "win32") {
@@ -2407,7 +2597,7 @@ export function createPrinterModule({
         try {
           const content = fs.readFileSync(psPath, 'utf-8');
           // Vérifier si le script contient la bonne version et le bon chemin
-          if (content.includes('LA GRACE POS v2.6') && content.includes(PRINT_DIR.replace(/\\/g, '\\\\'))) {
+          if (content.includes('LA GRACE POS v2.7') && content.includes(PRINT_DIR.replace(/\\/g, '\\\\'))) {
             guardianNeedsUpdate = false;
             log.info(`✅ [PRINT] PrintQueueGuardian.ps1 à jour`);
           } else {
@@ -2673,56 +2863,8 @@ export function createPrinterModule({
     }
   });
 
-  router.post("/test", async (_req, res) => {
-    try {
-      const demo = {
-        template: DEFAULT_TEMPLATE,
-        data: {
-          factureNum: "TEST-" + Date.now(),
-          client: "Client Démo",
-          taux: 2700,
-          printCurrency: "USD",
-          lignes: [
-            { code:"A1", nom:"Very strong", unite:"carton", mark:"", qteLabel:"1", puFC:54000, totalFC:54000 },
-            { code:"A2", nom:"Vin Swag",   unite:"carton", mark:"JUTE", qteLabel:"2.5 DZ", puFC:10800, totalFC:21600 },
-            { code:"A3", nom:"Vin Amour",  unite:"millier",  mark:"DZ", qteLabel:"0,04 DZ", puFC:0, totalFC:3000 },
-            { code:"A4", nom:"Soft Cola",  unite:"carton", mark:"DZ", qteLabel:"DEMI DZ", puFC:2000, totalFC:1000 },
-          ],
-          totalFC: 78600,
-          entreprise: {
-            nom: "ALIMENTATION LA GRACE",
-            rccm: "CD/KIS/RCCM 22-A-00172",
-            impot: "A220883T",
-            tel: "+243 896 885 373 / +243 819 082 637",
-            logo: null,
-            adresse: "Avenue Lac Tanganyika, Makiso, Kisangani, R.D.Congo"
-          },
-          meta: { currency: "USD", ventesUsd: true, dette: "oui" }
-        },
-        copies: 1,
-        autoDette: true
-      };
-      const html = await buildHTML(demo, TPL);
-      const buf  = await renderPDFfromHTML(html, { ticketWidthMM: 80 });
-      const tmp  = path.join(PRINT_TMP, `test-${Date.now()}.pdf`);
-      fs.writeFileSync(tmp, buf);
-      const usePrinter = await resolvePrinter();
-      await printPDFSilent(tmp, { printer: usePrinter, copies: demo.copies });
-      try { fs.unlinkSync(tmp); } catch {}
-
-      const isUSD = detectUSDMode(demo.data);
-      const delayMs = Number(demo?.data?.meta?.delay || DEEPLINK_DELAY_MS);
-      autoCreateDettesForFacture({ factureNum: String(demo.data.factureNum), isUSD, delayMs, io, log })
-        .catch(()=>{});
-
-      res.json({ ok: true, printer: usePrinter || "Windows Default" });
-    } catch (e) {
-      const info = classifyError(e, { cartonAssert: e?.cartonAssert !== false ? undefined : false });
-      info.stack = e?.stack || undefined;
-      console.error(banner("error", "TEST ERROR", [info.message, `code: ${info.code}`, `hint: ${info.hint}`]));
-      res.status(500).json({ error: e.message, code: info.code, hint: info.hint });
-    }
-  });
+  // ✅ Route de test DÉSACTIVÉE (supprimée pour production)
+  // router.post("/test", ...) - SUPPRIMÉ
 
   // *** Deep-link dettes depuis un N° de facture (pas d'API directe) ***
   router.post("/dette/from-facture", express.json(), async (req, res) => {
@@ -2793,7 +2935,15 @@ const DEFAULT_80MM_HBS = `<!doctype html>
 <title>Ticket</title>
 <style>
   @page { size: 80mm auto; margin: 0; }
-  html, body { margin:0; padding:0; background:#fff; color:#000; }
+  html, body { 
+    margin:0 !important; 
+    padding:0 !important; 
+    background:#fff; 
+    color:#000; 
+    position: relative;
+    top: 0;
+    left: 0;
+  }
   *, *::before, *::after {
     background:transparent !important; color:#000 !important; -webkit-text-fill-color:#000 !important;
     -webkit-print-color-adjust: exact; print-color-adjust: exact; image-rendering: crisp-edges; text-rendering: geometricPrecision;
@@ -2803,7 +2953,7 @@ const DEFAULT_80MM_HBS = `<!doctype html>
     --pageW:80mm;
     --w:78mm;
     --padX:1.2mm;     /* + marge latérale */
-    --padTop:2.2mm;   /* + marge haut     */
+    --padTop:0mm;     /* + marge haut (ZERO ESPACE) */
     --padBot:2.2mm;   /* + marge bas      */
 
     --fs:12px;
@@ -2815,16 +2965,28 @@ const DEFAULT_80MM_HBS = `<!doctype html>
     --ruleDot:1px dotted #000;
   }
 
-  body{ font-family: Arial, Helvetica, sans-serif; font-size:var(--fs); line-height:var(--lh); }
-  .ticket{ width:var(--w); margin:0 auto; padding:var(--padTop) var(--padX) var(--padBot); }
+  body{ 
+    font-family: Arial, Helvetica, sans-serif; 
+    font-size:var(--fs); 
+    line-height:var(--lh); 
+    margin-top: 0 !important;
+    padding-top: 0 !important;
+  }
+  .ticket{ 
+    width:var(--w); 
+    margin:0 auto !important; 
+    margin-top: 0 !important;
+    padding:var(--padTop) var(--padX) var(--padBot);
+    padding-top: 0 !important;
+  }
 
   /* ====== AUTO FIT FONTS (SHRINK-TO-FIT PRO) ====== */
   .ticket.tight  { --fs:11px; --fsTable:10.2px; --fsBadge:9.6px; --padTop:1.8mm; --padBot:1.8mm; }
   .ticket.ultra  { --fs:9.5px; --fsTable:8.8px; --fsBadge:8.2px; --padTop:1.5mm; --padBot:1.5mm; }
 
-  .brand{ text-align:center; margin:0 0 2px 0; }
-  .h1{ font-weight:900; font-size:16.5px; margin:0; letter-spacing:.25px; }
-  .h2{ font-weight:800; font-size:13px; margin:1px 0 4px; letter-spacing:.2px; }
+  .brand{ text-align:center; margin:0 !important; margin-top:0 !important; padding:0 !important; padding-top:0 !important; }
+  .h1{ font-weight:900; font-size:16.5px; margin:0 !important; margin-top:0 !important; padding:0 !important; padding-top:0 !important; letter-spacing:.25px; }
+  .h2{ font-weight:800; font-size:13px; margin:0 !important; margin-top:0 !important; padding:0 !important; padding-top:0 !important; letter-spacing:.2px; }
 
   .row{ margin:1px 0; word-break:break-word; overflow-wrap:anywhere; }
   .muted{opacity:.95}
@@ -2875,10 +3037,17 @@ const DEFAULT_80MM_HBS = `<!doctype html>
   .qty-badge .mk-ic svg{ width:11px; height:11px; }
   .qty-badge .mk-txt{ font-weight:800; font-size:var(--fsBadge); letter-spacing:.2px; }
   
+  /* Badge compact pour mode tight */
+  .ticket.tight .qty-badge{ padding:.25mm .8mm; gap:.35mm .5mm; }
+  .ticket.tight .qty-badge .mk-txt{ font-size:9px; }
+  .ticket.tight .qty-badge .q{ font-size:10px; }
+  .ticket.tight .qty-badge .q-frac{ font-size:0.75em; }
+  
   /* Badge compact pour mode ultra */
   .ticket.ultra .qty-badge{ padding:.2mm .7mm; gap:.3mm .4mm; }
   .ticket.ultra .qty-badge .mk-txt{ font-size:8px; }
   .ticket.ultra .qty-badge .q{ font-size:9px; }
+  .ticket.ultra .qty-badge .q-frac{ font-size:0.72em; }
 
   .name{ font-weight:600; word-break:break-word; overflow-wrap:anywhere; hyphens:auto; }
   .money{ font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1, "lnum" 1; }
@@ -2901,22 +3070,13 @@ const DEFAULT_80MM_HBS = `<!doctype html>
   .ticket.ultra .foot{ margin-top:4px; font-size:9px; }
   
   /* Headers plus compacts */
-  .ticket.tight .h1{ font-size:15px; margin:0 0 1px 0; }
-  .ticket.tight .h2{ font-size:12px; margin:0 0 2px 0; }
-  .ticket.ultra .h1{ font-size:14px; margin:0 0 1px 0; }
-  .ticket.ultra .h2{ font-size:11px; margin:0 0 2px 0; }
+  .ticket.tight .h1{ font-size:15px; margin:0 0 1px 0 !important; margin-top:0 !important; }
+  .ticket.tight .h2{ font-size:12px; margin:0 0 2px 0 !important; margin-top:0 !important; }
+  .ticket.ultra .h1{ font-size:14px; margin:0 0 1px 0 !important; margin-top:0 !important; }
+  .ticket.ultra .h2{ font-size:11px; margin:0 0 2px 0 !important; margin-top:0 !important; }
 </style>
 </head>
-<body>
-  <div class="ticket{{#if shrinkFit.class}} {{shrinkFit.class}}{{/if}}">
-
-    {{#if entreprise.logo}}
-      <div style="text-align:center;margin-bottom:4px">
-        <img src="{{asset entreprise.logo}}" alt="logo" style="max-width:64mm;max-height:18mm">
-      </div>
-    {{/if}}
-
-    <div class="brand">
+<body><div class="ticket{{#if shrinkFit.class}} {{shrinkFit.class}}{{/if}}">{{#if entreprise.logo}}<div style="text-align:center;margin:0;padding:0"><img src="{{asset entreprise.logo}}" alt="logo" style="max-width:64mm;max-height:18mm;margin:0;padding:0;display:block;margin-left:auto;margin-right:auto"></div>{{/if}}<div class="brand">
       <div class="h1">{{entreprise.nom}}</div>
       <div class="h2">LA GRACE</div>
     </div>

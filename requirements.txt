@@ -1,0 +1,30 @@
+# AI LaGrace - Dépendances Python
+# ================================
+# Assistant vocal intelligent pour La Grâce POS
+# Fonctionne 100% OFFLINE (pas besoin d'Internet)
+
+# === CORE ===
+python-socketio[client]==5.10.0
+aiohttp==3.9.1
+requests==2.31.0
+
+# === RECONNAISSANCE VOCALE (OFFLINE) ===
+vosk==0.3.45
+sounddevice==0.4.6
+numpy==1.26.2
+
+# === SYNTHÈSE VOCALE ULTRA NATURELLE (OFFLINE) ===
+piper-tts>=1.2.0
+pyttsx3==2.90
+
+# === AUDIO ===
+soundfile>=0.12.1
+scipy>=1.11.0
+
+# === DÉTECTION MOT-CLÉ ===
+webrtcvad==2.0.10
+
+# === UTILITAIRES ===
+python-dotenv==1.0.0
+colorama==0.4.6
+onnxruntime>=1.16.0

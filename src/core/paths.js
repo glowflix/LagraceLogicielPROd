@@ -87,8 +87,7 @@ export function ensureDirs() {
     "data/backups",
   ];
 
-  console.log(`\n📁 [PATHS] Root: ${root} | Mode: ${process.env.NODE_ENV || 'dev'}`);
-
+  // ✅ PRO: Création silencieuse des dossiers
   for (const d of dirs) {
     const fullPath = path.join(root, d);
     if (!fs.existsSync(fullPath)) {
@@ -96,7 +95,6 @@ export function ensureDirs() {
     }
   }
   
-  console.log(`✅ [PATHS] Dossiers prêts\n`);
   return root;
 }
 

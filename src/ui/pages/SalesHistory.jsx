@@ -1,10 +1,14 @@
-import { useEffect, useState, useMemo, useCallback, memo, useRef } from 'react';
+import { useEffect, useState, useMemo, useCallback, memo, useRef, startTransition } from 'react';
 import { m, AnimatePresence } from 'framer-motion';
-import { Search, Receipt, Printer, Eye, Calendar, ChevronLeft, ChevronRight, Package, X, ChevronDown, ChevronUp, Clock, DollarSign, User, Cloud, CloudOff, CheckCircle, AlertCircle, Trash2 } from 'lucide-react';
+import { Search, Receipt, Printer, Eye, Calendar, ChevronLeft, ChevronRight, Package, X, ChevronDown, ChevronUp, Clock, DollarSign, User, Cloud, CloudOff, CheckCircle, AlertCircle, Trash2, Wifi, WifiOff, RefreshCw } from 'lucide-react';
 import { useOfflineSales } from '../hooks/useOfflineFirst';
+import { useSmartSales, useWebSocketStatus, getGlobalSocket } from '../hooks/useSmartSync';
 import VirtualList from '../components/VirtualList';
+import ErrorBoundary from '../components/ErrorBoundary';
+import { ToastContainer } from '../components/Toast';
+import { useToastNotifications } from '../hooks/useToastNotifications';
 import axios from 'axios';
-import { format, startOfMonth, endOfMonth, parseISO, getHours, getMinutes } from 'date-fns';
+import { format, startOfMonth, endOfMonth, startOfDay, endOfDay, subDays, startOfWeek, endOfWeek, parseISO, getHours, getMinutes, isToday, isYesterday, isSameDay } from 'date-fns';
 import { fr } from 'date-fns/locale';
 
 // En mode proxy Vite, utiliser des chemins relatifs pour compatibilité LAN
@@ -90,11 +94,16 @@ const isUnitValue = (value) => {
 const SaleRow = memo(({ sale, index, printStatuses, onSelect, onPrint, onDelete, deleting }) => {
   const printStatus = printStatuses[sale.invoice_number];
   const status = printStatus?.status || 'none';
+  const isDeleting = deleting === sale.invoice_number;
   
   return (
-    <div
+    <m.div
+      initial={{ opacity: 1, x: 0 }}
+      animate={{ opacity: isDeleting ? 0 : 1, x: isDeleting ? 100 : 0 }}
+      exit={{ opacity: 0, x: 100 }}
+      transition={{ duration: 0.3 }}
       className="p-4 glass rounded-lg hover:bg-white/5 transition-all cursor-pointer"
-      onClick={() => onSelect(sale)}
+      onClick={() => !isDeleting && onSelect(sale)}
     >
       <div className="flex items-center justify-between">
         <div className="flex-1">
@@ -234,7 +243,7 @@ const SaleRow = memo(({ sale, index, printStatuses, onSelect, onPrint, onDelete,
           </button>
         </div>
       </div>
-    </div>
+    </m.div>
   );
 });
 
@@ -249,40 +258,100 @@ const SalesHistory = () => {
     };
   }, []);
 
-  // Par défaut, afficher le mois actuel
+  // Par défaut, afficher les ventes d'aujourd'hui
   const today = new Date();
   const [currentDisplayDate, setCurrentDisplayDate] = useState(today);
+  const [filterMode, setFilterMode] = useState('day'); // 'day' | 'month' | 'week' | 'all'
   const [searchQuery, setSearchQuery] = useState('');
   const [searchAllMonths, setSearchAllMonths] = useState(false);
   const [selectedSale, setSelectedSale] = useState(null);
   const [saleDetails, setSaleDetails] = useState(null);
   const [loadingDetails, setLoadingDetails] = useState(false);
-  const [expandedItems, setExpandedItems] = useState(false);
+  const [expandedItems, setExpandedItems] = useState(true); // ✅ Ouvert par défaut
   const [printStatuses, setPrintStatuses] = useState({});
   const [deleting, setDeleting] = useState(null);
+  const [showCalendar, setShowCalendar] = useState(false);
+  const { toasts, closeToast, error: showError, success: showSuccess, info: showInfo } = useToastNotifications();
+  
+  // ✅ État de connexion WebSocket pour l'indicateur temps réel
+  const { isConnected, reconnecting } = useWebSocketStatus();
 
-  // Calculer les filtres pour useOfflineSales
+  // Calculer les filtres pour useOfflineSales selon le mode
   const filters = useMemo(() => {
     if (searchAllMonths && searchQuery) {
-      return {}; // Toutes les ventes
+      return { hideDeleted: true }; // Masquer les suppressions par défaut
     }
     
-    const startOfSelectedMonth = startOfMonth(currentDisplayDate);
-    const endOfSelectedMonth = endOfMonth(currentDisplayDate);
-    const fromDate = format(startOfSelectedMonth, 'yyyy-MM-dd') + 'T00:00:00.000Z';
-    const toDate = format(endOfSelectedMonth, 'yyyy-MM-dd') + 'T23:59:59.999Z';
+    let fromDate, toDate;
+    
+    switch (filterMode) {
+      case 'day':
+        // Filtrer par jour spécifique
+        fromDate = format(startOfDay(currentDisplayDate), "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
+        toDate = format(endOfDay(currentDisplayDate), "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
+        break;
+      case 'week':
+        // Filtrer par semaine
+        fromDate = format(startOfWeek(currentDisplayDate, { weekStartsOn: 1 }), "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
+        toDate = format(endOfWeek(currentDisplayDate, { weekStartsOn: 1 }), "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
+        break;
+      case 'month':
+        // Filtrer par mois
+        fromDate = format(startOfMonth(currentDisplayDate), "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
+        toDate = format(endOfMonth(currentDisplayDate), "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
+        break;
+      case 'all':
+        return { hideDeleted: true, exclude_status: 'pending' };
+      default:
+        fromDate = format(startOfDay(currentDisplayDate), "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
+        toDate = format(endOfDay(currentDisplayDate), "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
+    }
     
     return {
       from: fromDate,
       to: toDate,
       exclude_status: 'pending',
+      hideDeleted: true,
     };
-  }, [currentDisplayDate, searchAllMonths, searchQuery]);
+  }, [currentDisplayDate, filterMode, searchAllMonths, searchQuery]);
 
   // Utiliser useOfflineSales pour données locales instantanées
   const { data: sales = [], loading, refresh } = useOfflineSales(filters, {
     refetchOnMount: true,
   });
+
+  // ✅ AUTO-ACTUALISATION: Écouter les événements Socket.IO pour nouvelles ventes
+  useEffect(() => {
+    const socket = getGlobalSocket();
+    if (!socket) return;
+
+    const handleSaleCreated = () => {
+      console.log('📊 [SalesHistory] Nouvelle vente détectée, rafraîchissement...');
+      startTransition(() => {
+        refresh();
+      });
+    };
+
+    const handleSaleDeleted = () => {
+      console.log('🗑️ [SalesHistory] Vente supprimée, rafraîchissement...');
+      startTransition(() => {
+        refresh();
+      });
+    };
+
+    // Écouter les événements de ventes
+    socket.on('sale:created', handleSaleCreated);
+    socket.on('sale:finalized', handleSaleCreated);
+    socket.on('sale:deleted', handleSaleDeleted);
+    socket.on('sales:synced', handleSaleCreated);
+
+    return () => {
+      socket.off('sale:created', handleSaleCreated);
+      socket.off('sale:finalized', handleSaleCreated);
+      socket.off('sale:deleted', handleSaleDeleted);
+      socket.off('sales:synced', handleSaleCreated);
+    };
+  }, [refresh]);
 
   // Grouper les ventes par (client_name, invoice_number) et limiter à 50
   const uniqueSales = useMemo(() => {
@@ -402,32 +471,89 @@ const SalesHistory = () => {
     }
   };
 
-  const handlePreviousMonth = useCallback(() => {
+  // ✅ Navigation selon le mode
+  const handlePrevious = useCallback(() => {
     setCurrentDisplayDate(prev => {
       const newDate = new Date(prev);
-      newDate.setMonth(newDate.getMonth() - 1);
+      if (filterMode === 'day') {
+        newDate.setDate(newDate.getDate() - 1);
+      } else if (filterMode === 'week') {
+        newDate.setDate(newDate.getDate() - 7);
+      } else {
+        newDate.setMonth(newDate.getMonth() - 1);
+      }
       return newDate;
     });
-  }, []);
+  }, [filterMode]);
 
-  const handleNextMonth = useCallback(() => {
+  const handleNext = useCallback(() => {
     setCurrentDisplayDate(prev => {
       const newDate = new Date(prev);
-      newDate.setMonth(newDate.getMonth() + 1);
+      if (filterMode === 'day') {
+        newDate.setDate(newDate.getDate() + 1);
+      } else if (filterMode === 'week') {
+        newDate.setDate(newDate.getDate() + 7);
+      } else {
+        newDate.setMonth(newDate.getMonth() + 1);
+      }
       return newDate;
     });
-  }, []);
+  }, [filterMode]);
 
   const handleToday = useCallback(() => {
     setCurrentDisplayDate(new Date());
+    setFilterMode('day');
     setSearchAllMonths(false);
+  }, []);
+
+  const handleYesterday = useCallback(() => {
+    setCurrentDisplayDate(subDays(new Date(), 1));
+    setFilterMode('day');
+    setSearchAllMonths(false);
+  }, []);
+
+  const handleThisWeek = useCallback(() => {
+    setCurrentDisplayDate(new Date());
+    setFilterMode('week');
+    setSearchAllMonths(false);
+  }, []);
+
+  const handleThisMonth = useCallback(() => {
+    setCurrentDisplayDate(new Date());
+    setFilterMode('month');
+    setSearchAllMonths(false);
+  }, []);
+
+  const handleDateChange = useCallback((e) => {
+    const selectedDate = new Date(e.target.value);
+    setCurrentDisplayDate(selectedDate);
+    setFilterMode('day');
+    setSearchAllMonths(false);
+    setShowCalendar(false);
   }, []);
 
   const handleMonthChange = useCallback((e) => {
     const selectedDate = new Date(e.target.value + '-01');
     setCurrentDisplayDate(selectedDate);
+    setFilterMode('month');
     setSearchAllMonths(false);
   }, []);
+
+  // ✅ Obtenir le label de la période
+  const getPeriodLabel = useCallback(() => {
+    if (filterMode === 'all') return 'Toutes les ventes';
+    if (filterMode === 'day') {
+      if (isToday(currentDisplayDate)) return "Aujourd'hui";
+      if (isYesterday(currentDisplayDate)) return 'Hier';
+      return format(currentDisplayDate, 'EEEE d MMMM yyyy', { locale: fr });
+    }
+    if (filterMode === 'week') {
+      const start = startOfWeek(currentDisplayDate, { weekStartsOn: 1 });
+      const end = endOfWeek(currentDisplayDate, { weekStartsOn: 1 });
+      return `Semaine du ${format(start, 'd MMM', { locale: fr })} au ${format(end, 'd MMM yyyy', { locale: fr })}`;
+    }
+    return format(currentDisplayDate, 'MMMM yyyy', { locale: fr });
+  }, [currentDisplayDate, filterMode]);
 
   // Calculer les statistiques du mois
   const monthStats = useMemo(() => {
@@ -462,16 +588,57 @@ const SalesHistory = () => {
   }, []);
 
   const handlePrint = useCallback(async (invoiceNumber) => {
-    try {
-      await axios.post(`${API_URL}/api/sales/${invoiceNumber}/print`);
-      // Optionnel: notification de succès
-    } catch (error) {
-      console.error('Erreur impression:', error);
-      alert('Erreur lors de l\'impression');
+    if (!invoiceNumber) {
+      showError('❌ Numéro de facture manquant');
+      return;
     }
-  }, []);
+    
+    try {
+      console.log(`🖨️ [SalesHistory] Impression demandée: ${invoiceNumber}`);
+      
+      // ✅ Encoder l'invoiceNumber pour l'URL (caractères spéciaux)
+      const encodedInvoice = encodeURIComponent(invoiceNumber);
+      const response = await axios.post(`${API_URL}/api/sales/${encodedInvoice}/print`, {
+        template: 'receipt-80',
+        copies: 1
+      }, {
+        timeout: 15000 // 15 secondes max
+      });
+      
+      console.log(`✅ [SalesHistory] Réponse impression:`, response.data);
+      
+      if (response.data.success) {
+        showSuccess(`✅ Impression envoyée (${response.data.file || invoiceNumber})`);
+        
+        // Mettre à jour le statut d'impression localement
+        setPrintStatuses(prev => ({
+          ...prev,
+          [invoiceNumber]: { status: 'processing', timestamp: Date.now() }
+        }));
+      } else {
+        showError(`❌ Erreur: ${response.data.error || 'Erreur inconnue'}`);
+      }
+    } catch (error) {
+      console.error('❌ [SalesHistory] Erreur impression:', error);
+      console.error('   Status:', error.response?.status);
+      console.error('   Data:', error.response?.data);
+      
+      const errorMsg = error.response?.data?.error || 
+                      error.response?.data?.message ||
+                      error.message ||
+                      'Erreur inconnue';
+      
+      if (error.code === 'ECONNABORTED') {
+        showError('⏱️ Timeout - Le serveur est trop lent ou injoignable');
+      } else if (error.response?.status === 404) {
+        showError(`❌ Facture non trouvée: ${invoiceNumber}`);
+      } else {
+        showError(`❌ Erreur impression: ${errorMsg}`);
+      }
+    }
+  }, [showSuccess, showError]);
 
-  // ✅ Supprimer une vente et restaurer le stock
+  // ✅ Supprimer une vente et restaurer le stock - NON-BLOQUANT pour l'UI
   const handleDeleteSale = useCallback(async (invoiceNumber, e) => {
     e?.stopPropagation();
     
@@ -497,14 +664,26 @@ Continuer ?`;
       return;
     }
     
+    // 1. Fermer le modal IMMÉDIATEMENT avant toute opération async
+    // Cela libère le backdrop et évite les blocages de pointer-events
+    if (selectedSale?.invoice_number === invoiceNumber) {
+      closeModal();
+    }
+    
+    // 2. Yield au main thread pour permettre à React de mettre à jour le DOM
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    
     setDeleting(invoiceNumber);
     
     try {
-      // Encoder l'invoice number pour l'URL
+      // 3. Encoder l'invoice number pour l'URL
       const encodedInvoice = encodeURIComponent(invoiceNumber);
       console.log(`   📤 DELETE ${API_URL}/api/sales/${encodedInvoice}`);
       
-      const response = await axios.delete(`${API_URL}/api/sales/${encodedInvoice}`);
+      // 4. Appel API (async, ne bloque pas l'UI)
+      const response = await axios.delete(`${API_URL}/api/sales/${encodedInvoice}`, {
+        timeout: 30000 // 30 secondes max
+      });
       
       console.log(`   📥 Réponse:`, response.data);
       
@@ -513,38 +692,78 @@ Continuer ?`;
         if (response.data.stockRestored && response.data.stockRestored.length > 0) {
           console.log(`✅ Facture supprimée, stock restauré:`);
           response.data.stockRestored.forEach((item) => {
-            console.log(`   📦 ${item.product}: +${item.restored} ${formatUnitLevel(item.unit)} (${item.stock_before} → ${item.stock_after})`);
+            console.log(`   📦 ${item.product_code}: +${item.qty} ${formatUnitLevel(item.unit_level)} (→ ${item.stock_after})`);
           });
         } else {
           console.log(`✅ Facture supprimée (aucun stock à restaurer)`);
         }
         
-        // Fermer le modal si ouvert
-        if (selectedSale?.invoice_number === invoiceNumber) {
-          closeModal();
-        }
-        
-        // Recharger les ventes
-        refresh();
-        
-        // Notification de succès (optionnel)
+        // Afficher succès via Toast
         const restoredCount = response.data.stockRestored?.length || 0;
         if (restoredCount > 0) {
-          console.log(`🎉 ${restoredCount} produit(s) restauré(s) - Sync en attente`);
+          showSuccess(`✅ Facture supprimée - ${restoredCount} produit(s) restauré(s)`);
+        } else {
+          showSuccess(`✅ Facture supprimée avec succès`);
         }
+        
+        // ✅ PRO FIX: Libérer l'état de suppression IMMÉDIATEMENT
+        setDeleting(null);
+        
+        // ✅ PRO: Invalider le cache de façon non-bloquante
+        setTimeout(() => {
+          const filtersKey = JSON.stringify(filters);
+          try {
+            localStorage.removeItem(`offline_cache_sales_${filtersKey}`);
+            console.log('🗑️ Cache ventes invalidé');
+          } catch (err) {
+            console.warn('⚠️ Impossible d\'invalider cache:', err.message);
+          }
+        }, 0);
+        
+        // ✅ PRO FIX CRITIQUE: Utiliser startTransition de React 18 pour le refresh
+        // startTransition marque l'update comme "non-urgente" → les inputs restent réactifs
+        // C'est LA solution React officielle pour les updates qui ne doivent pas bloquer l'UI
+        const doNonBlockingRefresh = () => {
+          startTransition(() => {
+            refresh().catch(err => {
+              console.warn('⚠️ Refresh warning:', err.message);
+            });
+          });
+        };
+        
+        // ✅ Double yield: d'abord libérer le thread, puis refresh en transition
+        // 1) setTimeout(0) libère le thread principal pour les inputs
+        // 2) startTransition évite le blocage pendant le re-render
+        setTimeout(doNonBlockingRefresh, 16); // 1 frame (~16ms)
+        
+        console.log(`✅ Vente ${invoiceNumber} supprimée - refresh startTransition programmé`);
+        return; // Sortir tôt, finally ne mettra pas deleting à null (déjà fait)
       } else {
         console.error('❌ Erreur serveur:', response.data.error);
-        alert(`Erreur: ${response.data.error || 'Erreur inconnue'}`);
+        showError(`Erreur: ${response.data.error || 'Erreur inconnue'}`);
       }
     } catch (error) {
       console.error('❌ Erreur suppression:', error);
       console.error('   Status:', error.response?.status);
       console.error('   Data:', error.response?.data);
-      alert(`Erreur lors de la suppression:\n${error.response?.data?.error || error.message}`);
+      
+      // Ne pas bloquer avec alert si erreur réseau simple
+      const errorMsg = error.response?.data?.error || 
+                      error.response?.data?.message ||
+                      error.message ||
+                      'Erreur inconnue';
+      
+      // Si timeout ou connexion, message simplifié
+      if (error.code === 'ECONNABORTED') {
+        showError('⏱️ Timeout - serveur lent ou injoignable');
+      } else {
+        showError(`Erreur suppression: ${errorMsg}`);
+      }
     } finally {
-      setDeleting(null);
+      // Seulement si on n'a pas déjà libéré (cas d'erreur)
+      setDeleting(prev => prev === invoiceNumber ? null : prev);
     }
-  }, [refresh, selectedSale, closeModal]);
+  }, [refresh, selectedSale, closeModal, filters, showSuccess, showError]);
 
   const handleSaleClick = useCallback((sale) => {
     setSelectedSale(sale);
@@ -556,100 +775,248 @@ Continuer ?`;
       {/* Header */}
       <div>
         <h1 className="text-3xl font-bold text-gray-100 mb-2">Historique des ventes</h1>
-        <p className="text-gray-400">Consultez toutes vos factures</p>
+        <p className="text-gray-400 flex items-center gap-2 flex-wrap">
+          <span>Consultez toutes vos factures</span>
+          {/* ✅ Indicateur de synchronisation temps réel */}
+          <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium ${
+            isConnected 
+              ? 'bg-green-500/20 text-green-400 border border-green-500/30' 
+              : reconnecting 
+              ? 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30 animate-pulse' 
+              : 'bg-red-500/20 text-red-400 border border-red-500/30'
+          }`}>
+            {isConnected ? (
+              <>
+                <Wifi className="w-3 h-3" />
+                <span>Sync auto</span>
+              </>
+            ) : reconnecting ? (
+              <>
+                <RefreshCw className="w-3 h-3 animate-spin" />
+                <span>Reconnexion...</span>
+              </>
+            ) : (
+              <>
+                <WifiOff className="w-3 h-3" />
+                <span>Hors ligne</span>
+              </>
+            )}
+          </span>
+        </p>
       </div>
 
-      {/* Navigation mensuelle et filtres */}
+      {/* ✅ FILTRES DE DATE PRO */}
       <div className="card space-y-4">
-        {/* Navigation mensuelle */}
-        <div className="flex justify-between items-center pb-4 border-b border-gray-700">
-          <button 
-            onClick={handlePreviousMonth} 
-            className="p-2 glass rounded-lg hover:bg-white/10 transition-all"
-            title="Mois précédent"
-            disabled={searchAllMonths}
+        {/* Boutons de raccourci rapide */}
+        <div className="flex flex-wrap gap-2 pb-4 border-b border-gray-700">
+          <m.button
+            onClick={handleToday}
+            whileHover={{ scale: 1.02 }}
+            whileTap={{ scale: 0.98 }}
+            className={`px-4 py-2 rounded-xl font-medium transition-all flex items-center gap-2 ${
+              filterMode === 'day' && isToday(currentDisplayDate)
+                ? 'bg-gradient-to-r from-primary-500 to-primary-600 text-white shadow-lg shadow-primary-500/25'
+                : 'bg-white/5 text-gray-300 hover:bg-white/10 border border-white/10'
+            }`}
           >
-            <ChevronLeft className={`w-5 h-5 ${searchAllMonths ? 'text-gray-600' : 'text-gray-400'}`} />
-          </button>
+            <Clock className="w-4 h-4" />
+            Aujourd'hui
+          </m.button>
           
-          <div className="flex flex-col items-center gap-2">
-            <div className="flex items-center gap-2">
-              <Calendar className="w-5 h-5 text-primary-400" />
-              <h2 className="text-xl font-semibold text-gray-100">
-                {searchAllMonths ? 'Tous les mois' : format(currentDisplayDate, 'MMMM yyyy', { locale: fr })}
-              </h2>
-            </div>
-            <div className="flex items-center gap-2">
-              <input
-                type="month"
-                value={format(currentDisplayDate, 'yyyy-MM')}
-                onChange={handleMonthChange}
-                className="input-field text-sm"
-                title="Sélectionner un mois"
-                disabled={searchAllMonths}
-              />
-              <button 
-                onClick={handleToday}
-                className="btn btn-primary btn-sm"
-                title="Retour au mois actuel"
-                disabled={searchAllMonths}
-              >
-                Aujourd'hui
-              </button>
-            </div>
-          </div>
-          
-          <button 
-            onClick={handleNextMonth} 
-            className="p-2 glass rounded-lg hover:bg-white/10 transition-all"
-            title="Mois suivant"
-            disabled={searchAllMonths}
+          <m.button
+            onClick={handleYesterday}
+            whileHover={{ scale: 1.02 }}
+            whileTap={{ scale: 0.98 }}
+            className={`px-4 py-2 rounded-xl font-medium transition-all flex items-center gap-2 ${
+              filterMode === 'day' && isYesterday(currentDisplayDate)
+                ? 'bg-gradient-to-r from-amber-500 to-amber-600 text-white shadow-lg shadow-amber-500/25'
+                : 'bg-white/5 text-gray-300 hover:bg-white/10 border border-white/10'
+            }`}
           >
-            <ChevronRight className={`w-5 h-5 ${searchAllMonths ? 'text-gray-600' : 'text-gray-400'}`} />
-          </button>
+            <Calendar className="w-4 h-4" />
+            Hier
+          </m.button>
+          
+          <m.button
+            onClick={handleThisWeek}
+            whileHover={{ scale: 1.02 }}
+            whileTap={{ scale: 0.98 }}
+            className={`px-4 py-2 rounded-xl font-medium transition-all flex items-center gap-2 ${
+              filterMode === 'week'
+                ? 'bg-gradient-to-r from-blue-500 to-blue-600 text-white shadow-lg shadow-blue-500/25'
+                : 'bg-white/5 text-gray-300 hover:bg-white/10 border border-white/10'
+            }`}
+          >
+            <Calendar className="w-4 h-4" />
+            Cette semaine
+          </m.button>
+          
+          <m.button
+            onClick={handleThisMonth}
+            whileHover={{ scale: 1.02 }}
+            whileTap={{ scale: 0.98 }}
+            className={`px-4 py-2 rounded-xl font-medium transition-all flex items-center gap-2 ${
+              filterMode === 'month'
+                ? 'bg-gradient-to-r from-purple-500 to-purple-600 text-white shadow-lg shadow-purple-500/25'
+                : 'bg-white/5 text-gray-300 hover:bg-white/10 border border-white/10'
+            }`}
+          >
+            <Calendar className="w-4 h-4" />
+            Ce mois
+          </m.button>
+          
+          <m.button
+            onClick={() => { setFilterMode('all'); setSearchAllMonths(true); }}
+            whileHover={{ scale: 1.02 }}
+            whileTap={{ scale: 0.98 }}
+            className={`px-4 py-2 rounded-xl font-medium transition-all flex items-center gap-2 ${
+              filterMode === 'all'
+                ? 'bg-gradient-to-r from-gray-500 to-gray-600 text-white shadow-lg'
+                : 'bg-white/5 text-gray-300 hover:bg-white/10 border border-white/10'
+            }`}
+          >
+            <Receipt className="w-4 h-4" />
+            Tout
+          </m.button>
         </div>
 
-        {/* Statistiques du mois */}
+        {/* Navigation de période avec calendrier */}
+        <div className="flex justify-between items-center">
+          <m.button 
+            onClick={handlePrevious}
+            whileHover={{ scale: 1.1 }}
+            whileTap={{ scale: 0.9 }}
+            className="p-3 glass rounded-xl hover:bg-white/10 transition-all border border-white/10"
+            title="Période précédente"
+            disabled={filterMode === 'all'}
+          >
+            <ChevronLeft className={`w-5 h-5 ${filterMode === 'all' ? 'text-gray-600' : 'text-gray-300'}`} />
+          </m.button>
+          
+          <div className="flex flex-col items-center gap-3">
+            <m.div 
+              className="flex items-center gap-3 px-6 py-3 glass rounded-2xl border border-white/10 cursor-pointer hover:bg-white/5 transition-all"
+              onClick={() => setShowCalendar(!showCalendar)}
+              whileHover={{ scale: 1.02 }}
+            >
+              <Calendar className="w-6 h-6 text-primary-400" />
+              <h2 className="text-xl font-bold text-gray-100 capitalize">
+                {getPeriodLabel()}
+              </h2>
+              <ChevronDown className={`w-5 h-5 text-gray-400 transition-transform ${showCalendar ? 'rotate-180' : ''}`} />
+            </m.div>
+            
+            {/* Calendrier déroulant */}
+            <AnimatePresence>
+              {showCalendar && (
+                <m.div
+                  initial={{ opacity: 0, y: -10, height: 0 }}
+                  animate={{ opacity: 1, y: 0, height: 'auto' }}
+                  exit={{ opacity: 0, y: -10, height: 0 }}
+                  className="flex flex-wrap gap-2 justify-center"
+                >
+                  <input
+                    type="date"
+                    value={format(currentDisplayDate, 'yyyy-MM-dd')}
+                    onChange={handleDateChange}
+                    className="input-field text-sm px-4 py-2 rounded-xl"
+                    title="Choisir une date"
+                  />
+                  <input
+                    type="month"
+                    value={format(currentDisplayDate, 'yyyy-MM')}
+                    onChange={handleMonthChange}
+                    className="input-field text-sm px-4 py-2 rounded-xl"
+                    title="Choisir un mois"
+                  />
+                </m.div>
+              )}
+            </AnimatePresence>
+          </div>
+          
+          <m.button 
+            onClick={handleNext}
+            whileHover={{ scale: 1.1 }}
+            whileTap={{ scale: 0.9 }}
+            className="p-3 glass rounded-xl hover:bg-white/10 transition-all border border-white/10"
+            title="Période suivante"
+            disabled={filterMode === 'all'}
+          >
+            <ChevronRight className={`w-5 h-5 ${filterMode === 'all' ? 'text-gray-600' : 'text-gray-300'}`} />
+          </m.button>
+        </div>
+
+        {/* ✅ Statistiques améliorées */}
         {!loading && (
-          <div className="grid grid-cols-2 gap-4 pt-4">
-            <div className="text-center p-4 glass rounded-lg">
-              <p className="text-sm text-gray-400 mb-1">Ventes uniques</p>
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 pt-4 border-t border-gray-700">
+            <m.div 
+              className="text-center p-4 glass rounded-xl border border-white/5"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.1 }}
+            >
+              <Receipt className="w-6 h-6 text-primary-400 mx-auto mb-2" />
               <p className="text-3xl font-bold text-primary-400">{monthStats.count}</p>
-              <p className="text-xs text-gray-500 mt-1">
-                {searchAllMonths ? 'toutes périodes' : `pour ce mois`}
+              <p className="text-xs text-gray-400 mt-1">Ventes</p>
+            </m.div>
+            <m.div 
+              className="text-center p-4 glass rounded-xl border border-white/5"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.2 }}
+            >
+              <DollarSign className="w-6 h-6 text-green-400 mx-auto mb-2" />
+              <p className="text-3xl font-bold text-green-400">{monthStats.total.toLocaleString()}</p>
+              <p className="text-xs text-gray-400 mt-1">FC Total</p>
+            </m.div>
+            <m.div 
+              className="text-center p-4 glass rounded-xl border border-white/5"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.3 }}
+            >
+              <Package className="w-6 h-6 text-blue-400 mx-auto mb-2" />
+              <p className="text-3xl font-bold text-blue-400">
+                {uniqueSales.reduce((sum, s) => sum + (s.items?.length || 0), 0)}
               </p>
-            </div>
-            <div className="text-center p-4 glass rounded-lg">
-              <p className="text-sm text-gray-400 mb-1">Total</p>
-              <p className="text-3xl font-bold text-primary-400">{monthStats.total.toLocaleString()}</p>
-              <p className="text-xs text-gray-500 mt-1">Francs Congolais</p>
-            </div>
+              <p className="text-xs text-gray-400 mt-1">Articles</p>
+            </m.div>
+            <m.div 
+              className="text-center p-4 glass rounded-xl border border-white/5"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.4 }}
+            >
+              <User className="w-6 h-6 text-amber-400 mx-auto mb-2" />
+              <p className="text-3xl font-bold text-amber-400">
+                {monthStats.count > 0 ? Math.round(monthStats.total / monthStats.count).toLocaleString() : 0}
+              </p>
+              <p className="text-xs text-gray-400 mt-1">Moyenne FC</p>
+            </m.div>
           </div>
         )}
 
-        {/* Recherche */}
-        <div className="space-y-2 pt-2 border-t border-gray-700">
+        {/* ✅ Recherche améliorée */}
+        <div className="space-y-2 pt-4 border-t border-gray-700">
           <div className="relative">
-            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5 text-gray-400" />
+            <Search className="absolute left-4 top-1/2 transform -translate-y-1/2 w-5 h-5 text-gray-400" />
             <input
+              id="sales-search-input"
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Rechercher par numéro de facture ou nom de client..."
-              className="input-field pl-10"
+              placeholder="🔍 Rechercher facture, client..."
+              className="input-field pl-12 py-3 text-lg rounded-xl"
             />
+            {searchQuery && (
+              <button
+                onClick={() => setSearchQuery('')}
+                className="absolute right-3 top-1/2 transform -translate-y-1/2 p-1 hover:bg-white/10 rounded-full"
+              >
+                <X className="w-4 h-4 text-gray-400" />
+              </button>
+            )}
           </div>
-          {searchQuery && (
-            <label className="flex items-center gap-2 text-sm text-gray-400 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={searchAllMonths}
-                onChange={(e) => setSearchAllMonths(e.target.checked)}
-                className="w-4 h-4 rounded border-gray-600 bg-gray-800 text-primary-500 focus:ring-primary-500"
-              />
-              <span>Rechercher dans tous les mois</span>
-            </label>
-          )}
         </div>
       </div>
 
@@ -711,155 +1078,196 @@ Continuer ?`;
         )}
       </div>
 
-      {/* Modal de détails */}
-      <AnimatePresence>
+      {/* Modal de détails - FIXED: pointer-events properly handled */}
+      <AnimatePresence mode="wait">
         {selectedSale && (
-          <div
+          <m.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.2 }}
             className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4"
             onClick={closeModal}
+            style={{ 
+              // CRITICAL: Ensure pointer-events are properly handled
+              pointerEvents: 'auto',
+              willChange: 'opacity'
+            }}
           >
-            <div
+            <m.div
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              transition={{ 
+                duration: 0.25, 
+                ease: [0.25, 0.1, 0.25, 1],
+                // Ensure exit animation is fast enough
+                exit: { duration: 0.15 }
+              }}
               className="bg-gray-900 rounded-xl shadow-2xl max-w-4xl w-full max-h-[90vh] overflow-y-auto"
               onClick={(e) => e.stopPropagation()}
+              style={{ pointerEvents: 'auto' }}
             >
               {loadingDetails ? (
                 <div className="p-8 text-center">
                   <m.div
                     animate={{ rotate: 360 }}
                     transition={{ duration: 1, repeat: Infinity, ease: 'linear' }}
-                    className="w-12 h-12 border-4 border-primary-500 border-t-transparent rounded-full mx-auto"
+                    className="w-16 h-16 border-4 border-primary-500 border-t-transparent rounded-full mx-auto"
                   />
-                  <p className="mt-4 text-gray-400">Chargement des détails...</p>
+                  <p className="mt-4 text-gray-400 text-lg">Chargement des détails...</p>
                 </div>
               ) : saleDetails ? (
-                <div className="p-6 space-y-6">
-                  {/* Header */}
-                  <div className="flex items-center justify-between border-b border-gray-700 pb-4">
-                    <div>
-                      <h2 className="text-2xl font-bold text-gray-100">
-                        {saleDetails.client_name || 'Client'}
-                      </h2>
-                      <p className="text-sm text-gray-400 mt-1 flex items-center gap-2">
-                        <Receipt className="w-4 h-4" />
-                        Facture {saleDetails.invoice_number}
-                      </p>
-                    </div>
-                    <button
-                      onClick={closeModal}
-                      className="p-2 glass rounded-lg hover:bg-white/10"
-                    >
-                      <X className="w-5 h-5 text-gray-400" />
-                    </button>
-                  </div>
-
-                  {/* Informations principales */}
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div className="p-4 glass rounded-lg">
-                      <div className="flex items-center gap-2 mb-2">
-                        <User className="w-5 h-5 text-primary-400" />
-                        <p className="text-sm text-gray-400">Client</p>
-                      </div>
-                      <div className="space-y-1">
-                        <p className="text-lg font-semibold text-gray-200">
-                          {saleDetails.client_name || 'Non renseigné'}
-                        </p>
-                        <p className="text-xs text-gray-400 flex items-center gap-1">
-                          <Receipt className="w-3 h-3" />
-                          {saleDetails.invoice_number}
-                        </p>
-                      </div>
-                    </div>
-                    <div className="p-4 glass rounded-lg">
-                      <p className="text-sm text-gray-400 mb-1">Date & Heure</p>
-                      <p className="text-lg font-semibold text-gray-200">
-                        {format(new Date(saleDetails.sold_at), 'dd MMMM yyyy à HH:mm', { locale: fr })}
-                      </p>
-                    </div>
-                    <div className="p-4 glass rounded-lg">
-                      <p className="text-sm text-gray-400 mb-1">Nombre de produits</p>
-                      <p className="text-lg font-semibold text-primary-400">
-                        {saleDetails.items?.length || 0} article{saleDetails.items?.length > 1 ? 's' : ''}
-                      </p>
-                    </div>
-                    {saleDetails.seller_name && !isUnitValue(saleDetails.seller_name) && (
-                      <div className="p-4 glass rounded-lg">
-                        <p className="text-sm text-gray-400 mb-1">Vendeur</p>
-                        <p className="text-lg font-semibold text-gray-200">
-                          {saleDetails.seller_name}
-                        </p>
-                      </div>
-                    )}
-                    <div className="p-4 glass rounded-lg">
-                      <p className="text-sm text-gray-400 mb-1">Total</p>
-                      <div className="flex items-center gap-2">
-                        <p className="text-lg font-semibold text-primary-400">
-                          {saleDetails.total_fc?.toLocaleString() || 0} FC
-                        </p>
-                        {saleDetails.total_usd && (
-                          <p className="text-sm text-gray-400">
-                            / ${saleDetails.total_usd.toFixed(2)} USD
-                          </p>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Graphique d'heure */}
-                  {hourChart && (
-                    <div className="p-4 glass rounded-lg">
-                      <div className="flex items-center gap-2 mb-4">
-                        <Clock className="w-5 h-5 text-primary-400" />
-                        <h3 className="text-lg font-semibold text-gray-200">Heure de vente</h3>
-                      </div>
-                      <div className="space-y-2">
-                        <div className="flex items-center justify-between text-sm text-gray-400 mb-2">
-                          <span>Heure: {hourChart.currentHour}h{hourChart.currentMinute.toString().padStart(2, '0')}</span>
-                          <span>0h - 23h</span>
-                        </div>
-                        <div className="flex items-end gap-1 h-32">
-                          {hourChart.hours.map((h, i) => (
-                            <div
-                              key={i}
-                              className={`flex-1 rounded-t transition-all ${
-                                h.active
-                                  ? 'bg-primary-500'
-                                  : i % 6 === 0
-                                  ? 'bg-gray-700'
-                                  : 'bg-gray-800'
-                              }`}
-                              style={{
-                                height: h.active ? '100%' : '20%',
-                                minHeight: '4px'
-                              }}
-                              title={`${h.hour}h`}
-                            />
-                          ))}
+                <div className="p-0 space-y-0">
+                  {/* ✅ HEADER PRO avec gradient */}
+                  <div className="bg-gradient-to-r from-primary-600/30 via-primary-500/20 to-transparent p-6 border-b border-white/10">
+                    <div className="flex items-start justify-between">
+                      <div className="flex items-center gap-4">
+                        <m.div 
+                          className="w-16 h-16 rounded-2xl bg-gradient-to-br from-primary-500 to-primary-600 flex items-center justify-center shadow-lg shadow-primary-500/30"
+                          initial={{ scale: 0, rotate: -180 }}
+                          animate={{ scale: 1, rotate: 0 }}
+                          transition={{ type: 'spring', stiffness: 200, damping: 15 }}
+                        >
+                          <Receipt className="w-8 h-8 text-white" />
+                        </m.div>
+                        <div>
+                          <m.h2 
+                            className="text-2xl font-bold text-white"
+                            initial={{ opacity: 0, x: -20 }}
+                            animate={{ opacity: 1, x: 0 }}
+                            transition={{ delay: 0.1 }}
+                          >
+                            {saleDetails.client_name || 'Client'}
+                          </m.h2>
+                          <m.div 
+                            className="flex items-center gap-3 mt-1"
+                            initial={{ opacity: 0, x: -20 }}
+                            animate={{ opacity: 1, x: 0 }}
+                            transition={{ delay: 0.2 }}
+                          >
+                            <span className="px-3 py-1 bg-white/10 rounded-full text-sm font-mono text-primary-300">
+                              #{saleDetails.invoice_number}
+                            </span>
+                            <span className="text-gray-400 text-sm">
+                              {format(new Date(saleDetails.sold_at), 'dd MMM yyyy • HH:mm', { locale: fr })}
+                            </span>
+                          </m.div>
                         </div>
                       </div>
-                    </div>
-                  )}
-
-                  {/* Articles (repliables) */}
-                  {saleDetails.items && saleDetails.items.length > 0 && (
-                    <div className="p-4 glass rounded-lg">
-                      <button
-                        onClick={() => setExpandedItems(!expandedItems)}
-                        className="flex items-center justify-between w-full mb-2"
+                      <m.button
+                        onClick={closeModal}
+                        whileHover={{ scale: 1.1, rotate: 90 }}
+                        whileTap={{ scale: 0.9 }}
+                        className="p-2 rounded-xl bg-white/10 hover:bg-white/20 transition-all"
                       >
-                        <div className="flex items-center gap-2">
-                          <Package className="w-5 h-5 text-primary-400" />
-                          <h3 className="text-lg font-semibold text-gray-200">
-                            Articles ({saleDetails.items.length})
-                          </h3>
-                        </div>
-                        {expandedItems ? (
-                          <ChevronUp className="w-5 h-5 text-gray-400" />
-                        ) : (
-                          <ChevronDown className="w-5 h-5 text-gray-400" />
-                        )}
-                      </button>
+                        <X className="w-6 h-6 text-white" />
+                      </m.button>
+                    </div>
+                    
+                    {/* ✅ Total en grand */}
+                    <m.div 
+                      className="mt-4 flex items-baseline gap-3"
+                      initial={{ opacity: 0, y: 20 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      transition={{ delay: 0.3 }}
+                    >
+                      <span className="text-4xl font-black text-white">
+                        {saleDetails.total_fc?.toLocaleString() || 0}
+                      </span>
+                      <span className="text-xl text-primary-300 font-semibold">FC</span>
+                      {saleDetails.total_usd && (
+                        <span className="text-lg text-gray-400 ml-2">
+                          (${saleDetails.total_usd.toFixed(2)} USD)
+                        </span>
+                      )}
+                    </m.div>
+                  </div>
+
+                  <div className="p-6 space-y-6">
+                    {/* ✅ Informations en grille PRO */}
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                      <m.div 
+                        className="p-4 rounded-xl bg-gradient-to-br from-blue-500/20 to-blue-600/10 border border-blue-500/20"
+                        initial={{ opacity: 0, y: 20 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        transition={{ delay: 0.1 }}
+                      >
+                        <User className="w-5 h-5 text-blue-400 mb-2" />
+                        <p className="text-xs text-gray-400">Client</p>
+                        <p className="text-sm font-semibold text-white truncate">{saleDetails.client_name || '-'}</p>
+                      </m.div>
                       
-                      {/* Résumé par unité */}
+                      <m.div 
+                        className="p-4 rounded-xl bg-gradient-to-br from-purple-500/20 to-purple-600/10 border border-purple-500/20"
+                        initial={{ opacity: 0, y: 20 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        transition={{ delay: 0.15 }}
+                      >
+                        <Clock className="w-5 h-5 text-purple-400 mb-2" />
+                        <p className="text-xs text-gray-400">Heure</p>
+                        <p className="text-sm font-semibold text-white">
+                          {format(new Date(saleDetails.sold_at), 'HH:mm', { locale: fr })}
+                        </p>
+                      </m.div>
+                      
+                      <m.div 
+                        className="p-4 rounded-xl bg-gradient-to-br from-amber-500/20 to-amber-600/10 border border-amber-500/20"
+                        initial={{ opacity: 0, y: 20 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        transition={{ delay: 0.2 }}
+                      >
+                        <Package className="w-5 h-5 text-amber-400 mb-2" />
+                        <p className="text-xs text-gray-400">Articles</p>
+                        <p className="text-sm font-semibold text-white">{saleDetails.items?.length || 0} produit(s)</p>
+                      </m.div>
+                      
+                      {saleDetails.seller_name && !isUnitValue(saleDetails.seller_name) && (
+                        <m.div 
+                          className="p-4 rounded-xl bg-gradient-to-br from-green-500/20 to-green-600/10 border border-green-500/20"
+                          initial={{ opacity: 0, y: 20 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          transition={{ delay: 0.25 }}
+                        >
+                          <User className="w-5 h-5 text-green-400 mb-2" />
+                          <p className="text-xs text-gray-400">Vendeur</p>
+                          <p className="text-sm font-semibold text-white truncate">{saleDetails.seller_name}</p>
+                        </m.div>
+                      )}
+                    </div>
+
+                  {/* Articles (repliables) - PRO UI avec animations staggered */}
+                  {saleDetails.items && saleDetails.items.length > 0 && (
+                    <div className="p-4 glass rounded-xl border border-white/5 bg-gradient-to-br from-gray-800/50 to-gray-900/50">
+                      <m.button
+                        onClick={() => setExpandedItems(!expandedItems)}
+                        className="flex items-center justify-between w-full mb-3 p-2 rounded-lg hover:bg-white/5 transition-all group"
+                        whileHover={{ scale: 1.01 }}
+                        whileTap={{ scale: 0.99 }}
+                      >
+                        <div className="flex items-center gap-3">
+                          <div className="p-2 rounded-lg bg-primary-500/20 border border-primary-500/30 group-hover:bg-primary-500/30 transition-colors">
+                            <Package className="w-5 h-5 text-primary-400" />
+                          </div>
+                          <div className="text-left">
+                            <h3 className="text-lg font-bold text-gray-100">
+                              Articles
+                            </h3>
+                            <p className="text-xs text-gray-400">
+                              {saleDetails.items.length} produit{saleDetails.items.length > 1 ? 's' : ''} • Cliquer pour {expandedItems ? 'réduire' : 'détailler'}
+                            </p>
+                          </div>
+                        </div>
+                        <m.div
+                          animate={{ rotate: expandedItems ? 180 : 0 }}
+                          transition={{ duration: 0.2 }}
+                          className="p-2 rounded-full bg-white/5 group-hover:bg-white/10 transition-colors"
+                        >
+                          <ChevronDown className="w-5 h-5 text-gray-400" />
+                        </m.div>
+                      </m.button>
+                      
+                      {/* Résumé par unité - Design amélioré */}
                       {(() => {
                         const unitSummary = saleDetails.items.reduce((acc, item) => {
                           const unitKey = formatUnitLevel(item.unit_level);
@@ -872,59 +1280,73 @@ Continuer ?`;
                         }, {});
                         
                         return (
-                          <div className="flex flex-wrap gap-2 mb-3">
-                            {Object.entries(unitSummary).map(([unit, data]) => (
-                              <span 
+                          <div className="flex flex-wrap gap-2 mb-3 px-2">
+                            {Object.entries(unitSummary).map(([unit, data], idx) => (
+                              <m.span 
                                 key={unit} 
-                                className={`${getUnitBadgeClass(data.unitLevel)} px-2 py-1`}
+                                initial={{ opacity: 0, scale: 0.9 }}
+                                animate={{ opacity: 1, scale: 1 }}
+                                transition={{ delay: idx * 0.05 }}
+                                className={`${getUnitBadgeClass(data.unitLevel)} px-3 py-1.5 rounded-lg font-semibold shadow-sm`}
                               >
-                                {data.qty} {unit}
-                              </span>
+                                <span className="text-lg font-bold">{data.qty}</span>
+                                <span className="ml-1 opacity-80">{unit}</span>
+                              </m.span>
                             ))}
                           </div>
                         );
                       })()}
 
-                      <AnimatePresence>
+                      <AnimatePresence mode="wait">
                         {expandedItems && (
                           <m.div
                             initial={{ height: 0, opacity: 0 }}
                             animate={{ height: 'auto', opacity: 1 }}
                             exit={{ height: 0, opacity: 0 }}
+                            transition={{ duration: 0.25, ease: [0.25, 0.1, 0.25, 1] }}
                             className="overflow-hidden"
                           >
-                            <div className="space-y-2 mt-4">
+                            <div className="space-y-2 mt-4 max-h-[40vh] overflow-y-auto pr-2 custom-scrollbar">
                               {saleDetails.items.map((item, idx) => (
-                                <div
+                                <m.div
                                   key={item.id || idx}
-                                  className="p-3 bg-gray-800/50 rounded-lg flex items-center justify-between hover:bg-gray-800/70 transition-colors"
+                                  initial={{ opacity: 0, x: -10 }}
+                                  animate={{ opacity: 1, x: 0 }}
+                                  transition={{ 
+                                    delay: idx * 0.03, 
+                                    duration: 0.2,
+                                    ease: [0.25, 0.1, 0.25, 1]
+                                  }}
+                                  className="p-4 bg-gradient-to-r from-gray-800/80 to-gray-800/40 rounded-xl border border-white/5 flex items-center justify-between hover:border-primary-500/30 hover:from-gray-800/90 transition-all group"
                                 >
-                                  <div className="flex-1">
-                                    <div className="flex items-center gap-2">
-                                      <p className="font-semibold text-gray-200">{item.product_name || item.product_code}</p>
-                                      <span className={getUnitBadgeClass(item.unit_level)}>
+                                  <div className="flex-1 min-w-0">
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                      <p className="font-bold text-gray-100 text-base truncate">
+                                        {item.product_name || item.product_code}
+                                      </p>
+                                      <span className={`${getUnitBadgeClass(item.unit_level)} px-2 py-0.5 text-xs font-semibold`}>
                                         {formatUnitLevel(item.unit_level)}
                                       </span>
                                       {item.unit_mark && item.unit_mark !== formatUnitLevel(item.unit_level) && (
-                                        <span className="badge badge-ghost text-xs">{item.unit_mark}</span>
+                                        <span className="badge badge-ghost text-xs px-2 py-0.5">{item.unit_mark}</span>
                                       )}
                                     </div>
-                                    <div className="flex items-center gap-4 text-sm text-gray-400 mt-1">
-                                      <span className="font-mono text-gray-500">#{item.product_code}</span>
-                                      <span className={`font-medium ${getUnitColor(item.unit_level)}`}>
-                                        {item.qty} {item.qty_label || formatUnitLevel(item.unit_level)}
+                                    <div className="flex items-center gap-4 text-sm mt-1.5">
+                                      <span className="font-mono text-gray-500 text-xs">#{item.product_code}</span>
+                                      <span className={`font-bold ${getUnitColor(item.unit_level)} text-base`}>
+                                        × {item.qty}
                                       </span>
                                     </div>
                                   </div>
-                                  <div className="text-right">
-                                    <p className="font-semibold text-primary-400">
-                                      {item.subtotal_fc?.toLocaleString() || 0} FC
+                                  <div className="text-right ml-4 flex-shrink-0">
+                                    <p className="font-bold text-primary-400 text-lg">
+                                      {item.subtotal_fc?.toLocaleString() || 0} <span className="text-sm opacity-70">FC</span>
                                     </p>
-                                    <p className="text-sm text-gray-500">
-                                      @ {item.unit_price_fc?.toLocaleString() || 0} FC
+                                    <p className="text-xs text-gray-500 mt-0.5">
+                                      @ {item.unit_price_fc?.toLocaleString() || 0} FC/unité
                                     </p>
                                   </div>
-                                </div>
+                                </m.div>
                               ))}
                             </div>
                           </m.div>
@@ -933,28 +1355,42 @@ Continuer ?`;
                     </div>
                   )}
 
-                  {/* Actions */}
-                  <div className="flex items-center justify-between pt-4 border-t border-gray-700">
-                    <button
+                  {/* ✅ Actions PRO avec animations */}
+                  <div className="flex items-center justify-between pt-6 border-t border-gray-700/50 mt-6">
+                    <m.button
                       onClick={() => handleDeleteSale(saleDetails.invoice_number)}
                       disabled={deleting === saleDetails.invoice_number}
-                      className={`btn flex items-center gap-2 ${
+                      whileHover={{ scale: deleting === saleDetails.invoice_number ? 1 : 1.02 }}
+                      whileTap={{ scale: deleting === saleDetails.invoice_number ? 1 : 0.98 }}
+                      className={`flex items-center gap-3 px-5 py-3 rounded-xl font-semibold transition-all ${
                         deleting === saleDetails.invoice_number 
-                          ? 'btn-disabled bg-red-900/50' 
-                          : 'btn-error bg-red-600/20 hover:bg-red-600/40 text-red-400'
+                          ? 'bg-gray-800 text-gray-500 cursor-not-allowed' 
+                          : 'bg-gradient-to-r from-red-600/20 to-red-500/10 border border-red-500/30 text-red-400 hover:from-red-600/30 hover:to-red-500/20 hover:border-red-500/50 hover:shadow-lg hover:shadow-red-500/10'
                       }`}
                       title="Supprimer et restaurer le stock"
                     >
-                      <Trash2 className={`w-5 h-5 ${deleting === saleDetails.invoice_number ? 'animate-pulse' : ''}`} />
-                      {deleting === saleDetails.invoice_number ? 'Suppression...' : 'Supprimer'}
-                    </button>
-                    <button
+                      {deleting === saleDetails.invoice_number ? (
+                        <m.div
+                          animate={{ rotate: 360 }}
+                          transition={{ duration: 1, repeat: Infinity, ease: 'linear' }}
+                          className="w-5 h-5 border-2 border-red-400 border-t-transparent rounded-full"
+                        />
+                      ) : (
+                        <Trash2 className="w-5 h-5" />
+                      )}
+                      <span>{deleting === saleDetails.invoice_number ? 'Suppression...' : 'Supprimer la facture'}</span>
+                    </m.button>
+                    
+                    <m.button
                       onClick={() => handlePrint(saleDetails.invoice_number)}
-                      className="btn btn-primary flex items-center gap-2"
+                      whileHover={{ scale: 1.02 }}
+                      whileTap={{ scale: 0.98 }}
+                      className="flex items-center gap-3 px-6 py-3 rounded-xl font-semibold bg-gradient-to-r from-primary-500 to-primary-600 text-white shadow-lg shadow-primary-500/25 hover:shadow-xl hover:shadow-primary-500/30 transition-all"
                     >
                       <Printer className="w-5 h-5" />
-                      Imprimer
-                    </button>
+                      <span>Imprimer</span>
+                    </m.button>
+                  </div>
                   </div>
                 </div>
               ) : (
@@ -965,12 +1401,21 @@ Continuer ?`;
                   </button>
                 </div>
               )}
-            </div>
-          </div>
+            </m.div>
+          </m.div>
         )}
       </AnimatePresence>
+
+      {/* Toast Container */}
+      <ToastContainer toasts={toasts} onCloseToast={closeToast} />
     </div>
   );
 };
 
-export default SalesHistory;
+export default function SalesHistoryWithErrorBoundary() {
+  return (
+    <ErrorBoundary>
+      <SalesHistory />
+    </ErrorBoundary>
+  );
+}

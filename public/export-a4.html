@@ -308,7 +308,8 @@
       </h1>
       <div class="actions">
         <button class="btn" onclick="window.location.reload()">🔄 Actualiser</button>
-        <button class="btn btn-primary" onclick="window.print()">🖨️ Imprimer</button>
+        <button class="btn" onclick="downloadCSV()">📥 Télécharger CSV</button>
+        <button class="btn btn-primary" onclick="window.print()">🖨️ Imprimer / PDF</button>
       </div>
     </div>
     
@@ -367,6 +368,9 @@
     document.getElementById('print-date').textContent = `Imprimé le ${new Date().toLocaleDateString('fr-FR')} à ${new Date().toLocaleTimeString('fr-FR')}`;
     document.title = `Export A4 - ${exportTitle}`;
     
+    // Variable globale pour stocker les données
+    let currentData = [];
+    
     // Construire l'URL API selon le type
     function getApiUrl() {
       const base = '/api/newarrivage/products';
@@ -384,10 +388,50 @@
           return `${base}?unitLevel=MILLIER`;
         case 'piece':
           return `${base}?unitLevel=PIECE`;
+        case 'empty-stock':
+          return `${base}?emptyStock=true`;
+        case 'with-stock':
+          return `${base}?withStock=true`;
+        case 'all-products':
         case 'all':
         default:
           return base;
       }
+    }
+    
+    // Télécharger en CSV
+    function downloadCSV() {
+      if (!currentData || currentData.length === 0) {
+        alert('Aucune donnée à exporter');
+        return;
+      }
+      
+      const headers = ['Code', 'Nom', 'Unité', 'Mark', 'Stock', 'Prix FC', 'Prix USD', 'Total FC'];
+      const rows = currentData.map(p => {
+        const stock = p.stock || p.stock_after || p.stock_current || 0;
+        const prixFc = p.prix_fc || p.sale_price_fc || 0;
+        const prixUsd = p.prix_usd || p.sale_price_usd || 0;
+        const total = p.total_fc || (stock * prixFc) || 0;
+        return [
+          p.code || p.product_code || '',
+          (p.nom || p.product_name || p.name || '').replace(/"/g, '""'),
+          p.unit_level || '',
+          p.unit_mark || p.current_unit_mark || '',
+          stock,
+          prixFc,
+          prixUsd,
+          total
+        ].map(v => `"${v}"`).join(',');
+      });
+      
+      const csv = [headers.join(','), ...rows].join('\n');
+      const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `export-${exportType}-${new Date().toISOString().split('T')[0]}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
     }
     
     // Formater les nombres
@@ -403,10 +447,56 @@
         if (!response.ok) throw new Error('Erreur API');
         
         const data = await response.json();
+        currentData = data; // Stocker pour téléchargement
         renderTable(data);
         updateStats(data);
       } catch (error) {
         console.error('Erreur:', error);
+        // Essayer de charger depuis /api/products si l'API newarrivage échoue
+        try {
+          const fallbackResponse = await fetch('/api/products');
+          if (fallbackResponse.ok) {
+            const products = await fallbackResponse.json();
+            // Aplatir les produits avec leurs unités
+            const flatData = [];
+            (products || []).forEach(p => {
+              if (p.units && Array.isArray(p.units)) {
+                p.units.forEach(u => {
+                  // Filtrer selon le type d'export
+                  const stock = u.stock_current || 0;
+                  if (exportType === 'empty-stock' && stock > 0) return;
+                  if (exportType === 'with-stock' && stock <= 0) return;
+                  if (exportType === 'carton' && u.unit_level !== 'CARTON') return;
+                  if (exportType === 'millier' && u.unit_level !== 'MILLIER') return;
+                  if (exportType === 'piece' && u.unit_level !== 'PIECE') return;
+                  
+                  flatData.push({
+                    code: p.code,
+                    product_code: p.code,
+                    nom: p.name,
+                    product_name: p.name,
+                    unit_level: u.unit_level,
+                    unit_mark: u.unit_mark || '',
+                    stock_current: stock,
+                    stock: stock,
+                    sale_price_fc: u.sale_price_fc || 0,
+                    prix_fc: u.sale_price_fc || 0,
+                    sale_price_usd: u.sale_price_usd || 0,
+                    prix_usd: u.sale_price_usd || 0,
+                    total_fc: stock * (u.sale_price_fc || 0)
+                  });
+                });
+              }
+            });
+            currentData = flatData;
+            renderTable(flatData);
+            updateStats(flatData);
+            return;
+          }
+        } catch (fallbackError) {
+          console.error('Fallback error:', fallbackError);
+        }
+        
         document.getElementById('products-table').innerHTML = `
           <tr>
             <td colspan="8" class="empty-state">

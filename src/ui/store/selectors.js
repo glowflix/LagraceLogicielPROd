@@ -32,10 +32,14 @@ export const useUser = () => useStore((state) => state.user);
 export const useToken = () => useStore((state) => state.token);
 export const useIsLoading = () => useStore((state) => state.isLoading);
 
-// État de connexion
+// État de connexion PRO LOCAL-FIRST
 export const useIsOnline = () => useStore((state) => state.isOnline);
 export const useSocketConnected = () => useStore((state) => state.socketConnected);
 export const useLastSync = () => useStore((state) => state.lastSync);
+export const useBackendConnected = () => useStore((state) => state.backendConnected);
+export const useBackendLatency = () => useStore((state) => state.backendLatency);
+export const useSheetsConnected = () => useStore((state) => state.sheetsConnected);
+export const useLastHealthCheck = () => useStore((state) => state.lastHealthCheck);
 
 // Données principales
 export const useProducts = () => useStore((state) => state.products);
@@ -69,13 +73,23 @@ export const useAuthState = () => useStore(
 );
 
 /**
- * Sélecteur pour l'état de connexion
+ * Sélecteur pour l'état de connexion PRO LOCAL-FIRST
+ * 
+ * États:
+ * - backendConnected: Connexion au backend SQLite local (le plus important)
+ * - socketConnected: Connexion WebSocket pour sync temps réel
+ * - sheetsConnected: Connexion à Google Sheets (sync externe, optionnel)
+ * - isOnline: État global (= backendConnected || socketConnected)
  */
 export const useConnectionState = () => useStore(
   (state) => ({
     isOnline: state.isOnline,
+    backendConnected: state.backendConnected,
+    backendLatency: state.backendLatency,
     socketConnected: state.socketConnected,
+    sheetsConnected: state.sheetsConnected,
     lastSync: state.lastSync,
+    lastHealthCheck: state.lastHealthCheck,
   }),
   shallow
 );
@@ -243,12 +257,13 @@ export const useDataActions = () => useStore(
 );
 
 /**
- * Actions de connexion
+ * Actions de connexion PRO LOCAL-FIRST
  */
 export const useConnectionActions = () => useStore(
   (state) => ({
     initSocket: state.initSocket,
     checkConnection: state.checkConnection,
+    checkSheetsConnection: state.checkSheetsConnection,
     updateOnlineStatus: state.updateOnlineStatus,
   }),
   shallow

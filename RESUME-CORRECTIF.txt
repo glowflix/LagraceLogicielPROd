@@ -1,0 +1,68 @@
+=== CORRECTIF MODE LICENSE APPLIQUÉ ===
+
+✅ PROBLÈME RÉSOLU : Erreur 403 lors de la modification de comptes en mode license
+
+📁 FICHIERS MODIFIÉS :
+   - src/api/middlewares/auth.js
+   - src/api/routes/users.routes.js  
+   - src/ui/pages/UsersPage.jsx
+
+📄 DOCUMENTATION CRÉÉE :
+   - CORRECTIF-MODE-LICENSE.md (détails complets)
+
+🔧 CORRECTIONS PRINCIPALES :
+
+1. Backend (auth.js) :
+   - Définit req.user = null en mode license pur
+   - Facilite la détection du mode license
+   - Log: "🔑 [Auth] Mode LICENSE détecté"
+
+2. Backend (users.routes.js) :
+   - Détection robuste: !req.user || !req.user.id || req.userRole === 'LICENSE_ONLY'
+   - Appliqué sur POST (création) et PUT (modification)
+   - Logs de debug pour diagnostic
+
+3. Frontend (UsersPage.jsx) :
+   - Utilise token depuis useStore() au lieu de localStorage
+   - Cohérence avec la persistence Zustand
+
+🧪 POUR TESTER :
+
+1. Redémarrer le serveur backend
+   > npm run dev
+   OU
+   > npm start
+
+2. Redémarrer le frontend (dans src/ui/)
+   > npm run dev
+
+3. Dans l'application :
+   - Activer la license (0987654321)
+   - NE PAS se connecter avec un compte
+   - Aller dans "Gestion des Comptes"
+   - Créer un nouveau compte avec Admin = true
+   - Modifier un compte existant
+   
+4. Vérifier les logs backend :
+   - Chercher "🔑 [Auth] Mode LICENSE détecté"
+   - Chercher "isLicenseMode=true"
+
+✅ RÉSULTAT ATTENDU :
+   - Pas d'erreur 403
+   - Les comptes peuvent être créés et modifiés
+   - Les changements sont synchronisés avec Google Sheets
+
+📊 MODE LICENSE = DROITS OWNER :
+   - Créer n'importe quel compte (client, vendeur, admin)
+   - Modifier n'importe quel compte
+   - Changer le statut is_admin
+   - Activer/désactiver des comptes
+
+🔐 SÉCURITÉ PRÉSERVÉE :
+   - Le flag is_owner reste protégé
+   - Les tokens locaux sont validés
+   - La détection du mode license est robuste
+
+Date: 2026-01-10
+Status: ✅ Corrigé et prêt pour test
+

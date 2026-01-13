@@ -1,7 +1,7 @@
 import express from 'express';
 import { debtsRepo } from '../../db/repositories/debts.repo.js';
 import { salesRepo } from '../../db/repositories/sales.repo.js';
-import { syncRepo } from '../../db/repositories/sync.repo.js';
+import { outboxRepo } from '../../db/repositories/outbox.repo.js';
 import { auditRepo } from '../../db/repositories/audit.repo.js';
 import { authenticate, optionalAuth } from '../middlewares/auth.js';
 import { logger } from '../../core/logger.js';
@@ -88,8 +88,8 @@ router.post('/from-sale/:invoice', authenticate, (req, res) => {
 
     const debt = debtsRepo.createFromSale(sale.id, sale.invoice_number);
 
-    // Ajouter à l'outbox
-    syncRepo.addToOutbox('debts', debt.id.toString(), 'upsert', debt);
+    // ✅ PRO: Ajouter à l'outbox pour sync vers Sheets (feuille "Dettes")
+    outboxRepo.enqueueDebt(debt);
 
     // Audit log
     auditRepo.log(req.user.id, 'debt_create', {
@@ -106,28 +106,94 @@ router.post('/from-sale/:invoice', authenticate, (req, res) => {
 /**
  * POST /api/debts/:id/payments
  * Ajoute un paiement à une dette
+ * ✅ SYNC COMPLÈTE: Met à jour la dette dans Google Sheets (colonnes "prix payer deja", "reste", status)
  */
 router.post('/:id/payments', authenticate, (req, res) => {
   try {
-    const debt = debtsRepo.addPayment(parseInt(req.params.id), {
+    const debtId = parseInt(req.params.id);
+    const amountFC = parseFloat(req.body.amount_fc) || 0;
+    
+    if (amountFC <= 0) {
+      return res.status(400).json({ success: false, error: 'Montant invalide' });
+    }
+    
+    if (isNaN(debtId) || debtId <= 0) {
+      return res.status(400).json({ success: false, error: 'ID de dette invalide' });
+    }
+    
+    logger.info(`💰 [PAYMENT] Début paiement dette ID=${debtId}, montant=${amountFC} FC`);
+    
+    // ✅ FIX: Vérifier d'abord si la dette existe
+    const existingDebt = debtsRepo.findById(debtId);
+    if (!existingDebt) {
+      logger.error(`❌ [PAYMENT] Dette ID=${debtId} non trouvée dans la base locale`);
+      return res.status(404).json({ 
+        success: false, 
+        error: `Dette non trouvée (ID: ${debtId}). Veuillez rafraîchir la page et réessayer.` 
+      });
+    }
+    
+    logger.info(`   📋 [PAYMENT] Dette trouvée: Client="${existingDebt.client_name}", Invoice="${existingDebt.invoice_number}"`);
+    
+    // 1. Ajouter le paiement et mettre à jour la dette localement
+    const debt = debtsRepo.addPayment(debtId, {
       ...req.body,
       paid_by: req.user.id,
     });
+    
+    if (!debt) {
+      logger.error(`❌ [PAYMENT] addPayment a retourné null pour dette ID=${debtId}`);
+      return res.status(500).json({ success: false, error: 'Erreur lors de l\'enregistrement du paiement' });
+    }
+    
+    logger.info(`   ✅ [PAYMENT] Dette mise à jour: paid_fc=${debt.paid_fc}, remaining_fc=${debt.remaining_fc}, status=${debt.status}`);
+    
+    // 2. ✅ SYNC SHEETS: Ajouter opération DEBT complète pour mise à jour dans Sheets
+    // Envoie les données complètes de la dette pour que handleDebtUpsert puisse
+    // mettre à jour les colonnes "prix payer deja", "reste" et le statut
+    const syncPayload = {
+      uuid: debt.uuid,
+      invoice_number: debt.invoice_number,
+      client_name: debt.client_name,
+      client_phone: debt.client_phone || '',
+      product_description: debt.product_description || '',
+      total_fc: debt.total_fc,
+      paid_fc: debt.paid_fc,
+      remaining_fc: debt.remaining_fc,
+      total_usd: debt.total_usd || 0,
+      debt_fc_in_usd: debt.debt_fc_in_usd || 0,
+      status: debt.status,
+      note: debt.note || '',
+      created_at: debt.created_at,
+      updated_at: new Date().toISOString(),
+      // Métadonnées paiement
+      last_payment_amount: amountFC,
+      last_payment_date: new Date().toISOString(),
+    };
+    
+    // ✅ PRO: Ajouter à l'outbox pour sync vers Sheets (feuille "Dettes")
+    outboxRepo.enqueueDebt(syncPayload);
+    logger.info(`   📤 [PAYMENT] Opération SYNC ajoutée pour mise à jour Sheets`);
 
-    // Ajouter à l'outbox
-    syncRepo.addToOutbox('debt_payments', debt.id.toString(), 'payment', {
-      debt_id: debt.id,
-      amount_fc: req.body.amount_fc,
-    });
-
-    // Audit log
+    // 3. Audit log
     auditRepo.log(req.user.id, 'debt_payment', {
       debt_id: debt.id,
-      amount_fc: req.body.amount_fc,
+      debt_uuid: debt.uuid,
+      amount_fc: amountFC,
+      new_paid_fc: debt.paid_fc,
+      new_remaining_fc: debt.remaining_fc,
+      new_status: debt.status,
     });
 
-    res.json({ success: true, debt });
+    res.json({ 
+      success: true, 
+      debt,
+      message: debt.status === 'closed' 
+        ? '🎉 Dette entièrement payée!' 
+        : `Paiement de ${amountFC.toLocaleString()} FC enregistré`
+    });
   } catch (error) {
+    logger.error('❌ [PAYMENT] Erreur:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });

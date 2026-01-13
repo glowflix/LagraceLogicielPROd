@@ -9,11 +9,13 @@ const VERBOSE = syncLogger.isVerbose();
 // Timeouts recommandés pour une sync fréquente (10s)
 // Ajustez par ENV si besoin.
 const TIMEOUTS = {
-  users:   parseInt(process.env.SHEETS_TIMEOUT_USERS_MS || '6000', 10),
-  rates:   parseInt(process.env.SHEETS_TIMEOUT_RATES_MS || '6000', 10),
-  debts:   parseInt(process.env.SHEETS_TIMEOUT_DEBTS_MS || '7000', 10),
-  products:parseInt(process.env.SHEETS_TIMEOUT_PRODUCTS_MS || '30000', 10), // 30s pour products
-  sales:   parseInt(process.env.SHEETS_TIMEOUT_SALES_MS || '30000', 10),   // 30s pour sales
+  users:       parseInt(process.env.SHEETS_TIMEOUT_USERS_MS || '6000', 10),
+  rates:       parseInt(process.env.SHEETS_TIMEOUT_RATES_MS || '6000', 10),
+  debts:       parseInt(process.env.SHEETS_TIMEOUT_DEBTS_MS || '7000', 10),
+  products:    parseInt(process.env.SHEETS_TIMEOUT_PRODUCTS_MS || '30000', 10), // 30s pour products
+  sales:       parseInt(process.env.SHEETS_TIMEOUT_SALES_MS || '30000', 10),   // 30s pour sales
+  stock_move:  parseInt(process.env.SHEETS_TIMEOUT_STOCKMOVE_MS || '15000', 10), // 15s pour stock moves
+  stock_moves: parseInt(process.env.SHEETS_TIMEOUT_STOCKMOVE_MS || '15000', 10), // alias
 };
 
 const DEFAULT_TIMEOUT_MS = parseInt(process.env.SHEETS_TIMEOUT_DEFAULT_MS || '7000', 10);
@@ -103,12 +105,17 @@ export class SheetsClient {
     const url = this.getWebAppUrl();
     if (!url) {
       syncLogger.warn('[BATCH] URL non configurée');
-      return { success: false, error: 'URL non configurée', applied: [], conflicts: [] };
+      return { success: false, error: 'URL non configurée', applied: [], conflicts: [], failed: [], stats: {} };
     }
 
-    const mode = (process.env.SHEETS_BATCH_MODE || '0') === '1';
-    const timeout = options.timeout ?? parseInt(process.env.SHEETS_TIMEOUT_BATCHPUSH_MS || '9000', 10);
+    // ✅ PRO: Toujours utiliser le batch mode pour plus de fiabilité
+    const mode = true; // (process.env.SHEETS_BATCH_MODE || '0') === '1';
+    // ✅ PRO: Timeout 60s pour permettre traitement de gros batches
+    const timeout = options.timeout ?? parseInt(process.env.SHEETS_TIMEOUT_BATCHPUSH_MS || '60000', 10);
     const t0 = Date.now();
+
+    // ✅ PRO: Log visible dans le terminal
+    console.log(`   📡 pushBatch: ${ops.length} ops vers ${url.substring(0, 50)}...`);
 
     if (mode) {
       try {
@@ -120,30 +127,77 @@ export class SheetsClient {
 
         const ms = Date.now() - t0;
 
-        if (res?.data?.success) {
-          const appliedCount = res.data.applied?.length || ops.length;
-          const conflictCount = res.data.conflicts?.length || 0;
-          
+        // ✅ PRO: Nouvelle logique qui gère à la fois les anciennes et nouvelles réponses
+        const data = res?.data || {};
+        const success = data.success === true;
+        const applied = Array.isArray(data.applied) ? data.applied : [];
+        const conflicts = Array.isArray(data.conflicts) ? data.conflicts : [];
+        const failed = Array.isArray(data.failed) ? data.failed : [];
+        const stats = data.stats || {};
+        
+        // ✅ ANTI-LOSS: Log brut si réponse suspecte (pour déboguer les format mismatches)
+        if (success && applied.length === 0 && conflicts.length === 0 && failed.length === 0) {
+          console.log('   ⚠️  BATCH RESPONSE (no arrays):', JSON.stringify(data).substring(0, 400));
+          const received = Number.isFinite(stats.received) ? stats.received : ops.length;
+          const skipped = Number.isFinite(stats.skipped) ? stats.skipped : 0;
+          console.log(`   ⚠️  Counts: received=${received}, applied=${applied.length}, skipped=${skipped}, failed=${failed.length}`);
+        }
+        
+        // ✅ PRO: Deux cas de succès:
+        // 1. success=true ET (applied>0 OU conflits>0)  [ancien format avec opérations]
+        // 2. success=true ET failed=0 ET skipped=received [nouveau format: noop OK]
+        const appliedCount = applied.length;
+        const failedCount = failed.length;
+        const conflictCount = conflicts.length;
+        const isNoopOk = (appliedCount === 0 && failedCount === 0 && (stats.skipped ?? 0) === (stats.received ?? ops.length));
+        const hasOperations = (appliedCount > 0 || conflictCount > 0);
+        const isValid = success && (hasOperations || isNoopOk);
+
+        if (isValid) {
           // Log résumé unique
-          syncLogger.info(`📤 [BATCH] ↑${appliedCount} OK${conflictCount > 0 ? `, ${conflictCount} conflits` : ''} (${ms}ms)`);
-          syncLogger.incrementPushed('products', appliedCount);
+          const msg = isNoopOk ? `(noop: all ${stats.skipped} skipped)` : `(${appliedCount} applied)`;
+          console.log(`   ✅ BATCH OK: ${appliedCount} appliqués, ${conflictCount} conflits ${msg} (${ms}ms)`);
+          syncLogger.info(`📤 [BATCH] ↑${appliedCount} OK${conflictCount > 0 ? `, ${conflictCount} conflits` : ''} ${msg} (${ms}ms)`);
+          // ✅ FIX: Utiliser 'batch' au lieu de 'products' (car on peut pusher stock_move, sales, debts, etc.)
+          syncLogger.incrementPushed('batch', appliedCount);
           
           return {
             success: true,
-            applied: res.data.applied || [],
-            conflicts: res.data.conflicts || [],
+            applied,
+            conflicts,
+            failed,
+            stats,
             server_time: res.data.server_time || null
           };
         }
 
-        const err = res?.data?.error || `HTTP ${res.status}`;
+        // Réponse invalide - log détaillé pour déboguer
+        let err = res?.data?.error || `HTTP ${res.status}`;
+        
+        // Cas 1: success=false avec failed array (Apps Script a rejeté des ops)
+        if (!success && failedCount > 0) {
+          err = `${failedCount} operations failed`;
+          console.log(`   ❌ BATCH FAIL: ${err} (${failedCount} failed ops)`);
+        }
+        // Cas 2: success=true mais ZERO_APPLIED (données perdues)
+        else if (success && appliedCount === 0 && conflictCount === 0 && !isNoopOk) {
+          err = 'ZERO_APPLIED: Apps Script returned success=true but 0 operations were applied - forcing retry to prevent data loss';
+          console.log(`   ⚠️  ${err}`);
+        }
+        
+        console.log(`   ❌ BATCH FAIL: ${err}`);
+        console.log(`      Réponse: success=${success}, applied=${appliedCount}, conflicts=${conflictCount}, failed=${failedCount}`);
         syncLogger.warn(`❌ [BATCH] FAIL: ${err}`);
-        syncLogger.incrementErrors('products', ops.length);
-        return { success: false, error: err, applied: [], conflicts: [] };
+        // ✅ FIX: Utiliser 'batch' au lieu de 'products' pour les compteurs
+        syncLogger.incrementErrors('batch', ops.length);
+        return { success: false, error: err, applied, conflicts, failed, stats };
       } catch (e) {
+        const ms = Date.now() - t0;
+        console.log(`   ❌ BATCH ERROR: ${e.message} (${ms}ms)`);
         syncLogger.warn(`❌ [BATCH] ERROR: ${e.message}`);
-        syncLogger.incrementErrors('products', ops.length);
-        return { success: false, error: e.message, applied: [], conflicts: [] };
+        // ✅ FIX: Utiliser 'batch' au lieu de 'products'
+        syncLogger.incrementErrors('batch', ops.length);
+        return { success: false, error: e.message, applied: [], conflicts: [], failed: [], stats: {} };
       }
     }
 
@@ -159,7 +213,7 @@ export class SheetsClient {
     const ms = Date.now() - t0;
     syncLogger.info(`📤 [BATCH-FALLBACK] ↑${applied.length} OK, ${conflicts.length} conflits (${ms}ms)`);
 
-    return { success: true, applied, conflicts, server_time: null };
+    return { success: true, applied, conflicts, failed: [], stats: { received: ops.length, applied: applied.length, failed: 0 }, server_time: null };
   }
 
   /**

@@ -4,6 +4,7 @@ import { outboxRepo } from '../../db/repositories/outbox.repo.js';
 import { syncWorker } from '../../services/sync/sync.instance.js';
 import { authenticate, optionalAuth } from '../middlewares/auth.js';
 import { logger } from '../../core/logger.js';
+import { getDb } from '../../db/sqlite.js';
 
 const router = express.Router();
 
@@ -750,5 +751,360 @@ router.post('/force-all-from-sheets', optionalAuth, async (req, res) => {
   }
 });
 
-export default router;
+/**
+ * POST /api/sync/allow-empty-pending
+ * ✅ Autorise la sync locale même si pending est vide
+ * Utile pour forcer la sync des CC et produits en mode offline
+ */
+router.post('/allow-empty-pending', optionalAuth, (req, res) => {
+  try {
+    // ✅ Force la synchronisation locale des produits et CC même si pending est vide
+    const stats = outboxRepo.getStats();
+    
+    res.json({
+      success: true,
+      message: 'Pending vide autorisé - sync locale des produits/CC activée',
+      allowEmptyPending: true,
+      canSyncLocally: true,
+      outbox: stats,
+      details: {
+        pendingEmpty: stats.totalPending === 0,
+        canProceed: true // ✅ Permet de continuer même si pending est vide
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 
+/**
+ * POST /api/sync/cleanup-conflicts
+ * ✅ URGENCE: Nettoie les conflits/erreurs bloquées (ancien outbox cassé)
+ * À utiliser si la queue s'accumule infiniment
+ */
+router.post('/cleanup-conflicts', optionalAuth, (req, res) => {
+  try {
+    const { maxAge = 60 } = req.body; // maxAge en minutes (défaut: 60 min = 1h)
+    
+    logger.info(`🧹 [SYNC] Nettoyage des conflits/erreurs > ${maxAge} min...`);
+    
+    const db = getDb();
+    
+    // ✅ 1. Supprimer les opérations en erreur depuis longtemps
+    const cutoffTime = new Date(Date.now() - maxAge * 60000).toISOString();
+    const result = db.prepare(`
+      DELETE FROM sync_operations
+      WHERE status = 'error' AND updated_at < ?
+    `).run(cutoffTime);
+    
+    logger.info(`🗑️  [SYNC] ${result.changes} opération(s) en erreur supprimée(s)`);
+    
+    // ✅ 2. Réinitialiser les conflits anciens (les remettre pending)
+    const retried = db.prepare(`
+      UPDATE sync_operations
+      SET status = 'pending', tries = 0, last_error = NULL
+      WHERE status = 'error' AND tries >= 3
+    `).run();
+    
+    logger.info(`♻️  [SYNC] ${retried.changes} opération(s) réinitialisée(s) (tries reset)`);
+    
+    const stats = outboxRepo.getStats();
+    
+    res.json({
+      success: true,
+      message: `Nettoyage complet: ${result.changes} supprimées, ${retried.changes} réinitialisées`,
+      deleted: result.changes,
+      retried: retried.changes,
+      outbox: stats
+    });
+  } catch (error) {
+    logger.error('❌ [SYNC] Erreur cleanup:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * DELETE /api/sync/clear-all-pending
+ * ⚠️  DANGER: Vide COMPLÈTEMENT l'outbox (pour mode test/reset)
+ * À utiliser UNIQUEMENT si la queue est totalement cassée!
+ */
+router.delete('/clear-all-pending', optionalAuth, (req, res) => {
+  try {
+    logger.warn('⚠️  [SYNC] SUPPRESSION COMPLÈTE DE L\'OUTBOX DEMANDÉE');
+    
+    const db = getDb();
+    
+    // ✅ Supprimer TOUTES les opérations pending/error
+    const result = db.prepare(`
+      DELETE FROM sync_operations
+      WHERE status IN ('pending', 'error')
+    `).run();
+    
+    logger.warn(`🗑️  [SYNC] ${result.changes} opération(s) supprimée(s) - OUTBOX VIDÉE`);
+    
+    const stats = outboxRepo.getStats();
+    
+    res.json({
+      success: true,
+      warning: '⚠️  OUTBOX complètement vidée!',
+      deleted: result.changes,
+      outbox: stats
+    });
+  } catch (error) {
+    logger.error('❌ [SYNC] Erreur clear:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * POST /api/maintenance/fix-corrupted-stock
+ * ✅ Corrige les données de stock corrompues (< -1000000)
+ * Cause: Bugs lors de la synchronisation créent des valeurs impossibles
+ * Solution: Réinitialise le stock à 0 pour les produits corrompus
+ */
+router.post('/maintenance/fix-corrupted-stock', optionalAuth, (req, res) => {
+  try {
+    const db = getDb();
+    
+    logger.info('🔧 [MAINTENANCE] Recherche de données de stock corrompues...');
+    
+    // 1️⃣ Trouver les données corrompues
+    const corrupted = db.prepare(`
+      SELECT code, unit_level, stock_current 
+      FROM product_units 
+      WHERE stock_current < -1000000
+      ORDER BY stock_current
+    `).all();
+    
+    logger.info(`📊 [MAINTENANCE] ${corrupted.length} produit(s) corrompu(s) détecté(s)`);
+    
+    if (corrupted.length > 0) {
+      for (const row of corrupted) {
+        logger.warn(`   ⚠️  ${row.code}/${row.unit_level}: stock=${row.stock_current}`);
+      }
+      
+      // 2️⃣ Corriger les données
+      const updateResult = db.prepare(`
+        UPDATE product_units 
+        SET stock_current = 0 
+        WHERE stock_current < -1000000
+      `).run();
+      
+      logger.info(`✅ [MAINTENANCE] ${updateResult.changes} ligne(s) corrigée(s)`);
+    }
+    
+    // 3️⃣ Vérifier qu'il reste des anomalies
+    const remaining = db.prepare(`
+      SELECT COUNT(*) as count FROM product_units 
+      WHERE stock_current < -100000
+    `).get();
+    
+    res.json({
+      success: true,
+      fixed: corrupted.length,
+      corrupted: corrupted,
+      remaining: remaining.count,
+      message: corrupted.length > 0 
+        ? `✅ ${corrupted.length} produit(s) réparé(s)` 
+        : '✅ Aucune donnée corrompue détectée'
+    });
+  } catch (error) {
+    logger.error('❌ [MAINTENANCE] Erreur fix-stock:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ROUTES POUR L'AUTO-ACTUALISATION INTELLIGENTE (Smart Sync)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /api/sync/timestamps
+ * ✅ Récupère les timestamps de dernière modification pour chaque type de données
+ * Utilisé par useSmartSync pour détecter les changements
+ */
+router.get('/timestamps', optionalAuth, (req, res) => {
+  try {
+    const db = getDb();
+    const timestamps = {};
+    
+    // Timestamp produits
+    const productsTs = db.prepare(`
+      SELECT MAX(COALESCE(updated_at, created_at)) as ts FROM products
+    `).get();
+    timestamps.products = productsTs?.ts || null;
+    
+    // Timestamp ventes
+    const salesTs = db.prepare(`
+      SELECT MAX(COALESCE(updated_at, sold_at, created_at)) as ts FROM sales
+    `).get();
+    timestamps.sales = salesTs?.ts || null;
+    
+    // Timestamp stock (product_units)
+    const stockTs = db.prepare(`
+      SELECT MAX(updated_at) as ts FROM product_units
+    `).get();
+    timestamps.stock = stockTs?.ts || null;
+    
+    // Timestamp dettes
+    const debtsTs = db.prepare(`
+      SELECT MAX(COALESCE(updated_at, created_at)) as ts FROM debts
+    `).get();
+    timestamps.debts = debtsTs?.ts || null;
+    
+    // Timestamp taux
+    const rateTs = db.prepare(`
+      SELECT MAX(updated_at) as ts FROM exchange_rates
+    `).get();
+    timestamps.rates = rateTs?.ts || null;
+    
+    // Hash global pour détection rapide de changement
+    const allTs = [timestamps.products, timestamps.sales, timestamps.stock, timestamps.debts, timestamps.rates]
+      .filter(Boolean)
+      .sort()
+      .reverse();
+    
+    timestamps.globalHash = allTs.length > 0 ? allTs[0] : null;
+    timestamps.serverTime = new Date().toISOString();
+    
+    res.json({
+      success: true,
+      timestamps,
+    });
+  } catch (error) {
+    logger.error('❌ [SYNC/TIMESTAMPS] Erreur:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * GET /api/sync/changes-since
+ * ✅ Récupère tous les changements depuis une date donnée
+ * Utilisé pour le rattrapage après reconnexion
+ */
+router.get('/changes-since', optionalAuth, (req, res) => {
+  try {
+    const { since, types = 'products,sales,stock,debts' } = req.query;
+    
+    if (!since) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Paramètre "since" requis (format ISO)' 
+      });
+    }
+    
+    const sinceDate = new Date(since).toISOString();
+    const requestedTypes = types.split(',').map(t => t.trim());
+    const db = getDb();
+    const changes = {};
+    
+    if (requestedTypes.includes('products')) {
+      changes.products = db.prepare(`
+        SELECT p.*, GROUP_CONCAT(pu.unit_level || ':' || pu.stock) as stock_by_level
+        FROM products p
+        LEFT JOIN product_units pu ON p.id = pu.product_id
+        WHERE p.updated_at > ? OR p.created_at > ?
+        GROUP BY p.id
+        ORDER BY p.updated_at DESC
+        LIMIT 500
+      `).all(sinceDate, sinceDate);
+    }
+    
+    if (requestedTypes.includes('sales')) {
+      changes.sales = db.prepare(`
+        SELECT * FROM sales 
+        WHERE sold_at > ? OR created_at > ?
+        ORDER BY sold_at DESC
+        LIMIT 200
+      `).all(sinceDate, sinceDate);
+    }
+    
+    if (requestedTypes.includes('stock')) {
+      changes.stock = db.prepare(`
+        SELECT pu.*, p.code as product_code, p.name as product_name
+        FROM product_units pu
+        JOIN products p ON pu.product_id = p.id
+        WHERE pu.updated_at > ?
+        ORDER BY pu.updated_at DESC
+        LIMIT 500
+      `).all(sinceDate);
+    }
+    
+    if (requestedTypes.includes('debts')) {
+      changes.debts = db.prepare(`
+        SELECT * FROM debts 
+        WHERE updated_at > ? OR created_at > ?
+        ORDER BY updated_at DESC
+        LIMIT 200
+      `).all(sinceDate, sinceDate);
+    }
+    
+    // Statistiques
+    const stats = {
+      products: changes.products?.length || 0,
+      sales: changes.sales?.length || 0,
+      stock: changes.stock?.length || 0,
+      debts: changes.debts?.length || 0,
+      total: (changes.products?.length || 0) + (changes.sales?.length || 0) + 
+             (changes.stock?.length || 0) + (changes.debts?.length || 0),
+    };
+    
+    logger.info(`📊 [SYNC/CHANGES-SINCE] Changements depuis ${since}:`, stats);
+    
+    res.json({
+      success: true,
+      since: sinceDate,
+      serverTime: new Date().toISOString(),
+      stats,
+      changes,
+    });
+  } catch (error) {
+    logger.error('❌ [SYNC/CHANGES-SINCE] Erreur:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * GET /api/sync/version
+ * ✅ Version rapide: retourne juste un hash pour savoir si données ont changé
+ * Utilisé pour le polling intelligent (très léger)
+ */
+router.get('/version', optionalAuth, (req, res) => {
+  try {
+    const { type = 'all' } = req.query;
+    const db = getDb();
+    
+    let hash = '';
+    
+    if (type === 'all' || type === 'products') {
+      const pCount = db.prepare('SELECT COUNT(*) as c, MAX(updated_at) as t FROM products').get();
+      hash += `p:${pCount.c}:${pCount.t || '0'}|`;
+    }
+    
+    if (type === 'all' || type === 'sales') {
+      const sCount = db.prepare('SELECT COUNT(*) as c, MAX(sold_at) as t FROM sales WHERE DATE(sold_at) = DATE("now")').get();
+      hash += `s:${sCount.c}:${sCount.t || '0'}|`;
+    }
+    
+    if (type === 'all' || type === 'stock') {
+      const stCount = db.prepare('SELECT SUM(stock) as total, MAX(updated_at) as t FROM product_units').get();
+      hash += `st:${Math.round(stCount.total || 0)}:${stCount.t || '0'}|`;
+    }
+    
+    if (type === 'all' || type === 'debts') {
+      const dCount = db.prepare('SELECT COUNT(*) as c FROM debts WHERE status = "active"').get();
+      hash += `d:${dCount.c}|`;
+    }
+    
+    res.json({
+      success: true,
+      version: hash,
+      type,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+export default router;

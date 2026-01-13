@@ -5,6 +5,39 @@ import { logger } from '../../core/logger.js';
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 
 /**
+ * Normaliser boolean depuis DB/payload (1, true, '1', 'true', 'oui', 'OUI')
+ */
+function normalizeBool(v) {
+  return v === 1 || v === true || v === '1' || v === 'true' || v === 'oui' || v === 'OUI';
+}
+
+/**
+ * Calculer le rôle d'un utilisateur depuis ses flags DB
+ * OWNER > ADMIN > autres rôles
+ */
+function computeUserRoleFromUser(user) {
+  if (!user) return 'LICENSE_ONLY';
+  
+  // OWNER si is_owner=1 (créateur/fondateur)
+  if (normalizeBool(user.is_owner)) return 'OWNER';
+  
+  // ADMIN si is_admin=1
+  if (normalizeBool(user.is_admin)) return 'ADMIN';
+  
+  // Autres rôles selon combinaison de flags
+  const isVendeur = normalizeBool(user.is_vendeur);
+  const isStock = normalizeBool(user.is_gerant_stock);
+  const canProducts = normalizeBool(user.can_manage_products);
+
+  if (isVendeur && isStock) return 'VENDEUR_STOCK';
+  if (isVendeur && canProducts) return 'VENDEUR_PRODUITS';
+  if (isVendeur) return 'VENDEUR_SEULEMENT';
+  if (isStock) return 'GERANT_STOCK';
+  if (canProducts) return 'PRODUITS_SEULEMENT';
+  return 'LICENSE_ONLY';
+}
+
+/**
  * Middleware d'authentification
  */
 export function authenticate(req, res, next) {
@@ -19,7 +52,8 @@ export function authenticate(req, res, next) {
     
     // Mode offline: accepter le token offline basique
     if (token === 'offline-token') {
-      req.user = { username: 'offline', is_admin: true };
+      req.user = { id: 0, username: 'offline', is_admin: true, is_active: 1 };
+      req.userRole = 'ADMIN';
       return next();
     }
 
@@ -39,21 +73,39 @@ export function authenticate(req, res, next) {
         // Si un user_id est présent, essayer de charger l'utilisateur
         if (payload.user_id) {
           const user = usersRepo.findById(payload.user_id);
-          if (user && user.is_active) {
+          if (user && normalizeBool(user.is_active)) {
             req.user = user;
+            req.userRole = computeUserRoleFromUser(user); // ✅ IMPORTANT: toujours définir userRole
+            req.roleFlags = payload.role_flags || {};
             return next();
           }
         }
 
-        // Sinon, créer un utilisateur basique basé sur le rôle et les flags
+        // Sinon, créer un utilisateur basique basé sur les flags (PAS sur payload.role pour sécurité)
         const roleFlags = payload.role_flags || {};
+        
+        // ✅ MODE LICENSE: Si pas de user_id dans le payload = connexion avec license seule
+        // Dans ce cas, on ne crée PAS d'objet req.user pour permettre la détection du mode license
+        if (!payload.user_id) {
+          req.user = null; // ✅ CRITIQUE: null pour indiquer mode license pur
+          req.userRole = 'LICENSE_ONLY';
+          req.roleFlags = roleFlags;
+          logger.debug('🔑 [Auth] Mode LICENSE détecté - Accès complet autorisé');
+          return next();
+        }
+        
+        // Si user_id présent mais pas dans DB, créer un user basique
         req.user = {
-          username: payload.user_id ? `user_${payload.user_id}` : 'offline',
-          is_admin: payload.role === 'ADMIN' || roleFlags.admin === true,
-          is_vendeur: roleFlags.vendeur === true || payload.role === 'VENDEUR_SEULEMENT' || payload.role === 'VENDEUR_PRODUITS' || payload.role === 'VENDEUR_STOCK',
-          is_gerant_stock: roleFlags.gerentStock === true || payload.role === 'GERANT_STOCK' || payload.role === 'VENDEUR_STOCK',
-          can_manage_products: roleFlags.produitsVendeur === true || payload.role === 'VENDEUR_PRODUITS' || payload.role === 'VENDEUR_STOCK' || payload.role === 'PRODUITS_SEULEMENT' || payload.role === 'GERANT_STOCK' || payload.role === 'ADMIN',
+          id: Number(payload.user_id),
+          username: `user_${payload.user_id}`,
+          is_active: 1,
+          // ⚠️ SÉCURITÉ: admin/owner ne viennent QUE de la DB, jamais du payload
+          is_admin: false,
+          is_vendeur: roleFlags.vendeur === true,
+          is_gerant_stock: roleFlags.gerentStock === true,
+          can_manage_products: roleFlags.produitsVendeur === true,
         };
+        // Rôle déterminé par flags du payload (non-signé, donc contraint)
         req.userRole = payload.role || 'LICENSE_ONLY';
         req.roleFlags = roleFlags;
         return next();
@@ -68,27 +120,12 @@ export function authenticate(req, res, next) {
       const decoded = jwt.verify(token, JWT_SECRET);
       const user = usersRepo.findById(decoded.userId);
       
-      if (!user || !user.is_active) {
+      if (!user || !normalizeBool(user.is_active)) {
         return res.status(401).json({ success: false, error: 'Utilisateur invalide' });
       }
 
       req.user = user;
-      // Déterminer le rôle depuis l'utilisateur pour les vérifications de permissions
-      if (user.is_admin === 1 || user.is_admin === true) {
-        req.userRole = 'ADMIN';
-      } else if (user.is_vendeur === 1 && user.is_gerant_stock === 1) {
-        req.userRole = 'VENDEUR_STOCK';
-      } else if (user.is_vendeur === 1 && user.can_manage_products === 1) {
-        req.userRole = 'VENDEUR_PRODUITS';
-      } else if (user.is_vendeur === 1) {
-        req.userRole = 'VENDEUR_SEULEMENT';
-      } else if (user.is_gerant_stock === 1) {
-        req.userRole = 'GERANT_STOCK';
-      } else if (user.can_manage_products === 1) {
-        req.userRole = 'PRODUITS_SEULEMENT';
-      } else {
-        req.userRole = 'LICENSE_ONLY';
-      }
+      req.userRole = computeUserRoleFromUser(user); // ✅ Utiliser la fonction helper
       next();
     } catch (error) {
       logger.error('Erreur vérification token:', error);
@@ -146,19 +183,25 @@ export function optionalAuth(req, res, next) {
         if (payload.exp && payload.exp >= now) {
           if (payload.user_id) {
             const user = usersRepo.findById(payload.user_id);
-            if (user && user.is_active) {
+            if (user && normalizeBool(user.is_active)) {
               req.user = user;
+              req.userRole = computeUserRoleFromUser(user);
             } else {
               req.user = {
+                id: Number(payload.user_id),
                 username: `user_${payload.user_id}`,
-                is_admin: payload.role === 'ADMIN',
+                is_active: 1,
+                is_admin: false, // Sécurité: pas d'admin depuis payload
               };
+              req.userRole = payload.role || 'LICENSE_ONLY';
             }
           } else {
             req.user = {
               username: 'offline',
-              is_admin: payload.role === 'ADMIN',
+              is_active: 1,
+              is_admin: false, // Sécurité: pas d'admin depuis payload
             };
+            req.userRole = payload.role || 'LICENSE_ONLY';
           }
         }
       } catch (error) {

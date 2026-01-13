@@ -343,39 +343,49 @@ const MobileQRSection = () => {
     try {
       // Méthode 1: Via l'API système
       const response = await axios.get(`${getApiUrl()}/api/system/network-info`);
-      if (response.data?.addresses) {
-        response.data.addresses.forEach(ip => ips.add(ip));
+      // Le backend retourne 'ips' (pas 'addresses')
+      if (response.data?.ips && Array.isArray(response.data.ips)) {
+        response.data.ips.forEach(ip => {
+          // Ne garder que les vraies adresses IPv4 (pas les .local ou hostname)
+          if (ip && /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip)) {
+            ips.add(ip);
+          }
+        });
       }
     } catch (e) {
       console.log('API network-info non disponible');
     }
 
-    // Méthode 2: WebRTC (fallback navigateur)
-    try {
-      const pc = new RTCPeerConnection({ iceServers: [] });
-      pc.createDataChannel('');
-      
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      
-      await new Promise((resolve) => {
-        pc.onicecandidate = (e) => {
-          if (!e.candidate) {
-            resolve();
-            return;
-          }
-          const parts = e.candidate.candidate.split(' ');
-          const ip = parts[4];
-          if (ip && !ip.includes(':') && ip !== '0.0.0.0' && !ip.startsWith('127.')) {
-            ips.add(ip);
-          }
-        };
-        setTimeout(resolve, 1000);
-      });
-      
-      pc.close();
-    } catch (e) {
-      console.log('WebRTC non disponible');
+    // Méthode 2: WebRTC (fallback navigateur) - seulement si l'API n'a rien retourné
+    if (ips.size === 0) {
+      try {
+        const pc = new RTCPeerConnection({ iceServers: [] });
+        pc.createDataChannel('');
+        
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        
+        await new Promise((resolve) => {
+          pc.onicecandidate = (e) => {
+            if (!e.candidate) {
+              resolve();
+              return;
+            }
+            const parts = e.candidate.candidate.split(' ');
+            const ip = parts[4];
+            // Valider que c'est une vraie adresse IPv4 privée
+            if (ip && /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip) && 
+                ip !== '0.0.0.0' && !ip.startsWith('127.')) {
+              ips.add(ip);
+            }
+          };
+          setTimeout(resolve, 1000);
+        });
+        
+        pc.close();
+      } catch (e) {
+        console.log('WebRTC non disponible');
+      }
     }
 
     // Méthode 3: IPs communes par défaut
